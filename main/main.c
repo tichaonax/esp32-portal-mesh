@@ -1060,54 +1060,49 @@ static void dns_server_task(void *pvParameters)
             break;
         }
 
-        // Check if client is authenticated - if so, forward DNS to real server
+        // Check if client is authenticated - if so, forward DNS to gateway
         uint32_t client_ip = source_addr.sin_addr.s_addr;
         if (is_client_authenticated(client_ip))
         {
-            ESP_LOGI(TAG, "DNS: Forwarding query from authenticated client " IPSTR,
-                     IP2STR((esp_ip4_addr_t *)&client_ip));
-
-            // Forward DNS query to Google DNS (8.8.8.8)
-            struct sockaddr_in dns_server;
-            dns_server.sin_family = AF_INET;
-            dns_server.sin_port = htons(53);
-            inet_pton(AF_INET, "8.8.8.8", &dns_server.sin_addr);
-
-            // Forward the query
-            int forward_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (forward_sock >= 0)
+            // Get gateway IP from STA interface
+            esp_netif_ip_info_t ip_info;
+            if (sta_netif != NULL && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.gw.addr != 0)
             {
-                // Set timeout for receiving response
-                struct timeval timeout;
-                timeout.tv_sec = 2;
-                timeout.tv_usec = 0;
-                setsockopt(forward_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                // Forward DNS query to gateway (router's DNS)
+                struct sockaddr_in dns_server;
+                dns_server.sin_family = AF_INET;
+                dns_server.sin_port = htons(53);
+                dns_server.sin_addr.s_addr = ip_info.gw.addr; // Use gateway IP
 
-                // Send query to 8.8.8.8
-                int sent = sendto(forward_sock, rx_buffer, len, 0,
-                                  (struct sockaddr *)&dns_server, sizeof(dns_server));
-                ESP_LOGI(TAG, "DNS: Sent %d bytes to 8.8.8.8", sent);
-
-                // Receive response from 8.8.8.8
-                char forward_response[512];
-                int response_len = recvfrom(forward_sock, forward_response, sizeof(forward_response), 0, NULL, NULL);
-
-                if (response_len > 0)
+                // Forward the query
+                int forward_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                if (forward_sock >= 0)
                 {
-                    ESP_LOGI(TAG, "DNS: Received %d bytes from 8.8.8.8, forwarding to client", response_len);
-                    // Forward response back to client
-                    sendto(sock, forward_response, response_len, 0,
-                           (struct sockaddr *)&source_addr, sizeof(source_addr));
+                    // Set timeout for receiving response
+                    struct timeval timeout;
+                    timeout.tv_sec = 2;
+                    timeout.tv_usec = 0;
+                    setsockopt(forward_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+                    // Send query to gateway
+                    int sent = sendto(forward_sock, rx_buffer, len, 0,
+                                      (struct sockaddr *)&dns_server, sizeof(dns_server));
+
+                    if (sent > 0)
+                    {
+                        // Receive response from gateway
+                        char forward_response[512];
+                        int response_len = recvfrom(forward_sock, forward_response, sizeof(forward_response), 0, NULL, NULL);
+
+                        if (response_len > 0)
+                        {
+                            // Forward response back to client
+                            sendto(sock, forward_response, response_len, 0,
+                                   (struct sockaddr *)&source_addr, sizeof(source_addr));
+                        }
+                    }
+                    close(forward_sock);
                 }
-                else
-                {
-                    ESP_LOGW(TAG, "DNS: No response from 8.8.8.8 (timeout or error)");
-                }
-                close(forward_sock);
-            }
-            else
-            {
-                ESP_LOGE(TAG, "DNS: Failed to create forward socket");
             }
             continue;
         }
@@ -2335,12 +2330,12 @@ static void http_server_task(void *pvParameters)
             }
 
             // If authenticated and NOT accessing portal pages, close connection to let traffic through to internet
-            bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status || 
-                                  is_customer_status || is_api_token || is_api_token_disable || 
+            bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status ||
+                                  is_customer_status || is_api_token || is_api_token_disable ||
                                   is_api_token_info || is_api_token_extend ||
-                                  (strstr(rx_buffer, "GET / HTTP") != NULL) ||  // Main portal page
+                                  (strstr(rx_buffer, "GET / HTTP") != NULL) || // Main portal page
                                   (strstr(rx_buffer, "GET /favicon.ico") != NULL);
-            
+
             if (is_authenticated && !is_portal_page)
             {
                 ESP_LOGI(TAG, "Authenticated client accessing internet - closing connection to allow direct access");
@@ -2661,8 +2656,7 @@ void app_main(void)
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {
                 .capable = true,
-                .required = false
-            },
+                .required = false},
         },
     };
     strncpy((char *)sta_config.sta.ssid, current_wifi_ssid, sizeof(sta_config.sta.ssid));
