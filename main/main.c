@@ -573,6 +573,19 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
     return false;
 }
 
+// Get token info by token string (helper function)
+static token_info_t* get_token_info_by_string(const char *token)
+{
+    for (int i = 0; i < token_count; i++)
+    {
+        if (active_tokens[i].active && strcmp(active_tokens[i].token, token) == 0)
+        {
+            return &active_tokens[i];
+        }
+    }
+    return NULL;
+}
+
 // Load or generate API key
 static void load_or_generate_api_key(void)
 {
@@ -2376,26 +2389,93 @@ static void http_server_task(void *pvParameters)
                             // Add client to authenticated list
                             add_authenticated_client(source_addr.sin_addr.s_addr, client_mac);
 
-                            // Success response
-                            const char *success_response =
+                            // Get token info for display
+                            token_info_t *token_info = get_token_info_by_string(token);
+                            
+                            // Calculate remaining time
+                            time_t now = time(NULL);
+                            time_t expires_at = token_info->first_use + (token_info->duration_minutes * 60);
+                            time_t time_remaining = expires_at - now;
+                            int hours_left = time_remaining / 3600;
+                            int minutes_left = (time_remaining % 3600) / 60;
+
+                            // Format expiration date
+                            struct tm *exp_time = localtime(&expires_at);
+                            char exp_str[64];
+                            strftime(exp_str, sizeof(exp_str), "%b %d, %Y %I:%M %p", exp_time);
+
+                            // Build success response with detailed stats
+                            char response[3072];
+                            int offset = snprintf(response, sizeof(response),
                                 "HTTP/1.1 200 OK\r\n"
                                 "Content-Type: text/html; charset=UTF-8\r\n"
-                                "Connection: close\r\n"
-                                "\r\n"
+                                "Connection: close\r\n\r\n"
                                 "<!DOCTYPE html>"
                                 "<html><head><meta charset='UTF-8'><title>Connected</title>"
                                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                                "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
-                                ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
-                                "h1{color:#28a745}.status{color:#666;margin-top:20px}button{background:#007bff;color:white;padding:12px;border:none;border-radius:5px;cursor:pointer;margin-top:15px}"
+                                "<style>"
+                                "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);min-height:100vh;display:flex;align-items:center;justify-content:center}"
+                                ".box{background:white;padding:30px;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,0.2);max-width:400px;width:100%%}"
+                                "h1{color:#28a745;margin:0 0 10px 0;font-size:28px}h1::before{content:'✓ ';font-size:32px}"
+                                "p{color:#666;margin:0 0 20px 0}"
+                                ".divider{border-top:2px solid #f0f0f0;margin:20px 0}"
+                                ".token-code{background:#f8f9fa;padding:12px;border-radius:8px;font-family:monospace;font-size:18px;font-weight:bold;text-align:center;letter-spacing:2px;margin:15px 0;color:#333}"
+                                ".stat-group{margin:15px 0}"
+                                ".stat-label{font-size:20px;margin-right:8px}"
+                                ".stat-title{font-weight:600;color:#333;margin-bottom:8px;display:flex;align-items:center}"
+                                ".stat-value{color:#666;font-size:14px;margin-left:28px}"
+                                ".time-remaining{font-size:24px;font-weight:bold;color:#28a745;margin:5px 0}"
+                                ".expires{color:#999;font-size:12px}"
+                                ".usage-badge{display:inline-block;background:#e7f3ff;color:#0066cc;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;margin:5px 5px 5px 28px}"
+                                ".unlimited{color:#28a745;font-weight:600}"
                                 "</style></head><body><div class='box'>"
-                                "<h1>✓ Connected!</h1>"
-                                "<p>Your device is now connected to the internet.</p>"
-                                "<div class='status'><strong>Token:</strong> %s<br><strong>Valid for:</strong> %d hours</div>"
-                                "</div></body></html>";
+                                "<h1>Connected!</h1>"
+                                "<p>Your device is now connected to the internet</p>"
+                                "<div class='divider'></div>"
+                                "<div class='token-code'>%s</div>", token);
 
-                            char response[2048];
-                            snprintf(response, sizeof(response), success_response, token, TOKEN_EXPIRY_HOURS);
+                            // Time remaining section
+                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                "<div class='stat-group'>"
+                                "<div class='stat-title'><span class='stat-label'>⏱️</span> Time Remaining</div>"
+                                "<div class='time-remaining'>%dh %dm</div>"
+                                "<div class='expires'>Expires: %s</div>"
+                                "</div>", hours_left, minutes_left, exp_str);
+
+                            // Usage statistics section
+                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                "<div class='stat-group'>"
+                                "<div class='stat-title'><span class='stat-label'>📊</span> Usage Statistics</div>"
+                                "<div class='usage-badge'>Used %lu times</div>"
+                                "<div class='usage-badge'>Device %d of %d</div>"
+                                "</div>", token_info->usage_count, token_info->device_count, MAX_DEVICES_PER_TOKEN);
+
+                            // Bandwidth section
+                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                "<div class='stat-group'>"
+                                "<div class='stat-title'><span class='stat-label'>📶</span> Bandwidth</div>");
+
+                            if (token_info->bandwidth_down_mb == 0) {
+                                offset += snprintf(response + offset, sizeof(response) - offset,
+                                    "<div class='stat-value'>Download: <span class='unlimited'>Unlimited</span></div>");
+                            } else {
+                                offset += snprintf(response + offset, sizeof(response) - offset,
+                                    "<div class='stat-value'>Download: %lu / %lu MB</div>",
+                                    token_info->bandwidth_used_down, token_info->bandwidth_down_mb);
+                            }
+
+                            if (token_info->bandwidth_up_mb == 0) {
+                                offset += snprintf(response + offset, sizeof(response) - offset,
+                                    "<div class='stat-value'>Upload: <span class='unlimited'>Unlimited</span></div>");
+                            } else {
+                                offset += snprintf(response + offset, sizeof(response) - offset,
+                                    "<div class='stat-value'>Upload: %lu / %lu MB</div>",
+                                    token_info->bandwidth_used_up, token_info->bandwidth_up_mb);
+                            }
+
+                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                "</div></div></body></html>");
+
                             send(sock, response, strlen(response), 0);
                         }
                         else
