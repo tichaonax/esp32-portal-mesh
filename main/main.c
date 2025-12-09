@@ -2118,9 +2118,9 @@ static void http_server_task(void *pvParameters)
                     // Show login page
                     const char *login_page =
                         "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/html\r\n"
+                        "Content-Type: text/html; charset=UTF-8\r\n"
                         "Connection: close\r\n\r\n"
-                        "<!DOCTYPE html><html><head><title>Admin Login</title>"
+                        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Admin Login</title>"
                         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                         "<style>*{margin:0;padding:0;box-sizing:border-box}"
                         "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}"
@@ -2379,11 +2379,11 @@ static void http_server_task(void *pvParameters)
                             // Success response
                             const char *success_response =
                                 "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: text/html\r\n"
+                                "Content-Type: text/html; charset=UTF-8\r\n"
                                 "Connection: close\r\n"
                                 "\r\n"
                                 "<!DOCTYPE html>"
-                                "<html><head><title>Connected</title>"
+                                "<html><head><meta charset='UTF-8'><title>Connected</title>"
                                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                                 "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
                                 ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
@@ -2403,11 +2403,11 @@ static void http_server_task(void *pvParameters)
                             // Invalid token response
                             const char *error_response =
                                 "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: text/html\r\n"
+                                "Content-Type: text/html; charset=UTF-8\r\n"
                                 "Connection: close\r\n"
                                 "\r\n"
                                 "<!DOCTYPE html>"
-                                "<html><head><title>Invalid Token</title>"
+                                "<html><head><meta charset='UTF-8'><title>Invalid Token</title>"
                                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                                 "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
                                 ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
@@ -2428,11 +2428,11 @@ static void http_server_task(void *pvParameters)
                 // Show login page
                 const char *response =
                     "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/html\r\n"
+                    "Content-Type: text/html; charset=UTF-8\r\n"
                     "Connection: close\r\n"
                     "\r\n"
                     "<!DOCTYPE html>"
-                    "<html><head><title>ESP32 Portal</title>"
+                    "<html><head><meta charset='UTF-8'><title>ESP32 Portal</title>"
                     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                     "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
                     ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
