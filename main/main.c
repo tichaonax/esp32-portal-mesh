@@ -26,6 +26,10 @@
 
 static const char *TAG = "esp32-mesh-portal";
 
+// Helper macros
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
 // Mesh configuration
 #define MESH_ID "ESP32-PORTAL-MESH"
 #define MESH_PASSWORD "meshpass123"
@@ -1512,16 +1516,26 @@ static void http_server_task(void *pvParameters)
                 esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
                 bool sta_connected = (err == ESP_OK);
 
-                char status_json[512];
+                // Get mesh information
+                bool is_root = esp_mesh_is_root();
+                int routing_size = esp_mesh_get_routing_table_size();
+                const char *mesh_role = is_root ? "ROOT" : "CHILD";
+
+                char status_json[768];
                 snprintf(status_json, sizeof(status_json),
                          "HTTP/1.1 200 OK\r\n"
                          "Content-Type: application/json\r\n"
                          "Connection: close\r\n\r\n"
-                         "{\"sta_connected\":%s,\"ssid\":\"%s\",\"rssi\":%d,\"current_ssid\":\"%s\"}",
+                         "{\"sta_connected\":%s,\"ssid\":\"%s\",\"rssi\":%d,\"current_ssid\":\"%s\","
+                         "\"mesh_connected\":%s,\"mesh_role\":\"%s\",\"mesh_layer\":%d,\"mesh_routing_size\":%d}",
                          sta_connected ? "true" : "false",
                          sta_connected ? (char *)ap_info.ssid : "Not connected",
                          sta_connected ? ap_info.rssi : 0,
-                         current_wifi_ssid);
+                         current_wifi_ssid,
+                         mesh_connected ? "true" : "false",
+                         mesh_role,
+                         mesh_layer,
+                         routing_size);
                 send(sock, status_json, strlen(status_json), 0);
                 close(sock);
                 continue;
@@ -1636,6 +1650,16 @@ static void http_server_task(void *pvParameters)
                         "<p style='margin-top:10px;color:#155724'>Share this token with guests</p></div></div>";
                     send(sock, token_card, strlen(token_card), 0);
 
+                    // Mesh network status card
+                    const char *mesh_card =
+                        "<div class='card'><h2>🕸️ Mesh Network</h2>"
+                        "<div id='meshStatus' class='info-box'>Loading...</div>"
+                        "<p style='margin-top:10px;font-size:12px;color:#666'>"
+                        "Mesh ID: " MESH_ID "<br>"
+                        "Max Layers: " TOSTRING(MESH_MAX_LAYER) "<br>"
+                                                                "Channel: " TOSTRING(MESH_CHANNEL) "</p></div>";
+                    send(sock, mesh_card, strlen(mesh_card), 0);
+
                     // WiFi card with dynamic SSID
                     char wifi_card[512];
                     snprintf(wifi_card, sizeof(wifi_card),
@@ -1693,7 +1717,10 @@ static void http_server_task(void *pvParameters)
                         "else{alert('Error: '+d.error)}})});"
                         "function updateStatus(){fetch('/admin/status').then(r=>r.json()).then(d=>{"
                         "var status=d.sta_connected?'<span class=\"status-badge status-ok\">✓ Connected</span>':'<span class=\"status-badge status-error\">✗ Disconnected</span>';"
-                        "document.getElementById('wifiStatus').innerHTML='<strong>Status:</strong> '+status+'<br><strong>SSID:</strong> '+d.ssid+'<br><strong>RSSI:</strong> '+d.rssi+' dBm'})};"
+                        "document.getElementById('wifiStatus').innerHTML='<strong>Status:</strong> '+status+'<br><strong>SSID:</strong> '+d.ssid+'<br><strong>RSSI:</strong> '+d.rssi+' dBm';"
+                        "var meshStatus=d.mesh_connected?'<span class=\"status-badge status-ok\">✓ Connected</span>':'<span class=\"status-badge status-error\">✗ Disconnected</span>';"
+                        "var roleColor=d.mesh_role==='ROOT'?'#28a745':'#007bff';"
+                        "document.getElementById('meshStatus').innerHTML='<strong>Status:</strong> '+meshStatus+'<br><strong>Role:</strong> <span style=\"color:'+roleColor+';font-weight:bold\">'+d.mesh_role+'</span><br><strong>Layer:</strong> '+d.mesh_layer+'<br><strong>Nodes:</strong> '+d.mesh_routing_size})};"
                         "updateStatus();setInterval(updateStatus,10000);";
                     send(sock, script2, strlen(script2), 0);
 
