@@ -1572,22 +1572,23 @@ static void http_server_task(void *pvParameters)
                         snprintf(uplink_ip, sizeof(uplink_ip), IPSTR, IP2STR(&ip_info.ip));
                     }
 
-                    const char *admin_page =
+                    // Send response in parts to avoid stack overflow
+                    const char *header = 
                         "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/html\r\n"
+                        "Content-Type: text/html; charset=UTF-8\r\n"
                         "Connection: close\r\n\r\n"
-                        "<!DOCTYPE html><html><head><title>Admin Dashboard</title>"
+                        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Admin Dashboard</title>"
                         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                         "<style>*{margin:0;padding:0;box-sizing:border-box}"
                         "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f5f7fa;padding:20px}"
-                        ".header{background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);color:white;padding:30px;border-radius:15px;margin-bottom:20px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}"
+                        ".header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:30px;border-radius:15px;margin-bottom:20px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}"
                         ".header h1{font-size:32px;margin-bottom:5px}.header p{opacity:0.9}"
                         ".container{max-width:1200px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px;margin-bottom:20px}"
                         ".card{background:white;padding:25px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.08)}"
                         ".card h2{color:#333;margin-bottom:15px;font-size:20px;display:flex;align-items:center}"
                         ".card h2::before{content:'';display:inline-block;width:4px;height:20px;background:#667eea;margin-right:10px;border-radius:2px}"
                         "label{display:block;margin:15px 0 5px;font-weight:600;color:#555;font-size:14px}"
-                        "input,select{width:100%%;padding:10px;border:2px solid #e1e8ed;border-radius:8px;font-size:14px}"
+                        "input,select{width:100%;padding:10px;border:2px solid #e1e8ed;border-radius:8px;font-size:14px}"
                         "input:focus,select:focus{outline:none;border-color:#667eea}"
                         "button{padding:10px 20px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600;margin-top:10px;transition:all 0.3s}"
                         "button:hover{background:#5568d3}button.secondary{background:#6c757d}button.secondary:hover{background:#5a6268}"
@@ -1604,17 +1605,24 @@ static void http_server_task(void *pvParameters)
                         "</style></head><body><div class='container'>"
                         "<div class='header'><h1>🎛️ Admin Dashboard</h1><p>Manage your ESP32 Portal</p>"
                         "<button class='logout-btn secondary' onclick='logout()'>Logout</button></div>"
-                        "<div class='grid'>"
-                        
-                        "<!-- API Management -->"
+                        "<div class='grid'>";
+                    
+                    send(sock, header, strlen(header), 0);
+                    
+                    // API Management card with dynamic data
+                    char api_card[512];
+                    snprintf(api_card, sizeof(api_card),
                         "<div class='card'><h2>🔑 API Management</h2>"
                         "<p style='color:#666;margin-bottom:15px'>API key for third-party token generation</p>"
                         "<div class='api-key' id='apiKey'>%s</div>"
                         "<button onclick='regenKey()'>Regenerate API Key</button>"
                         "<div class='info-box' style='margin-top:15px'><strong>Uplink IP:</strong> %s<br>"
-                        "<small>Use this IP for API requests</small></div></div>"
-                        
-                        "<!-- Quick Token Generation -->"
+                        "<small>Use this IP for API requests</small></div></div>",
+                        api_key, uplink_ip);
+                    send(sock, api_card, strlen(api_card), 0);
+                    
+                    // Token generation card
+                    const char *token_card =
                         "<div class='card'><h2>🎫 Generate Token</h2>"
                         "<label>Duration:</label><select id='duration'>"
                         "<option value='30'>30 minutes</option><option value='60'>1 hour</option>"
@@ -1623,26 +1631,35 @@ static void http_server_task(void *pvParameters)
                         "</select><button onclick='generateToken()'>Create Token</button>"
                         "<div class='token-display' id='tokenDisplay'>"
                         "<strong>Token Created!</strong><strong id='newToken'></strong>"
-                        "<p style='margin-top:10px;color:#155724'>Share this token with guests</p></div></div>"
-                        
-                        "<!-- WiFi Configuration -->"
+                        "<p style='margin-top:10px;color:#155724'>Share this token with guests</p></div></div>";
+                    send(sock, token_card, strlen(token_card), 0);
+                    
+                    // WiFi card with dynamic SSID
+                    char wifi_card[512];
+                    snprintf(wifi_card, sizeof(wifi_card),
                         "<div class='card'><h2>📡 WiFi Uplink</h2>"
                         "<div id='wifiStatus' class='info-box'>Loading...</div>"
                         "<form id='wifiForm'>"
                         "<label>Admin Password:</label><input type='password' id='adminPass' required>"
                         "<label>Router SSID:</label><input type='text' id='ssid' value='%s' required>"
                         "<label>Router Password:</label><input type='password' id='pass' required>"
-                        "<button type='submit'>Update WiFi</button></form></div>"
-                        
-                        "<!-- Password Change -->"
+                        "<button type='submit'>Update WiFi</button></form></div>",
+                        current_wifi_ssid);
+                    send(sock, wifi_card, strlen(wifi_card), 0);
+                    
+                    // Password change card
+                    const char *pass_card =
                         "<div class='card'><h2>🔐 Change Password</h2>"
                         "<form id='passForm'>"
                         "<label>Current Password:</label><input type='password' id='oldPass' required>"
                         "<label>New Password:</label><input type='password' id='newPass' required>"
                         "<label>Confirm New Password:</label><input type='password' id='confirmPass' required>"
                         "<button type='submit' class='danger'>Change Password</button></form></div>"
-                        "</div></div>"
-                        
+                        "</div></div>";
+                    send(sock, pass_card, strlen(pass_card), 0);
+                    
+                    // JavaScript part 1
+                    const char *script1 =
                         "<script>"
                         "function logout(){fetch('/admin/logout',{method:'POST'}).then(()=>window.location.reload())}"
                         "function regenKey(){if(confirm('Regenerate API key? Old key will stop working.')){"
@@ -1658,8 +1675,11 @@ static void http_server_task(void *pvParameters)
                         "var data='admin_password='+encodeURIComponent(document.getElementById('adminPass').value)+"
                         "'&ssid='+encodeURIComponent(document.getElementById('ssid').value)+"
                         "'&password='+encodeURIComponent(document.getElementById('pass').value);"
-                        "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})"
-                        "});"
+                        "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})});";
+                    send(sock, script1, strlen(script1), 0);
+                    
+                    // JavaScript part 2
+                    const char *script2 =
                         "document.getElementById('passForm').addEventListener('submit',function(e){"
                         "e.preventDefault();var newP=document.getElementById('newPass').value;var confP=document.getElementById('confirmPass').value;"
                         "if(newP!==confP){alert('Passwords do not match!');return}"
@@ -1672,17 +1692,18 @@ static void http_server_task(void *pvParameters)
                         "function updateStatus(){fetch('/admin/status').then(r=>r.json()).then(d=>{"
                         "var status=d.sta_connected?'<span class=\"status-badge status-ok\">✓ Connected</span>':'<span class=\"status-badge status-error\">✗ Disconnected</span>';"
                         "document.getElementById('wifiStatus').innerHTML='<strong>Status:</strong> '+status+'<br><strong>SSID:</strong> '+d.ssid+'<br><strong>RSSI:</strong> '+d.rssi+' dBm'})};"
-                        "updateStatus();setInterval(updateStatus,10000);"
-                        // Session timeout warning
+                        "updateStatus();setInterval(updateStatus,10000);";
+                    send(sock, script2, strlen(script2), 0);
+                    
+                    // Session timeout with dynamic value
+                    char script3[512];
+                    snprintf(script3, sizeof(script3),
                         "var lastActivity=Date.now();function resetTimer(){lastActivity=Date.now()}"
                         "document.addEventListener('click',resetTimer);document.addEventListener('keypress',resetTimer);"
                         "setInterval(function(){if(Date.now()-lastActivity>%d*1000){alert('Session expired due to inactivity');window.location.reload()}},60000);"
-                        "</script></body></html>";
-
-                    char response[8192];
-                    snprintf(response, sizeof(response), admin_page, 
-                             api_key, uplink_ip, current_wifi_ssid, ADMIN_SESSION_TIMEOUT);
-                    send(sock, response, strlen(response), 0);
+                        "</script></body></html>",
+                        ADMIN_SESSION_TIMEOUT);
+                    send(sock, script3, strlen(script3), 0);
                 }
                 close(sock);
                 continue;
