@@ -35,13 +35,22 @@ static const char *TAG = "esp32-mesh-portal";
 #define MESH_ROUTER_PASS "08042024"
 
 // Admin configuration
-#define ADMIN_PASSWORD "admin123"
+#define ADMIN_PASSWORD_KEY "admin_pass"
+#define API_KEY_KEY "api_key"
 #define WIFI_SSID_KEY "wifi_ssid"
 #define WIFI_PASS_KEY "wifi_pass"
+#define ADMIN_SESSION_TIMEOUT 300 // 5 minutes in seconds
+#define API_KEY_LENGTH 32
 
-// Current WiFi credentials (loaded from NVS or defaults)
+// Current credentials (loaded from NVS or defaults)
+static char admin_password[64] = "admin123";
+static char api_key[API_KEY_LENGTH + 1] = {0};
 static char current_wifi_ssid[32] = MESH_ROUTER_SSID;
 static char current_wifi_pass[64] = MESH_ROUTER_PASS;
+
+// Admin session management
+static bool admin_logged_in = false;
+static time_t last_admin_activity = 0;
 
 // Mesh state
 static bool mesh_connected = false;
@@ -55,14 +64,23 @@ static esp_netif_t *ap_netif = NULL;
 #define TOKEN_LENGTH 8
 #define TOKEN_EXPIRY_HOURS 24
 #define MAX_TOKENS 50
+#define TOKEN_MIN_DURATION_MINUTES 30
+#define TOKEN_MAX_DURATION_MINUTES (30 * 24 * 60) // 30 days
+#define MAX_DEVICES_PER_TOKEN 2
 
 typedef struct
 {
     char token[TOKEN_LENGTH + 1];
     time_t created;
-    time_t expires;
+    time_t first_use;           // When token was first used (0 if not used yet)
+    uint32_t duration_minutes;  // Duration from first use
+    uint32_t bandwidth_down_mb; // Download limit in MB
+    uint32_t bandwidth_up_mb;   // Upload limit in MB
+    uint32_t bandwidth_used_down; // Used download in MB
+    uint32_t bandwidth_used_up;   // Used upload in MB
     uint32_t usage_count;
-    uint8_t client_mac[6];
+    uint8_t client_macs[MAX_DEVICES_PER_TOKEN][6]; // Multiple devices allowed
+    uint8_t device_count;       // Number of devices using this token
     bool active;
 } token_info_t;
 
@@ -240,6 +258,18 @@ static void generate_token(char *token_out)
     token_out[TOKEN_LENGTH] = '\0';
 }
 
+// Generate random API key
+static void generate_api_key(char *key_out)
+{
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int i = 0; i < API_KEY_LENGTH; i++)
+    {
+        uint32_t rand = esp_random();
+        key_out[i] = charset[rand % (sizeof(charset) - 1)];
+    }
+    key_out[API_KEY_LENGTH] = '\0';
+}
+
 // Save token to NVS
 static esp_err_t save_token_to_nvs(const char *token, token_info_t *info)
 {
@@ -294,16 +324,43 @@ static void load_tokens_from_nvs(void)
         {
             // Check if token has expired
             time_t now = time(NULL);
-            if (now > active_tokens[token_count].expires)
+            bool expired = false;
+            
+            if (active_tokens[token_count].first_use > 0)
             {
-                ESP_LOGI(TAG, "Token %s expired, removing", active_tokens[token_count].token);
+                time_t token_expires = active_tokens[token_count].first_use + 
+                                     (active_tokens[token_count].duration_minutes * 60);
+                if (now > token_expires)
+                {
+                    ESP_LOGI(TAG, "Token %s expired (time), removing", active_tokens[token_count].token);
+                    expired = true;
+                }
+            }
+            
+            // Check bandwidth limits
+            if (active_tokens[token_count].bandwidth_down_mb > 0 &&
+                active_tokens[token_count].bandwidth_used_down >= active_tokens[token_count].bandwidth_down_mb)
+            {
+                ESP_LOGI(TAG, "Token %s expired (bandwidth down), removing", active_tokens[token_count].token);
+                expired = true;
+            }
+            if (active_tokens[token_count].bandwidth_up_mb > 0 &&
+                active_tokens[token_count].bandwidth_used_up >= active_tokens[token_count].bandwidth_up_mb)
+            {
+                ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", active_tokens[token_count].token);
+                expired = true;
+            }
+            
+            if (expired)
+            {
                 active_tokens[token_count].active = false;
             }
             else
             {
-                ESP_LOGI(TAG, "Loaded token %s (used %lu times)",
+                ESP_LOGI(TAG, "Loaded token %s (used %lu times, %d devices)",
                          active_tokens[token_count].token,
-                         active_tokens[token_count].usage_count);
+                         active_tokens[token_count].usage_count,
+                         active_tokens[token_count].device_count);
                 token_count++;
             }
         }
@@ -320,8 +377,9 @@ static void load_tokens_from_nvs(void)
     ESP_LOGI(TAG, "Loaded %d active tokens from NVS", token_count);
 }
 
-// Create new access token
-static esp_err_t create_new_token(char *token_out)
+// Create new access token with parameters
+static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes, 
+                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
 {
     if (token_count >= MAX_TOKENS)
     {
@@ -329,14 +387,28 @@ static esp_err_t create_new_token(char *token_out)
         return ESP_ERR_NO_MEM;
     }
 
+    // Validate duration
+    if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
+    {
+        ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)", 
+                 duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     token_info_t new_token;
     generate_token(new_token.token);
 
     time_t now = time(NULL);
     new_token.created = now;
-    new_token.expires = now + (TOKEN_EXPIRY_HOURS * 3600);
+    new_token.first_use = 0;  // Not used yet
+    new_token.duration_minutes = duration_minutes;
+    new_token.bandwidth_down_mb = bandwidth_down_mb;
+    new_token.bandwidth_up_mb = bandwidth_up_mb;
+    new_token.bandwidth_used_down = 0;
+    new_token.bandwidth_used_up = 0;
     new_token.usage_count = 0;
-    memset(new_token.client_mac, 0, 6);
+    memset(new_token.client_macs, 0, sizeof(new_token.client_macs));
+    new_token.device_count = 0;
     new_token.active = true;
 
     // Save to NVS
@@ -351,9 +423,17 @@ static esp_err_t create_new_token(char *token_out)
     token_count++;
 
     strcpy(token_out, new_token.token);
-    ESP_LOGI(TAG, "✓ Created new token: %s (expires in %d hours)", token_out, TOKEN_EXPIRY_HOURS);
+    ESP_LOGI(TAG, "✓ Created new token: %s (duration: %lu min, down: %lu MB, up: %lu MB)", 
+             token_out, duration_minutes, bandwidth_down_mb, bandwidth_up_mb);
 
     return ESP_OK;
+}
+
+// Create new access token (simple version for admin UI)
+static esp_err_t create_new_token(char *token_out)
+{
+    // Default: 24 hours, unlimited bandwidth
+    return create_new_token_with_params(token_out, TOKEN_EXPIRY_HOURS * 60, 0, 0);
 }
 
 // Validate token and bind to client MAC
@@ -368,43 +448,69 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
 
         if (strcmp(active_tokens[i].token, token) == 0)
         {
-            // Check expiration
-            if (now > active_tokens[i].expires)
+            // Set first use time if not set
+            if (active_tokens[i].first_use == 0)
             {
-                ESP_LOGW(TAG, "Token %s has expired", token);
+                active_tokens[i].first_use = now;
+                ESP_LOGI(TAG, "Token %s first use at %lld", token, (long long)now);
+            }
+
+            // Check time-based expiration (from first use)
+            time_t token_expires = active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60);
+            if (now > token_expires)
+            {
+                ESP_LOGW(TAG, "Token %s has expired (time limit)", token);
                 active_tokens[i].active = false;
+                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
                 return false;
             }
 
-            // Check if token is already bound to a different MAC
-            bool is_bound = false;
-            for (int j = 0; j < 6; j++)
+            // Check bandwidth expiration
+            if (active_tokens[i].bandwidth_down_mb > 0 && 
+                active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
             {
-                if (active_tokens[i].client_mac[j] != 0)
+                ESP_LOGW(TAG, "Token %s exceeded download limit", token);
+                active_tokens[i].active = false;
+                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+                return false;
+            }
+            if (active_tokens[i].bandwidth_up_mb > 0 && 
+                active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
+            {
+                ESP_LOGW(TAG, "Token %s exceeded upload limit", token);
+                active_tokens[i].active = false;
+                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+                return false;
+            }
+
+            // Check if this MAC is already registered
+            int mac_index = -1;
+            for (int j = 0; j < active_tokens[i].device_count; j++)
+            {
+                if (memcmp(active_tokens[i].client_macs[j], client_mac, 6) == 0)
                 {
-                    is_bound = true;
+                    mac_index = j;
                     break;
                 }
             }
 
-            if (is_bound)
+            if (mac_index == -1)
             {
-                // Verify MAC matches
-                if (memcmp(active_tokens[i].client_mac, client_mac, 6) != 0)
+                // New device - check if we can add it
+                if (active_tokens[i].device_count >= MAX_DEVICES_PER_TOKEN)
                 {
-                    ESP_LOGW(TAG, "Token %s already bound to different device", token);
+                    ESP_LOGW(TAG, "Token %s already has %d devices (max allowed)", 
+                             token, MAX_DEVICES_PER_TOKEN);
                     return false;
                 }
-            }
-            else
-            {
-                // Bind token to this MAC
-                memcpy(active_tokens[i].client_mac, client_mac, 6);
-                ESP_LOGI(TAG, "Token %s bound to MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                         token,
+
+                // Add this MAC
+                memcpy(active_tokens[i].client_macs[active_tokens[i].device_count], client_mac, 6);
+                active_tokens[i].device_count++;
+                ESP_LOGI(TAG, "Token %s bound to device %d: %02X:%02X:%02X:%02X:%02X:%02X",
+                         token, active_tokens[i].device_count,
                          client_mac[0], client_mac[1], client_mac[2],
                          client_mac[3], client_mac[4], client_mac[5]);
-                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
             }
 
             // Increment usage count
@@ -418,6 +524,154 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
 
     ESP_LOGW(TAG, "✗ Invalid token: %s", token);
     return false;
+}
+
+// Load or generate API key
+static void load_or_generate_api_key(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error opening NVS for API key");
+        return;
+    }
+
+    size_t key_len = sizeof(api_key);
+    err = nvs_get_str(nvs_handle, API_KEY_KEY, api_key, &key_len);
+    
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        // Generate new API key
+        generate_api_key(api_key);
+        nvs_set_str(nvs_handle, API_KEY_KEY, api_key);
+        nvs_commit(nvs_handle);
+        ESP_LOGI(TAG, "Generated new API key: %s", api_key);
+    }
+    else if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Loaded API key from NVS");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Error loading API key: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+}
+
+// Regenerate API key (for admin UI)
+static esp_err_t regenerate_api_key(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    generate_api_key(api_key);
+    err = nvs_set_str(nvs_handle, API_KEY_KEY, api_key);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(nvs_handle);
+        ESP_LOGI(TAG, "Regenerated API key");
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+// Load admin password from NVS
+static void load_admin_password(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGI(TAG, "No saved admin password, using default");
+        strcpy(admin_password, "admin123");
+        return;
+    }
+
+    size_t pass_len = sizeof(admin_password);
+    err = nvs_get_str(nvs_handle, ADMIN_PASSWORD_KEY, admin_password, &pass_len);
+    
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        strcpy(admin_password, "admin123");
+        ESP_LOGI(TAG, "No saved admin password, using default");
+    }
+    else if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Loaded admin password from NVS");
+    }
+
+    nvs_close(nvs_handle);
+}
+
+// Change admin password
+static esp_err_t change_admin_password(const char *old_pass, const char *new_pass)
+{
+    // Verify old password
+    if (strcmp(admin_password, old_pass) != 0)
+    {
+        ESP_LOGW(TAG, "Old password incorrect");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Validate new password (minimum 6 characters)
+    if (strlen(new_pass) < 6)
+    {
+        ESP_LOGW(TAG, "New password too short");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_set_str(nvs_handle, ADMIN_PASSWORD_KEY, new_pass);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK)
+        {
+            strcpy(admin_password, new_pass);
+            ESP_LOGI(TAG, "Admin password changed successfully");
+        }
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+// Check admin session validity
+static bool is_admin_session_valid(void)
+{
+    if (!admin_logged_in)
+    {
+        return false;
+    }
+
+    time_t now = time(NULL);
+    if ((now - last_admin_activity) > ADMIN_SESSION_TIMEOUT)
+    {
+        admin_logged_in = false;
+        ESP_LOGI(TAG, "Admin session expired");
+        return false;
+    }
+
+    return true;
+}
+
+// Update admin activity timestamp
+static void update_admin_activity(void)
+{
+    last_admin_activity = time(NULL);
 }
 
 // Load WiFi credentials from NVS
@@ -791,6 +1045,340 @@ static void http_server_task(void *pvParameters)
             bool is_admin_page = (strstr(rx_buffer, "GET /admin") != NULL);
             bool is_admin_config = (strstr(rx_buffer, "POST /admin/configure") != NULL);
             bool is_admin_status = (strstr(rx_buffer, "GET /admin/status") != NULL);
+            bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL);
+            bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
+            bool is_admin_logout = (strstr(rx_buffer, "POST /admin/logout") != NULL);
+            bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
+            bool is_admin_regen_key = (strstr(rx_buffer, "POST /admin/regenerate_key") != NULL);
+            bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
+
+            // Handle Token API endpoint
+            if (is_api_token)
+            {
+                // This endpoint is for third-party applications
+                // Must check that request comes from uplink IP (not 192.168.4.x)
+                char client_ip_str[16];
+                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+                
+                // Check if request is from local AP network (reject these)
+                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
+                {
+                    const char *error_response =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"error\":\"API only accessible from uplink network\"}";
+                    send(sock, error_response, strlen(error_response), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Parse POST body for API key and token parameters
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    uint32_t duration = 0;
+                    uint32_t bandwidth_down = 0;
+                    uint32_t bandwidth_up = 0;
+
+                    // Parse: api_key=XXX&duration=XXX&bandwidth_down=XXX&bandwidth_up=XXX
+                    char *key_start = strstr(body, "api_key=");
+                    char *dur_start = strstr(body, "duration=");
+                    char *down_start = strstr(body, "bandwidth_down=");
+                    char *up_start = strstr(body, "bandwidth_up=");
+
+                    if (key_start && dur_start)
+                    {
+                        // Extract API key
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        // Extract duration (in minutes)
+                        dur_start += 9;
+                        sscanf(dur_start, "%lu", &duration);
+
+                        // Extract bandwidth limits (optional)
+                        if (down_start)
+                        {
+                            down_start += 15;
+                            sscanf(down_start, "%lu", &bandwidth_down);
+                        }
+                        if (up_start)
+                        {
+                            up_start += 13;
+                            sscanf(up_start, "%lu", &bandwidth_up);
+                        }
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Create token with parameters
+                            char new_token[TOKEN_LENGTH + 1];
+                            esp_err_t err = create_new_token_with_params(new_token, duration, 
+                                                                        bandwidth_down, bandwidth_up);
+                            
+                            if (err == ESP_OK)
+                            {
+                                char response[512];
+                                snprintf(response, sizeof(response),
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Content-Type: application/json\r\n"
+                                        "Connection: close\r\n\r\n"
+                                        "{\"success\":true,\"token\":\"%s\",\"duration_minutes\":%lu,"
+                                        "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu}",
+                                        new_token, duration, bandwidth_down, bandwidth_up);
+                                send(sock, response, strlen(response), 0);
+                                ESP_LOGI(TAG, "API: Created token %s via API", new_token);
+                            }
+                            else
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Invalid parameters or token limit reached\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            const char *auth_error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid API key\"}";
+                            send(sock, auth_error, strlen(auth_error), 0);
+                            ESP_LOGW(TAG, "API: Invalid API key attempt from %s", client_ip_str);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle admin login
+            if (is_admin_login)
+            {
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char password[64] = {0};
+                    char *pass_start = strstr(body, "password=");
+                    
+                    if (pass_start)
+                    {
+                        pass_start += 9;
+                        sscanf(pass_start, "%63[^&\r\n]", password);
+                        
+                        if (strcmp(password, admin_password) == 0)
+                        {
+                            admin_logged_in = true;
+                            update_admin_activity();
+                            
+                            const char *success =
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":true}";
+                            send(sock, success, strlen(success), 0);
+                            ESP_LOGI(TAG, "Admin logged in from %s", inet_ntoa(source_addr.sin_addr));
+                        }
+                        else
+                        {
+                            const char *error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid password\"}";
+                            send(sock, error, strlen(error), 0);
+                        }
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle admin logout
+            if (is_admin_logout)
+            {
+                admin_logged_in = false;
+                const char *response =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n\r\n"
+                    "{\"success\":true}";
+                send(sock, response, strlen(response), 0);
+                close(sock);
+                continue;
+            }
+
+            // Handle admin password change
+            if (is_admin_change_pass)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char old_pass[64] = {0};
+                    char new_pass[64] = {0};
+                    
+                    char *old_start = strstr(body, "old_password=");
+                    char *new_start = strstr(body, "new_password=");
+                    
+                    if (old_start && new_start)
+                    {
+                        old_start += 13;
+                        sscanf(old_start, "%63[^&\r\n]", old_pass);
+                        
+                        new_start += 13;
+                        sscanf(new_start, "%63[^&\r\n]", new_pass);
+                        
+                        esp_err_t err = change_admin_password(old_pass, new_pass);
+                        if (err == ESP_OK)
+                        {
+                            update_admin_activity();
+                            const char *success =
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":true}";
+                            send(sock, success, strlen(success), 0);
+                        }
+                        else
+                        {
+                            const char *error =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid old password or new password too short\"}";
+                            send(sock, error, strlen(error), 0);
+                        }
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle API key regeneration
+            if (is_admin_regen_key)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                esp_err_t err = regenerate_api_key();
+                if (err == ESP_OK)
+                {
+                    update_admin_activity();
+                    char response[512];
+                    snprintf(response, sizeof(response),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":true,\"api_key\":\"%s\"}", api_key);
+                    send(sock, response, strlen(response), 0);
+                }
+                else
+                {
+                    const char *error =
+                        "HTTP/1.1 500 Internal Server Error\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Failed to regenerate key\"}";
+                    send(sock, error, strlen(error), 0);
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle admin token generation
+            if (is_admin_generate_token)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    uint32_t duration = 0;
+                    
+                    char *dur_start = strstr(body, "duration=");
+                    if (dur_start)
+                    {
+                        dur_start += 9;
+                        sscanf(dur_start, "%lu", &duration);
+                        
+                        char new_token[TOKEN_LENGTH + 1];
+                        esp_err_t err = create_new_token_with_params(new_token, duration, 0, 0);
+                        
+                        if (err == ESP_OK)
+                        {
+                            update_admin_activity();
+                            char response[256];
+                            snprintf(response, sizeof(response),
+                                    "HTTP/1.1 200 OK\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":true,\"token\":\"%s\"}", new_token);
+                            send(sock, response, strlen(response), 0);
+                        }
+                        else
+                        {
+                            const char *error =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid duration or token limit reached\"}";
+                            send(sock, error, strlen(error), 0);
+                        }
+                    }
+                }
+                close(sock);
+                continue;
+            }
 
             // Handle admin configuration
             if (is_admin_config)
@@ -859,8 +1447,10 @@ static void http_server_task(void *pvParameters)
                                  new_pass[4], new_pass[5], new_pass[6], new_pass[7]);
 
                         // Verify admin password
-                        if (strcmp(admin_pass, ADMIN_PASSWORD) == 0)
+                        if (strcmp(admin_pass, admin_password) == 0)
                         {
+                            update_admin_activity(); // Update session
+                            
                             // Save and reconnect
                             esp_err_t err = save_wifi_credentials(new_ssid, new_pass);
                             if (err == ESP_OK)
@@ -938,46 +1528,162 @@ static void http_server_task(void *pvParameters)
             // Handle admin page
             if (is_admin_page)
             {
-                const char *admin_page =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/html\r\n"
-                    "Connection: close\r\n\r\n"
-                    "<!DOCTYPE html><html><head><title>Admin Panel</title>"
-                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                    "<style>body{font-family:Arial;margin:20px;background:#f0f0f0}"
-                    ".container{max-width:600px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
-                    "h1{color:#333;margin-top:0}.section{margin:20px 0;padding:20px;background:#f8f9fa;border-radius:5px}"
-                    "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
-                    "input{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box;margin-bottom:15px}"
-                    "button{background:#007bff;color:white;padding:12px 20px;border:none;border-radius:5px;cursor:pointer;width:100%}"
-                    "button:hover{background:#0056b3}.status{padding:10px;background:#e7f3ff;border-left:4px solid #007bff;margin:10px 0}"
-                    ".info{font-size:12px;color:#666;margin-top:10px}.warning{color:#dc3545;font-weight:bold}"
-                    "</style></head><body><div class='container'>"
-                    "<h1>🔧 Admin Panel</h1>"
-                    "<div class='section'><h2>WiFi Uplink Configuration</h2>"
-                    "<div id='status' class='status'>Loading status...</div>"
-                    "<form method='POST' action='/admin/configure' onsubmit='return confirm(\"Update WiFi configuration?\")'>"
-                    "<label>Admin Password:</label>"
-                    "<input type='password' name='admin_password' placeholder='Enter admin password' required>"
-                    "<label>Router SSID:</label>"
-                    "<input type='text' name='ssid' placeholder='Enter WiFi network name' value='%s' required>"
-                    "<label>Router Password:</label>"
-                    "<input type='password' name='password' placeholder='Enter WiFi password' value='%s' required>"
-                    "<button type='submit'>Update Configuration</button>"
-                    "</form>"
-                    "<div class='info'>Current SSID: <strong>%s</strong><br>"
-                    "Default admin password: <span class='warning'>admin123</span> (change in code)</div>"
-                    "</div></div>"
-                    "<script>fetch('/admin/status').then(r=>r.json()).then(d=>{"
-                    "document.getElementById('status').innerHTML="
-                    "'Status: '+(d.sta_connected?'<strong style=\"color:green\">✓ Connected</strong>':'<strong style=\"color:red\">✗ Disconnected</strong>')+"
-                    "' | SSID: '+d.ssid+' | RSSI: '+d.rssi+' dBm';"
-                    "});</script></body></html>";
+                // Check if admin is logged in
+                if (!is_admin_session_valid())
+                {
+                    // Show login page
+                    const char *login_page =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/html\r\n"
+                        "Connection: close\r\n\r\n"
+                        "<!DOCTYPE html><html><head><title>Admin Login</title>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<style>*{margin:0;padding:0;box-sizing:border-box}"
+                        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}"
+                        ".login-box{background:white;padding:40px;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,0.2);max-width:400px;width:100%%}"
+                        "h1{color:#333;margin-bottom:10px;font-size:28px}p{color:#666;margin-bottom:30px}"
+                        "input{width:100%%;padding:12px;border:2px solid #e1e8ed;border-radius:8px;margin-bottom:15px;font-size:16px}"
+                        "input:focus{outline:none;border-color:#667eea}button{width:100%%;padding:14px;background:#667eea;color:white;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:all 0.3s}"
+                        "button:hover{background:#5568d3}.error{color:#dc3545;margin-top:10px;display:none}"
+                        "</style></head><body><div class='login-box'>"
+                        "<h1>🔐 Admin Login</h1><p>Enter your admin password</p>"
+                        "<form id='loginForm'>"
+                        "<input type='password' id='password' placeholder='Admin Password' required autofocus>"
+                        "<button type='submit'>Login</button>"
+                        "<div class='error' id='error'>Invalid password</div>"
+                        "</form></div>"
+                        "<script>document.getElementById('loginForm').addEventListener('submit',function(e){"
+                        "e.preventDefault();var p=document.getElementById('password').value;"
+                        "fetch('/admin/login',{method:'POST',body:'password='+encodeURIComponent(p)})"
+                        ".then(r=>r.json()).then(d=>{if(d.success){window.location.reload()}else{document.getElementById('error').style.display='block'}})"
+                        "});</script></body></html>";
+                    send(sock, login_page, strlen(login_page), 0);
+                }
+                else
+                {
+                    // Show admin dashboard
+                    update_admin_activity();
+                    
+                    // Get uplink IP address
+                    esp_netif_ip_info_t ip_info;
+                    char uplink_ip[16] = "Not connected";
+                    if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0)
+                    {
+                        snprintf(uplink_ip, sizeof(uplink_ip), IPSTR, IP2STR(&ip_info.ip));
+                    }
 
-                char response[4096];
-                snprintf(response, sizeof(response), admin_page,
-                         current_wifi_ssid, "", current_wifi_ssid);
-                send(sock, response, strlen(response), 0);
+                    const char *admin_page =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/html\r\n"
+                        "Connection: close\r\n\r\n"
+                        "<!DOCTYPE html><html><head><title>Admin Dashboard</title>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<style>*{margin:0;padding:0;box-sizing:border-box}"
+                        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f5f7fa;padding:20px}"
+                        ".header{background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);color:white;padding:30px;border-radius:15px;margin-bottom:20px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}"
+                        ".header h1{font-size:32px;margin-bottom:5px}.header p{opacity:0.9}"
+                        ".container{max-width:1200px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px;margin-bottom:20px}"
+                        ".card{background:white;padding:25px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.08)}"
+                        ".card h2{color:#333;margin-bottom:15px;font-size:20px;display:flex;align-items:center}"
+                        ".card h2::before{content:'';display:inline-block;width:4px;height:20px;background:#667eea;margin-right:10px;border-radius:2px}"
+                        "label{display:block;margin:15px 0 5px;font-weight:600;color:#555;font-size:14px}"
+                        "input,select{width:100%%;padding:10px;border:2px solid #e1e8ed;border-radius:8px;font-size:14px}"
+                        "input:focus,select:focus{outline:none;border-color:#667eea}"
+                        "button{padding:10px 20px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600;margin-top:10px;transition:all 0.3s}"
+                        "button:hover{background:#5568d3}button.secondary{background:#6c757d}button.secondary:hover{background:#5a6268}"
+                        "button.danger{background:#dc3545}button.danger:hover{background:#c82333}"
+                        ".info-box{background:#e7f3ff;border-left:4px solid #007bff;padding:15px;margin:15px 0;border-radius:5px}"
+                        ".info-box strong{display:block;margin-bottom:5px}"
+                        ".api-key{font-family:monospace;background:#f8f9fa;padding:10px;border-radius:5px;word-break:break-all;margin:10px 0}"
+                        ".token-display{background:#d4edda;border-left:4px solid #28a745;padding:15px;margin:10px 0;border-radius:5px;display:none}"
+                        ".token-display strong{font-size:24px;font-family:monospace;display:block;margin:10px 0}"
+                        ".status-badge{display:inline-block;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600}"
+                        ".status-ok{background:#d4edda;color:#155724}.status-error{background:#f8d7da;color:#721c24}"
+                        ".logout-btn{position:absolute;top:30px;right:30px}"
+                        ".header{position:relative}"
+                        "</style></head><body><div class='container'>"
+                        "<div class='header'><h1>🎛️ Admin Dashboard</h1><p>Manage your ESP32 Portal</p>"
+                        "<button class='logout-btn secondary' onclick='logout()'>Logout</button></div>"
+                        "<div class='grid'>"
+                        
+                        "<!-- API Management -->"
+                        "<div class='card'><h2>🔑 API Management</h2>"
+                        "<p style='color:#666;margin-bottom:15px'>API key for third-party token generation</p>"
+                        "<div class='api-key' id='apiKey'>%s</div>"
+                        "<button onclick='regenKey()'>Regenerate API Key</button>"
+                        "<div class='info-box' style='margin-top:15px'><strong>Uplink IP:</strong> %s<br>"
+                        "<small>Use this IP for API requests</small></div></div>"
+                        
+                        "<!-- Quick Token Generation -->"
+                        "<div class='card'><h2>🎫 Generate Token</h2>"
+                        "<label>Duration:</label><select id='duration'>"
+                        "<option value='30'>30 minutes</option><option value='60'>1 hour</option>"
+                        "<option value='120'>2 hours</option><option value='240'>4 hours</option>"
+                        "<option value='480'>8 hours</option><option value='720' selected>12 hours</option>"
+                        "</select><button onclick='generateToken()'>Create Token</button>"
+                        "<div class='token-display' id='tokenDisplay'>"
+                        "<strong>Token Created!</strong><strong id='newToken'></strong>"
+                        "<p style='margin-top:10px;color:#155724'>Share this token with guests</p></div></div>"
+                        
+                        "<!-- WiFi Configuration -->"
+                        "<div class='card'><h2>📡 WiFi Uplink</h2>"
+                        "<div id='wifiStatus' class='info-box'>Loading...</div>"
+                        "<form id='wifiForm'>"
+                        "<label>Admin Password:</label><input type='password' id='adminPass' required>"
+                        "<label>Router SSID:</label><input type='text' id='ssid' value='%s' required>"
+                        "<label>Router Password:</label><input type='password' id='pass' required>"
+                        "<button type='submit'>Update WiFi</button></form></div>"
+                        
+                        "<!-- Password Change -->"
+                        "<div class='card'><h2>🔐 Change Password</h2>"
+                        "<form id='passForm'>"
+                        "<label>Current Password:</label><input type='password' id='oldPass' required>"
+                        "<label>New Password:</label><input type='password' id='newPass' required>"
+                        "<label>Confirm New Password:</label><input type='password' id='confirmPass' required>"
+                        "<button type='submit' class='danger'>Change Password</button></form></div>"
+                        "</div></div>"
+                        
+                        "<script>"
+                        "function logout(){fetch('/admin/logout',{method:'POST'}).then(()=>window.location.reload())}"
+                        "function regenKey(){if(confirm('Regenerate API key? Old key will stop working.')){"
+                        "fetch('/admin/regenerate_key',{method:'POST'}).then(r=>r.json()).then(d=>{"
+                        "if(d.success){document.getElementById('apiKey').textContent=d.api_key;alert('API key regenerated!')}})}}"
+                        "function generateToken(){var dur=document.getElementById('duration').value;"
+                        "fetch('/admin/generate_token',{method:'POST',body:'duration='+dur}).then(r=>r.json()).then(d=>{"
+                        "if(d.success){document.getElementById('newToken').textContent=d.token;"
+                        "document.getElementById('tokenDisplay').style.display='block';setTimeout(()=>document.getElementById('tokenDisplay').style.display='none',10000)}"
+                        "else{alert('Error: '+d.error)}})}"
+                        "document.getElementById('wifiForm').addEventListener('submit',function(e){"
+                        "e.preventDefault();if(!confirm('Update WiFi configuration?'))return;"
+                        "var data='admin_password='+encodeURIComponent(document.getElementById('adminPass').value)+"
+                        "'&ssid='+encodeURIComponent(document.getElementById('ssid').value)+"
+                        "'&password='+encodeURIComponent(document.getElementById('pass').value);"
+                        "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})"
+                        "});"
+                        "document.getElementById('passForm').addEventListener('submit',function(e){"
+                        "e.preventDefault();var newP=document.getElementById('newPass').value;var confP=document.getElementById('confirmPass').value;"
+                        "if(newP!==confP){alert('Passwords do not match!');return}"
+                        "if(newP.length<6){alert('Password must be at least 6 characters');return}"
+                        "var data='old_password='+encodeURIComponent(document.getElementById('oldPass').value)+"
+                        "'&new_password='+encodeURIComponent(newP);"
+                        "fetch('/admin/change_password',{method:'POST',body:data}).then(r=>r.json()).then(d=>{"
+                        "if(d.success){alert('Password changed successfully!');document.getElementById('passForm').reset()}"
+                        "else{alert('Error: '+d.error)}})});"
+                        "function updateStatus(){fetch('/admin/status').then(r=>r.json()).then(d=>{"
+                        "var status=d.sta_connected?'<span class=\"status-badge status-ok\">✓ Connected</span>':'<span class=\"status-badge status-error\">✗ Disconnected</span>';"
+                        "document.getElementById('wifiStatus').innerHTML='<strong>Status:</strong> '+status+'<br><strong>SSID:</strong> '+d.ssid+'<br><strong>RSSI:</strong> '+d.rssi+' dBm'})};"
+                        "updateStatus();setInterval(updateStatus,10000);"
+                        // Session timeout warning
+                        "var lastActivity=Date.now();function resetTimer(){lastActivity=Date.now()}"
+                        "document.addEventListener('click',resetTimer);document.addEventListener('keypress',resetTimer);"
+                        "setInterval(function(){if(Date.now()-lastActivity>%d*1000){alert('Session expired due to inactivity');window.location.reload()}},60000);"
+                        "</script></body></html>";
+
+                    char response[8192];
+                    snprintf(response, sizeof(response), admin_page, 
+                             api_key, uplink_ip, current_wifi_ssid, ADMIN_SESSION_TIMEOUT);
+                    send(sock, response, strlen(response), 0);
+                }
                 close(sock);
                 continue;
             }
@@ -1101,9 +1807,9 @@ static void http_server_task(void *pvParameters)
 
                 send(sock, response, strlen(response), 0);
             }
+            
+            close(sock);
         }
-
-        close(sock);
     }
 
     close(listen_sock);
@@ -1137,6 +1843,10 @@ void app_main(void)
     settimeofday(&tv_now, NULL);
     setenv("TZ", "UTC", 1);
     tzset();
+
+    // Load admin password and API key
+    load_admin_password();
+    load_or_generate_api_key();
 
     // Load existing tokens from NVS
     load_tokens_from_nvs();
