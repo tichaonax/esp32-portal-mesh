@@ -72,15 +72,15 @@ typedef struct
 {
     char token[TOKEN_LENGTH + 1];
     time_t created;
-    time_t first_use;           // When token was first used (0 if not used yet)
-    uint32_t duration_minutes;  // Duration from first use
-    uint32_t bandwidth_down_mb; // Download limit in MB
-    uint32_t bandwidth_up_mb;   // Upload limit in MB
+    time_t first_use;             // When token was first used (0 if not used yet)
+    uint32_t duration_minutes;    // Duration from first use
+    uint32_t bandwidth_down_mb;   // Download limit in MB
+    uint32_t bandwidth_up_mb;     // Upload limit in MB
     uint32_t bandwidth_used_down; // Used download in MB
     uint32_t bandwidth_used_up;   // Used upload in MB
     uint32_t usage_count;
     uint8_t client_macs[MAX_DEVICES_PER_TOKEN][6]; // Multiple devices allowed
-    uint8_t device_count;       // Number of devices using this token
+    uint8_t device_count;                          // Number of devices using this token
     bool active;
 } token_info_t;
 
@@ -325,18 +325,18 @@ static void load_tokens_from_nvs(void)
             // Check if token has expired
             time_t now = time(NULL);
             bool expired = false;
-            
+
             if (active_tokens[token_count].first_use > 0)
             {
-                time_t token_expires = active_tokens[token_count].first_use + 
-                                     (active_tokens[token_count].duration_minutes * 60);
+                time_t token_expires = active_tokens[token_count].first_use +
+                                       (active_tokens[token_count].duration_minutes * 60);
                 if (now > token_expires)
                 {
                     ESP_LOGI(TAG, "Token %s expired (time), removing", active_tokens[token_count].token);
                     expired = true;
                 }
             }
-            
+
             // Check bandwidth limits
             if (active_tokens[token_count].bandwidth_down_mb > 0 &&
                 active_tokens[token_count].bandwidth_used_down >= active_tokens[token_count].bandwidth_down_mb)
@@ -350,7 +350,7 @@ static void load_tokens_from_nvs(void)
                 ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", active_tokens[token_count].token);
                 expired = true;
             }
-            
+
             if (expired)
             {
                 active_tokens[token_count].active = false;
@@ -378,8 +378,8 @@ static void load_tokens_from_nvs(void)
 }
 
 // Create new access token with parameters
-static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes, 
-                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
+static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
+                                              uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
 {
     if (token_count >= MAX_TOKENS)
     {
@@ -390,7 +390,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     // Validate duration
     if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
     {
-        ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)", 
+        ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)",
                  duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
         return ESP_ERR_INVALID_ARG;
     }
@@ -400,7 +400,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
 
     time_t now = time(NULL);
     new_token.created = now;
-    new_token.first_use = 0;  // Not used yet
+    new_token.first_use = 0; // Not used yet
     new_token.duration_minutes = duration_minutes;
     new_token.bandwidth_down_mb = bandwidth_down_mb;
     new_token.bandwidth_up_mb = bandwidth_up_mb;
@@ -423,7 +423,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     token_count++;
 
     strcpy(token_out, new_token.token);
-    ESP_LOGI(TAG, "✓ Created new token: %s (duration: %lu min, down: %lu MB, up: %lu MB)", 
+    ESP_LOGI(TAG, "✓ Created new token: %s (duration: %lu min, down: %lu MB, up: %lu MB)",
              token_out, duration_minutes, bandwidth_down_mb, bandwidth_up_mb);
 
     return ESP_OK;
@@ -466,7 +466,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             }
 
             // Check bandwidth expiration
-            if (active_tokens[i].bandwidth_down_mb > 0 && 
+            if (active_tokens[i].bandwidth_down_mb > 0 &&
                 active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
             {
                 ESP_LOGW(TAG, "Token %s exceeded download limit", token);
@@ -474,7 +474,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
                 return false;
             }
-            if (active_tokens[i].bandwidth_up_mb > 0 && 
+            if (active_tokens[i].bandwidth_up_mb > 0 &&
                 active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
             {
                 ESP_LOGW(TAG, "Token %s exceeded upload limit", token);
@@ -499,7 +499,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 // New device - check if we can add it
                 if (active_tokens[i].device_count >= MAX_DEVICES_PER_TOKEN)
                 {
-                    ESP_LOGW(TAG, "Token %s already has %d devices (max allowed)", 
+                    ESP_LOGW(TAG, "Token %s already has %d devices (max allowed)",
                              token, MAX_DEVICES_PER_TOKEN);
                     return false;
                 }
@@ -539,7 +539,7 @@ static void load_or_generate_api_key(void)
 
     size_t key_len = sizeof(api_key);
     err = nvs_get_str(nvs_handle, API_KEY_KEY, api_key, &key_len);
-    
+
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         // Generate new API key
@@ -596,7 +596,7 @@ static void load_admin_password(void)
 
     size_t pass_len = sizeof(admin_password);
     err = nvs_get_str(nvs_handle, ADMIN_PASSWORD_KEY, admin_password, &pass_len);
-    
+
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         strcpy(admin_password, "admin123");
@@ -752,13 +752,13 @@ static int wifi_retry_num = 0;
 static void reconnect_wifi(void)
 {
     ESP_LOGI(TAG, "Reconnecting WiFi with new credentials...");
-    
+
     // Reset retry counter
     wifi_retry_num = 0;
-    
+
     // Disconnect current STA connection
     esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(1000));    // Update WiFi configuration
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Update WiFi configuration
     wifi_config_t wifi_config_sta = {0};
     strncpy((char *)wifi_config_sta.sta.ssid, current_wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
     strncpy((char *)wifi_config_sta.sta.password, current_wifi_pass, sizeof(wifi_config_sta.sta.password));
@@ -795,27 +795,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     {
         wifi_event_sta_disconnected_t *disconnected = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnected, reason: %d", disconnected->reason);
-        
+
         // Log specific disconnect reasons
         switch (disconnected->reason)
         {
-            case WIFI_REASON_AUTH_EXPIRE:
-            case WIFI_REASON_AUTH_LEAVE:
-            case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-            case WIFI_REASON_HANDSHAKE_TIMEOUT:
-                ESP_LOGE(TAG, "✗ Authentication failed - check password for SSID: %s", current_wifi_ssid);
-                break;
-            case WIFI_REASON_NO_AP_FOUND:
-                ESP_LOGE(TAG, "✗ AP not found - check SSID: %s", current_wifi_ssid);
-                break;
-            case WIFI_REASON_ASSOC_FAIL:
-                ESP_LOGE(TAG, "✗ Association failed - router might be rejecting connection");
-                break;
-            default:
-                ESP_LOGW(TAG, "Disconnect reason code: %d", disconnected->reason);
-                break;
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_AUTH_LEAVE:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+            ESP_LOGE(TAG, "✗ Authentication failed - check password for SSID: %s", current_wifi_ssid);
+            break;
+        case WIFI_REASON_NO_AP_FOUND:
+            ESP_LOGE(TAG, "✗ AP not found - check SSID: %s", current_wifi_ssid);
+            break;
+        case WIFI_REASON_ASSOC_FAIL:
+            ESP_LOGE(TAG, "✗ Association failed - router might be rejecting connection");
+            break;
+        default:
+            ESP_LOGW(TAG, "Disconnect reason code: %d", disconnected->reason);
+            break;
         }
-        
+
         if (wifi_retry_num < MAX_WIFI_RETRY)
         {
             esp_wifi_connect();
@@ -824,7 +824,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
         else
         {
-            ESP_LOGE(TAG, "✗ Failed to connect to '%s' after %d attempts - please check credentials in admin panel", 
+            ESP_LOGE(TAG, "✗ Failed to connect to '%s' after %d attempts - please check credentials in admin panel",
                      current_wifi_ssid, MAX_WIFI_RETRY);
         }
     }
@@ -1059,7 +1059,7 @@ static void http_server_task(void *pvParameters)
                 // Must check that request comes from uplink IP (not 192.168.4.x)
                 char client_ip_str[16];
                 inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-                
+
                 // Check if request is from local AP network (reject these)
                 if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
                 {
@@ -1078,7 +1078,7 @@ static void http_server_task(void *pvParameters)
                 if (body != NULL)
                 {
                     body += 4;
-                    
+
                     char received_key[API_KEY_LENGTH + 1] = {0};
                     uint32_t duration = 0;
                     uint32_t bandwidth_down = 0;
@@ -1117,19 +1117,19 @@ static void http_server_task(void *pvParameters)
                         {
                             // Create token with parameters
                             char new_token[TOKEN_LENGTH + 1];
-                            esp_err_t err = create_new_token_with_params(new_token, duration, 
-                                                                        bandwidth_down, bandwidth_up);
-                            
+                            esp_err_t err = create_new_token_with_params(new_token, duration,
+                                                                         bandwidth_down, bandwidth_up);
+
                             if (err == ESP_OK)
                             {
                                 char response[512];
                                 snprintf(response, sizeof(response),
-                                        "HTTP/1.1 200 OK\r\n"
-                                        "Content-Type: application/json\r\n"
-                                        "Connection: close\r\n\r\n"
-                                        "{\"success\":true,\"token\":\"%s\",\"duration_minutes\":%lu,"
-                                        "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu}",
-                                        new_token, duration, bandwidth_down, bandwidth_up);
+                                         "HTTP/1.1 200 OK\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":true,\"token\":\"%s\",\"duration_minutes\":%lu,"
+                                         "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu}",
+                                         new_token, duration, bandwidth_down, bandwidth_up);
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGI(TAG, "API: Created token %s via API", new_token);
                             }
@@ -1177,17 +1177,17 @@ static void http_server_task(void *pvParameters)
                     body += 4;
                     char password[64] = {0};
                     char *pass_start = strstr(body, "password=");
-                    
+
                     if (pass_start)
                     {
                         pass_start += 9;
                         sscanf(pass_start, "%63[^&\r\n]", password);
-                        
+
                         if (strcmp(password, admin_password) == 0)
                         {
                             admin_logged_in = true;
                             update_admin_activity();
-                            
+
                             const char *success =
                                 "HTTP/1.1 200 OK\r\n"
                                 "Content-Type: application/json\r\n"
@@ -1246,18 +1246,18 @@ static void http_server_task(void *pvParameters)
                     body += 4;
                     char old_pass[64] = {0};
                     char new_pass[64] = {0};
-                    
+
                     char *old_start = strstr(body, "old_password=");
                     char *new_start = strstr(body, "new_password=");
-                    
+
                     if (old_start && new_start)
                     {
                         old_start += 13;
                         sscanf(old_start, "%63[^&\r\n]", old_pass);
-                        
+
                         new_start += 13;
                         sscanf(new_start, "%63[^&\r\n]", new_pass);
-                        
+
                         esp_err_t err = change_admin_password(old_pass, new_pass);
                         if (err == ESP_OK)
                         {
@@ -1305,10 +1305,11 @@ static void http_server_task(void *pvParameters)
                     update_admin_activity();
                     char response[512];
                     snprintf(response, sizeof(response),
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: application/json\r\n"
-                            "Connection: close\r\n\r\n"
-                            "{\"success\":true,\"api_key\":\"%s\"}", api_key);
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Connection: close\r\n\r\n"
+                             "{\"success\":true,\"api_key\":\"%s\"}",
+                             api_key);
                     send(sock, response, strlen(response), 0);
                 }
                 else
@@ -1344,25 +1345,26 @@ static void http_server_task(void *pvParameters)
                 {
                     body += 4;
                     uint32_t duration = 0;
-                    
+
                     char *dur_start = strstr(body, "duration=");
                     if (dur_start)
                     {
                         dur_start += 9;
                         sscanf(dur_start, "%lu", &duration);
-                        
+
                         char new_token[TOKEN_LENGTH + 1];
                         esp_err_t err = create_new_token_with_params(new_token, duration, 0, 0);
-                        
+
                         if (err == ESP_OK)
                         {
                             update_admin_activity();
                             char response[256];
                             snprintf(response, sizeof(response),
-                                    "HTTP/1.1 200 OK\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Connection: close\r\n\r\n"
-                                    "{\"success\":true,\"token\":\"%s\"}", new_token);
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Type: application/json\r\n"
+                                     "Connection: close\r\n\r\n"
+                                     "{\"success\":true,\"token\":\"%s\"}",
+                                     new_token);
                             send(sock, response, strlen(response), 0);
                         }
                         else
@@ -1388,7 +1390,7 @@ static void http_server_task(void *pvParameters)
                 if (body != NULL)
                 {
                     body += 4;
-                    
+
                     // Debug: Log the raw POST body
                     ESP_LOGI(TAG, "Raw POST body: '%s'", body);
 
@@ -1400,7 +1402,7 @@ static void http_server_task(void *pvParameters)
                     char *admin_pass_start = strstr(body, "admin_password=");
                     char *ssid_start = strstr(body, "&ssid=");
                     char *pass_start = NULL;
-                    
+
                     // Find password= AFTER ssid= to avoid matching admin_password=
                     if (ssid_start)
                     {
@@ -1442,7 +1444,7 @@ static void http_server_task(void *pvParameters)
 
                         // Debug logging
                         ESP_LOGI(TAG, "Admin config received - SSID: '%s', Password length: %d", new_ssid, strlen(new_pass));
-                        ESP_LOGI(TAG, "Password bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
+                        ESP_LOGI(TAG, "Password bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
                                  new_pass[0], new_pass[1], new_pass[2], new_pass[3],
                                  new_pass[4], new_pass[5], new_pass[6], new_pass[7]);
 
@@ -1450,7 +1452,7 @@ static void http_server_task(void *pvParameters)
                         if (strcmp(admin_pass, admin_password) == 0)
                         {
                             update_admin_activity(); // Update session
-                            
+
                             // Save and reconnect
                             esp_err_t err = save_wifi_credentials(new_ssid, new_pass);
                             if (err == ESP_OK)
@@ -1563,7 +1565,7 @@ static void http_server_task(void *pvParameters)
                 {
                     // Show admin dashboard
                     update_admin_activity();
-                    
+
                     // Get uplink IP address
                     esp_netif_ip_info_t ip_info;
                     char uplink_ip[16] = "Not connected";
@@ -1573,7 +1575,7 @@ static void http_server_task(void *pvParameters)
                     }
 
                     // Send response in parts to avoid stack overflow
-                    const char *header = 
+                    const char *header =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/html; charset=UTF-8\r\n"
                         "Connection: close\r\n\r\n"
@@ -1606,21 +1608,21 @@ static void http_server_task(void *pvParameters)
                         "<div class='header'><h1>🎛️ Admin Dashboard</h1><p>Manage your ESP32 Portal</p>"
                         "<button class='logout-btn secondary' onclick='logout()'>Logout</button></div>"
                         "<div class='grid'>";
-                    
+
                     send(sock, header, strlen(header), 0);
-                    
+
                     // API Management card with dynamic data
                     char api_card[512];
                     snprintf(api_card, sizeof(api_card),
-                        "<div class='card'><h2>🔑 API Management</h2>"
-                        "<p style='color:#666;margin-bottom:15px'>API key for third-party token generation</p>"
-                        "<div class='api-key' id='apiKey'>%s</div>"
-                        "<button onclick='regenKey()'>Regenerate API Key</button>"
-                        "<div class='info-box' style='margin-top:15px'><strong>Uplink IP:</strong> %s<br>"
-                        "<small>Use this IP for API requests</small></div></div>",
-                        api_key, uplink_ip);
+                             "<div class='card'><h2>🔑 API Management</h2>"
+                             "<p style='color:#666;margin-bottom:15px'>API key for third-party token generation</p>"
+                             "<div class='api-key' id='apiKey'>%s</div>"
+                             "<button onclick='regenKey()'>Regenerate API Key</button>"
+                             "<div class='info-box' style='margin-top:15px'><strong>Uplink IP:</strong> %s<br>"
+                             "<small>Use this IP for API requests</small></div></div>",
+                             api_key, uplink_ip);
                     send(sock, api_card, strlen(api_card), 0);
-                    
+
                     // Token generation card
                     const char *token_card =
                         "<div class='card'><h2>🎫 Generate Token</h2>"
@@ -1633,20 +1635,20 @@ static void http_server_task(void *pvParameters)
                         "<strong>Token Created!</strong><strong id='newToken'></strong>"
                         "<p style='margin-top:10px;color:#155724'>Share this token with guests</p></div></div>";
                     send(sock, token_card, strlen(token_card), 0);
-                    
+
                     // WiFi card with dynamic SSID
                     char wifi_card[512];
                     snprintf(wifi_card, sizeof(wifi_card),
-                        "<div class='card'><h2>📡 WiFi Uplink</h2>"
-                        "<div id='wifiStatus' class='info-box'>Loading...</div>"
-                        "<form id='wifiForm'>"
-                        "<label>Admin Password:</label><input type='password' id='adminPass' required>"
-                        "<label>Router SSID:</label><input type='text' id='ssid' value='%s' required>"
-                        "<label>Router Password:</label><input type='password' id='pass' required>"
-                        "<button type='submit'>Update WiFi</button></form></div>",
-                        current_wifi_ssid);
+                             "<div class='card'><h2>📡 WiFi Uplink</h2>"
+                             "<div id='wifiStatus' class='info-box'>Loading...</div>"
+                             "<form id='wifiForm'>"
+                             "<label>Admin Password:</label><input type='password' id='adminPass' required>"
+                             "<label>Router SSID:</label><input type='text' id='ssid' value='%s' required>"
+                             "<label>Router Password:</label><input type='password' id='pass' required>"
+                             "<button type='submit'>Update WiFi</button></form></div>",
+                             current_wifi_ssid);
                     send(sock, wifi_card, strlen(wifi_card), 0);
-                    
+
                     // Password change card
                     const char *pass_card =
                         "<div class='card'><h2>🔐 Change Password</h2>"
@@ -1657,7 +1659,7 @@ static void http_server_task(void *pvParameters)
                         "<button type='submit' class='danger'>Change Password</button></form></div>"
                         "</div></div>";
                     send(sock, pass_card, strlen(pass_card), 0);
-                    
+
                     // JavaScript part 1
                     const char *script1 =
                         "<script>"
@@ -1677,7 +1679,7 @@ static void http_server_task(void *pvParameters)
                         "'&password='+encodeURIComponent(document.getElementById('pass').value);"
                         "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})});";
                     send(sock, script1, strlen(script1), 0);
-                    
+
                     // JavaScript part 2
                     const char *script2 =
                         "document.getElementById('passForm').addEventListener('submit',function(e){"
@@ -1694,15 +1696,15 @@ static void http_server_task(void *pvParameters)
                         "document.getElementById('wifiStatus').innerHTML='<strong>Status:</strong> '+status+'<br><strong>SSID:</strong> '+d.ssid+'<br><strong>RSSI:</strong> '+d.rssi+' dBm'})};"
                         "updateStatus();setInterval(updateStatus,10000);";
                     send(sock, script2, strlen(script2), 0);
-                    
+
                     // Session timeout with dynamic value
                     char script3[512];
                     snprintf(script3, sizeof(script3),
-                        "var lastActivity=Date.now();function resetTimer(){lastActivity=Date.now()}"
-                        "document.addEventListener('click',resetTimer);document.addEventListener('keypress',resetTimer);"
-                        "setInterval(function(){if(Date.now()-lastActivity>%d*1000){alert('Session expired due to inactivity');window.location.reload()}},60000);"
-                        "</script></body></html>",
-                        ADMIN_SESSION_TIMEOUT);
+                             "var lastActivity=Date.now();function resetTimer(){lastActivity=Date.now()}"
+                             "document.addEventListener('click',resetTimer);document.addEventListener('keypress',resetTimer);"
+                             "setInterval(function(){if(Date.now()-lastActivity>%d*1000){alert('Session expired due to inactivity');window.location.reload()}},60000);"
+                             "</script></body></html>",
+                             ADMIN_SESSION_TIMEOUT);
                     send(sock, script3, strlen(script3), 0);
                 }
                 close(sock);
@@ -1828,7 +1830,7 @@ static void http_server_task(void *pvParameters)
 
                 send(sock, response, strlen(response), 0);
             }
-            
+
             close(sock);
         }
     }
@@ -1893,14 +1895,13 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Create default WiFi station and AP with stored references
-    sta_netif = esp_netif_create_default_wifi_sta();
-    ap_netif = esp_netif_create_default_wifi_ap();
+    // Create network interfaces for mesh
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&sta_netif, &ap_netif));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Register WiFi event handlers (still needed for STA events)
+    // Register WiFi and Mesh event handlers
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
@@ -1911,44 +1912,83 @@ void app_main(void)
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(MESH_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &mesh_event_handler,
+                                                        NULL,
+                                                        NULL));
 
+    // Initialize ESP-MESH
+    ESP_ERROR_CHECK(esp_mesh_init());
+    ESP_LOGI(TAG, "✓ ESP-MESH initialized");
+
+    // Configure mesh network
+    mesh_cfg_t mesh_config = MESH_INIT_CONFIG_DEFAULT();
+
+    // Set mesh ID
+    memcpy((uint8_t *)&mesh_config.mesh_id, MESH_ID, 6);
+
+    // Set mesh type to MESH_ROOT (allow this node to become root)
+    mesh_config.mesh_ap.max_connection = 6;
+    mesh_config.mesh_ap.nonmesh_max_connection = 0; // No non-mesh connections on mesh interface
+
+    // Configure router connection for root node
+    strncpy((char *)mesh_config.router.ssid, current_wifi_ssid, sizeof(mesh_config.router.ssid));
+    strncpy((char *)mesh_config.router.password, current_wifi_pass, sizeof(mesh_config.router.password));
+
+    ESP_ERROR_CHECK(esp_mesh_set_config(&mesh_config));
+
+    // Set mesh topology
+    ESP_ERROR_CHECK(esp_mesh_set_max_layer(MESH_MAX_LAYER));
+    ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
+    ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
+
+    // Allow root node switching
+    ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(WIFI_AUTH_WPA2_PSK));
+    ESP_ERROR_CHECK(esp_mesh_set_ap_password((uint8_t *)MESH_PASSWORD, strlen(MESH_PASSWORD)));
+
+    // Enable self-organized networking
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
+
+    // Enable mesh root healing
+    ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+
+    // Set WiFi mode to APSTA for mesh operation
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
-    // Configure AP
+    // Configure the guest AP (separate from mesh)
     wifi_config_t wifi_config_ap = {
         .ap = {
             .ssid = "ESP32-Guest-Portal",
             .ssid_len = strlen("ESP32-Guest-Portal"),
-            .channel = 4,
+            .channel = MESH_CHANNEL,
             .password = "",
             .max_connection = 4,
             .authmode = WIFI_AUTH_OPEN,
         },
     };
-
-    // Configure STA to connect to your home router (use loaded credentials)
-    wifi_config_t wifi_config_sta = {0};
-    strncpy((char *)wifi_config_sta.sta.ssid, current_wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
-    strncpy((char *)wifi_config_sta.sta.password, current_wifi_pass, sizeof(wifi_config_sta.sta.password));
-
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config_ap));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
+
+    // Start WiFi and Mesh
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "✓ WiFi started - AP: ESP32-Guest-Portal, connecting to: %s", current_wifi_ssid);
+    ESP_LOGI(TAG, "✓ WiFi started for mesh operation");
 
-    // Connect to router
-    esp_wifi_connect();
+    ESP_ERROR_CHECK(esp_mesh_start());
+    ESP_LOGI(TAG, "✓ ESP-MESH started - Network: %s", MESH_ID);
+    ESP_LOGI(TAG, "  → Connecting to router: %s", current_wifi_ssid);
+    ESP_LOGI(TAG, "  → Guest AP: ESP32-Guest-Portal");
+    ESP_LOGI(TAG, "  → Mesh Channel: %d, Max Layer: %d", MESH_CHANNEL, MESH_MAX_LAYER);
 
-    // Wait for STA connection
-    ESP_LOGI(TAG, "Waiting for connection to router...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Wait for mesh connection
+    ESP_LOGI(TAG, "Waiting for mesh network to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(8000));
 
-    // Always proceed - start services (NAT will work when STA connects)
-    if (true)
+    // Start captive portal services
+    ESP_LOGI(TAG, "✓ Starting captive portal services");
+
+    // Enable NAT for internet routing - only if we're root node
+    if (esp_mesh_is_root())
     {
-        ESP_LOGI(TAG, "✓ Starting captive portal services");
-
-        // Enable NAT for internet routing from mesh to internet
         esp_netif_ip_info_t ap_ip_info;
         esp_netif_get_ip_info(ap_netif, &ap_ip_info);
 
@@ -1959,26 +1999,40 @@ void app_main(void)
         ip_napt_enable(ap_ip_info.ip.addr, 1);
         ESP_LOGI(TAG, "✓ NAT ENABLED on AP: " IPSTR " forwarding through STA: " IPSTR,
                  IP2STR(&ap_ip_info.ip), IP2STR(&sta_ip_info.ip));
-
-        ESP_LOGI(TAG, "✓ MESH NETWORK ACTIVE: %s", MESH_ID);
-        ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_count);
-        ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
-
-        // Start DNS server for captive portal redirect
-        xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL);
-
-        // Start HTTP server for captive portal with token validation
-        xTaskCreate(http_server_task, "http_server", 8192, NULL, 5, NULL);
-
-        ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
+        ESP_LOGI(TAG, "✓ MESH ROOT NODE: Acting as internet gateway");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "✓ MESH CHILD NODE: Layer %d, relaying through parent", mesh_layer);
     }
 
-    // Keep running
+    ESP_LOGI(TAG, "✓ MESH NETWORK ACTIVE: %s (Connected: %s)",
+             MESH_ID, mesh_connected ? "YES" : "NO");
+    ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_count);
+    ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
+
+    // Start DNS server for captive portal redirect
+    xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL);
+
+    // Start HTTP server for captive portal with token validation
+    xTaskCreate(http_server_task, "http_server", 8192, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
+
+    // Keep running and monitor mesh status
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGI(TAG, "System: Tokens=%d, Authenticated=%d",
+
+        const char *role = esp_mesh_is_root() ? "ROOT" : "CHILD";
+        int routing_table_size = esp_mesh_get_routing_table_size();
+
+        ESP_LOGI(TAG, "Status: Role=%s, Layer=%d, Connected=%d, Tokens=%d, Auth=%d, Routing=%d",
+                 role,
+                 mesh_layer,
+                 mesh_connected ? 1 : 0,
                  token_count,
-                 authenticated_count);
+                 authenticated_count,
+                 routing_table_size);
     }
 }
