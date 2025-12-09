@@ -43,6 +43,11 @@ static const char *TAG = "esp32-mesh-portal";
 #define API_KEY_KEY "api_key"
 #define WIFI_SSID_KEY "wifi_ssid"
 #define WIFI_PASS_KEY "wifi_pass"
+#define WIFI_USE_STATIC_IP_KEY "use_static"
+#define WIFI_STATIC_IP_KEY "static_ip"
+#define WIFI_STATIC_GATEWAY_KEY "static_gw"
+#define WIFI_STATIC_NETMASK_KEY "static_nm"
+#define WIFI_STATIC_DNS_KEY "static_dns"
 #define ADMIN_SESSION_TIMEOUT 300 // 5 minutes in seconds
 #define API_KEY_LENGTH 32
 
@@ -51,6 +56,13 @@ static char admin_password[64] = "admin123";
 static char api_key[API_KEY_LENGTH + 1] = {0};
 static char current_wifi_ssid[32] = MESH_ROUTER_SSID;
 static char current_wifi_pass[64] = MESH_ROUTER_PASS;
+
+// Static IP configuration
+static bool use_static_ip = false;
+static char static_ip[16] = "192.168.1.100";
+static char static_gateway[16] = "192.168.1.1";
+static char static_netmask[16] = "255.255.255.0";
+static char static_dns[16] = "8.8.8.8";
 
 // Admin session management
 static bool admin_logged_in = false;
@@ -704,6 +716,30 @@ static void load_wifi_credentials(void)
         ESP_LOGI(TAG, "Loaded WiFi password from NVS");
     }
 
+    // Load static IP configuration
+    uint8_t use_static = 0;
+    err = nvs_get_u8(nvs_handle, WIFI_USE_STATIC_IP_KEY, &use_static);
+    if (err == ESP_OK)
+    {
+        use_static_ip = (use_static == 1);
+        ESP_LOGI(TAG, "IP Mode: %s", use_static_ip ? "Static" : "DHCP");
+
+        if (use_static_ip)
+        {
+            size_t len = sizeof(static_ip);
+            nvs_get_str(nvs_handle, WIFI_STATIC_IP_KEY, static_ip, &len);
+            len = sizeof(static_gateway);
+            nvs_get_str(nvs_handle, WIFI_STATIC_GATEWAY_KEY, static_gateway, &len);
+            len = sizeof(static_netmask);
+            nvs_get_str(nvs_handle, WIFI_STATIC_NETMASK_KEY, static_netmask, &len);
+            len = sizeof(static_dns);
+            nvs_get_str(nvs_handle, WIFI_STATIC_DNS_KEY, static_dns, &len);
+
+            ESP_LOGI(TAG, "Static IP: %s, Gateway: %s, Netmask: %s, DNS: %s",
+                     static_ip, static_gateway, static_netmask, static_dns);
+        }
+    }
+
     nvs_close(nvs_handle);
 }
 
@@ -748,6 +784,51 @@ static esp_err_t save_wifi_credentials(const char *ssid, const char *password)
     return err;
 }
 
+// Save static IP configuration to NVS
+static esp_err_t save_static_ip_config(bool use_static, const char *ip,
+                                       const char *gateway, const char *netmask, const char *dns)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error opening NVS for IP config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_u8(nvs_handle, WIFI_USE_STATIC_IP_KEY, use_static ? 1 : 0);
+    if (err == ESP_OK && use_static)
+    {
+        nvs_set_str(nvs_handle, WIFI_STATIC_IP_KEY, ip);
+        nvs_set_str(nvs_handle, WIFI_STATIC_GATEWAY_KEY, gateway);
+        nvs_set_str(nvs_handle, WIFI_STATIC_NETMASK_KEY, netmask);
+        nvs_set_str(nvs_handle, WIFI_STATIC_DNS_KEY, dns);
+    }
+
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    if (err == ESP_OK)
+    {
+        use_static_ip = use_static;
+        if (use_static)
+        {
+            strncpy(static_ip, ip, sizeof(static_ip) - 1);
+            strncpy(static_gateway, gateway, sizeof(static_gateway) - 1);
+            strncpy(static_netmask, netmask, sizeof(static_netmask) - 1);
+            strncpy(static_dns, dns, sizeof(static_dns) - 1);
+            ESP_LOGI(TAG, "✓ Static IP config saved: IP=%s, GW=%s, NM=%s, DNS=%s",
+                     ip, gateway, netmask, dns);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "✓ DHCP mode enabled");
+        }
+    }
+
+    return err;
+}
+
 // WiFi connection tracking
 static int wifi_retry_num = 0;
 #define MAX_WIFI_RETRY 5
@@ -760,9 +841,41 @@ static void reconnect_wifi(void)
     // Reset retry counter
     wifi_retry_num = 0;
 
+    // Stop DHCP client first if switching to static IP
+    if (use_static_ip && sta_netif != NULL)
+    {
+        esp_netif_dhcpc_stop(sta_netif);
+
+        // Configure static IP
+        esp_netif_ip_info_t ip_info;
+        memset(&ip_info, 0, sizeof(esp_netif_ip_info_t));
+
+        ip_info.ip.addr = esp_ip4addr_aton(static_ip);
+        ip_info.gw.addr = esp_ip4addr_aton(static_gateway);
+        ip_info.netmask.addr = esp_ip4addr_aton(static_netmask);
+
+        esp_netif_set_ip_info(sta_netif, &ip_info);
+
+        // Set DNS
+        esp_netif_dns_info_t dns_info;
+        dns_info.ip.u_addr.ip4.addr = esp_ip4addr_aton(static_dns);
+        dns_info.ip.type = IPADDR_TYPE_V4;
+        esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+
+        ESP_LOGI(TAG, "Static IP configured: %s", static_ip);
+    }
+    else if (!use_static_ip && sta_netif != NULL)
+    {
+        // Enable DHCP client
+        esp_netif_dhcpc_start(sta_netif);
+        ESP_LOGI(TAG, "DHCP client enabled");
+    }
+
     // Disconnect current STA connection
     esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Update WiFi configuration
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Update WiFi configuration
     wifi_config_t wifi_config_sta = {0};
     strncpy((char *)wifi_config_sta.sta.ssid, current_wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
     strncpy((char *)wifi_config_sta.sta.password, current_wifi_pass, sizeof(wifi_config_sta.sta.password));
@@ -1049,7 +1162,10 @@ static void http_server_task(void *pvParameters)
             bool is_admin_page = (strstr(rx_buffer, "GET /admin") != NULL);
             bool is_admin_config = (strstr(rx_buffer, "POST /admin/configure") != NULL);
             bool is_admin_status = (strstr(rx_buffer, "GET /admin/status") != NULL);
-            bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL);
+            bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL && strstr(rx_buffer, "POST /api/token/") == NULL);
+            bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
+            bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
+            bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
             bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
             bool is_admin_logout = (strstr(rx_buffer, "POST /admin/logout") != NULL);
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
@@ -1165,6 +1281,355 @@ static void http_server_task(void *pvParameters)
                             "Content-Type: application/json\r\n"
                             "Connection: close\r\n\r\n"
                             "{\"success\":false,\"error\":\"Missing required parameters\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle Token Disable API endpoint
+            if (is_api_token_disable)
+            {
+                char client_ip_str[16];
+                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+
+                // Check if request is from local AP network (reject these)
+                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
+                {
+                    const char *error_response =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
+                    send(sock, error_response, strlen(error_response), 0);
+                    close(sock);
+                    continue;
+                }
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char token_to_disable[TOKEN_LENGTH + 1] = {0};
+
+                    // Parse: api_key=XXX&token=XXX
+                    char *key_start = strstr(body, "api_key=");
+                    char *token_start = strstr(body, "token=");
+
+                    if (key_start && token_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        token_start += 6;
+                        sscanf(token_start, "%8[^&\r\n]", token_to_disable);
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Find and disable token
+                            bool found = false;
+                            for (int i = 0; i < MAX_TOKENS; i++)
+                            {
+                                if (active_tokens[i].active &&
+                                    strcmp(active_tokens[i].token, token_to_disable) == 0)
+                                {
+                                    active_tokens[i].active = false;
+                                    token_count--;
+                                    save_token_to_nvs(token_to_disable, &active_tokens[i]); // Persist to NVS
+                                    found = true;
+
+                                    const char *success_response =
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Content-Type: application/json\r\n"
+                                        "Connection: close\r\n\r\n"
+                                        "{\"success\":true,\"message\":\"Token disabled successfully\"}";
+                                    send(sock, success_response, strlen(success_response), 0);
+                                    ESP_LOGI(TAG, "API: Token %s disabled via API", token_to_disable);
+                                    break;
+                                }
+                            }
+
+                            if (!found)
+                            {
+                                const char *not_found_response =
+                                    "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token not found or already disabled\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
+                                send(sock, not_found_response, strlen(not_found_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            const char *auth_error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid API key\"}";
+                            send(sock, auth_error, strlen(auth_error), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle Token Info API endpoint
+            if (is_api_token_info)
+            {
+                char client_ip_str[16];
+                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+
+                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
+                {
+                    const char *error_response =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
+                    send(sock, error_response, strlen(error_response), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Parse query string: /api/token/info?api_key=XXX&token=XXX
+                char received_key[API_KEY_LENGTH + 1] = {0};
+                char token_to_query[TOKEN_LENGTH + 1] = {0};
+
+                char *query_start = strstr(rx_buffer, "GET /api/token/info?");
+                if (query_start)
+                {
+                    query_start += 20; // skip "GET /api/token/info?"
+                    char *key_start = strstr(query_start, "api_key=");
+                    char *token_start = strstr(query_start, "token=");
+
+                    if (key_start && token_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n ]", received_key);
+
+                        token_start += 6;
+                        sscanf(token_start, "%8[^&\r\n ]", token_to_query);
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Find token
+                            bool found = false;
+                            for (int i = 0; i < MAX_TOKENS; i++)
+                            {
+                                if (active_tokens[i].active &&
+                                    strcmp(active_tokens[i].token, token_to_query) == 0)
+                                {
+                                    found = true;
+                                    time_t now = time(NULL);
+                                    time_t expires_at = active_tokens[i].first_use > 0
+                                                            ? active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60)
+                                                            : 0;
+                                    bool is_expired = (active_tokens[i].first_use > 0 && now > expires_at);
+                                    bool is_used = (active_tokens[i].first_use > 0);
+                                    int64_t remaining_seconds = is_used && !is_expired
+                                                                    ? (expires_at - now)
+                                                                    : 0;
+
+                                    char response[1024];
+                                    snprintf(response, sizeof(response),
+                                             "HTTP/1.1 200 OK\r\n"
+                                             "Content-Type: application/json\r\n"
+                                             "Connection: close\r\n\r\n"
+                                             "{\"success\":true,\"token\":\"%s\","
+                                             "\"status\":\"%s\","
+                                             "\"created\":%lld,"
+                                             "\"first_use\":%lld,"
+                                             "\"duration_minutes\":%lu,"
+                                             "\"expires_at\":%lld,"
+                                             "\"remaining_seconds\":%lld,"
+                                             "\"bandwidth_down_mb\":%lu,"
+                                             "\"bandwidth_up_mb\":%lu,"
+                                             "\"bandwidth_used_down_mb\":%lu,"
+                                             "\"bandwidth_used_up_mb\":%lu,"
+                                             "\"usage_count\":%lu,"
+                                             "\"device_count\":%u,"
+                                             "\"max_devices\":%d}",
+                                             active_tokens[i].token,
+                                             is_expired ? "expired" : (is_used ? "active" : "unused"),
+                                             (long long)active_tokens[i].created,
+                                             (long long)active_tokens[i].first_use,
+                                             active_tokens[i].duration_minutes,
+                                             (long long)expires_at,
+                                             remaining_seconds,
+                                             active_tokens[i].bandwidth_down_mb,
+                                             active_tokens[i].bandwidth_up_mb,
+                                             active_tokens[i].bandwidth_used_down,
+                                             active_tokens[i].bandwidth_used_up,
+                                             active_tokens[i].usage_count,
+                                             active_tokens[i].device_count,
+                                             MAX_DEVICES_PER_TOKEN);
+                                    send(sock, response, strlen(response), 0);
+                                    break;
+                                }
+                            }
+
+                            if (!found)
+                            {
+                                const char *not_found_response =
+                                    "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token not found\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
+                                send(sock, not_found_response, strlen(not_found_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            const char *auth_error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid API key\"}";
+                            send(sock, auth_error, strlen(auth_error), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle Token Extend API endpoint
+            if (is_api_token_extend)
+            {
+                char client_ip_str[16];
+                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+
+                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
+                {
+                    const char *error_response =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
+                    send(sock, error_response, strlen(error_response), 0);
+                    close(sock);
+                    continue;
+                }
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char token_to_extend[TOKEN_LENGTH + 1] = {0};
+
+                    // Parse: api_key=XXX&token=XXX
+                    char *key_start = strstr(body, "api_key=");
+                    char *token_start = strstr(body, "token=");
+
+                    if (key_start && token_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        token_start += 6;
+                        sscanf(token_start, "%8[^&\r\n]", token_to_extend);
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Find token
+                            bool found = false;
+                            for (int i = 0; i < MAX_TOKENS; i++)
+                            {
+                                if (active_tokens[i].active &&
+                                    strcmp(active_tokens[i].token, token_to_extend) == 0)
+                                {
+                                    found = true;
+
+                                    // Reset data usage counters
+                                    active_tokens[i].bandwidth_used_down = 0;
+                                    active_tokens[i].bandwidth_used_up = 0;
+
+                                    // Reset time - set first_use to now to restart the duration
+                                    active_tokens[i].first_use = time(NULL);
+
+                                    // Reset usage count
+                                    active_tokens[i].usage_count = 0;
+
+                                    save_token_to_nvs(token_to_extend, &active_tokens[i]); // Persist to NVS
+
+                                    time_t new_expires = active_tokens[i].first_use +
+                                                         (active_tokens[i].duration_minutes * 60);
+
+                                    char response[512];
+                                    snprintf(response, sizeof(response),
+                                             "HTTP/1.1 200 OK\r\n"
+                                             "Content-Type: application/json\r\n"
+                                             "Connection: close\r\n\r\n"
+                                             "{\"success\":true,"
+                                             "\"message\":\"Token extended successfully\","
+                                             "\"token\":\"%s\","
+                                             "\"duration_minutes\":%lu,"
+                                             "\"new_expires_at\":%lld,"
+                                             "\"bandwidth_down_mb\":%lu,"
+                                             "\"bandwidth_up_mb\":%lu}",
+                                             active_tokens[i].token,
+                                             active_tokens[i].duration_minutes,
+                                             (long long)new_expires,
+                                             active_tokens[i].bandwidth_down_mb,
+                                             active_tokens[i].bandwidth_up_mb);
+                                    send(sock, response, strlen(response), 0);
+                                    ESP_LOGI(TAG, "API: Token %s extended via API", token_to_extend);
+                                    break;
+                                }
+                            }
+
+                            if (!found)
+                            {
+                                const char *not_found_response =
+                                    "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token not found or has been disabled\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
+                                send(sock, not_found_response, strlen(not_found_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            const char *auth_error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Invalid API key\"}";
+                            send(sock, auth_error, strlen(auth_error), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
@@ -1401,11 +1866,21 @@ static void http_server_task(void *pvParameters)
                     char admin_pass[64] = {0};
                     char new_ssid[32] = {0};
                     char new_pass[64] = {0};
+                    bool use_static = false;
+                    char new_static_ip[16] = {0};
+                    char new_static_gw[16] = {0};
+                    char new_static_nm[16] = {0};
+                    char new_static_dns[16] = {0};
 
-                    // Parse admin_password=XXX&ssid=XXX&password=XXX
+                    // Parse admin_password=XXX&ssid=XXX&password=XXX&use_static=XXX&static_ip=...
                     char *admin_pass_start = strstr(body, "admin_password=");
                     char *ssid_start = strstr(body, "&ssid=");
                     char *pass_start = NULL;
+                    char *use_static_start = strstr(body, "&use_static=");
+                    char *static_ip_start = strstr(body, "&static_ip=");
+                    char *static_gw_start = strstr(body, "&static_gw=");
+                    char *static_nm_start = strstr(body, "&static_nm=");
+                    char *static_dns_start = strstr(body, "&static_dns=");
 
                     // Find password= AFTER ssid= to avoid matching admin_password=
                     if (ssid_start)
@@ -1446,19 +1921,54 @@ static void http_server_task(void *pvParameters)
                         }
                         new_pass[i] = '\0'; // Ensure null termination
 
+                        // Extract static IP configuration
+                        if (use_static_start)
+                        {
+                            use_static_start += 12; // skip "&use_static="
+                            use_static = (strncmp(use_static_start, "true", 4) == 0);
+                        }
+
+                        if (use_static && static_ip_start && static_gw_start && static_nm_start && static_dns_start)
+                        {
+                            // Extract static IP
+                            static_ip_start += 11; // skip "&static_ip="
+                            sscanf(static_ip_start, "%15[^&\r\n]", new_static_ip);
+
+                            // Extract gateway
+                            static_gw_start += 11; // skip "&static_gw="
+                            sscanf(static_gw_start, "%15[^&\r\n]", new_static_gw);
+
+                            // Extract netmask
+                            static_nm_start += 11; // skip "&static_nm="
+                            sscanf(static_nm_start, "%15[^&\r\n]", new_static_nm);
+
+                            // Extract DNS
+                            static_dns_start += 12; // skip "&static_dns="
+                            sscanf(static_dns_start, "%15[^&\r\n]", new_static_dns);
+                        }
+
                         // Debug logging
                         ESP_LOGI(TAG, "Admin config received - SSID: '%s', Password length: %d", new_ssid, strlen(new_pass));
-                        ESP_LOGI(TAG, "Password bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
-                                 new_pass[0], new_pass[1], new_pass[2], new_pass[3],
-                                 new_pass[4], new_pass[5], new_pass[6], new_pass[7]);
+                        ESP_LOGI(TAG, "Static IP mode: %s", use_static ? "enabled" : "disabled");
 
                         // Verify admin password
                         if (strcmp(admin_pass, admin_password) == 0)
                         {
                             update_admin_activity(); // Update session
 
-                            // Save and reconnect
+                            // Save WiFi credentials and static IP config
                             esp_err_t err = save_wifi_credentials(new_ssid, new_pass);
+                            if (err == ESP_OK && use_static)
+                            {
+                                err = save_static_ip_config(use_static, new_static_ip,
+                                                            new_static_gw, new_static_nm, new_static_dns);
+                            }
+                            else if (err == ESP_OK && !use_static)
+                            {
+                                // Save DHCP mode
+                                err = save_static_ip_config(false, "", "", "", "");
+                            }
+
                             if (err == ESP_OK)
                             {
                                 reconnect_wifi();
@@ -1660,8 +2170,8 @@ static void http_server_task(void *pvParameters)
                                                                 "Channel: " TOSTRING(MESH_CHANNEL) "</p></div>";
                     send(sock, mesh_card, strlen(mesh_card), 0);
 
-                    // WiFi card with dynamic SSID
-                    char wifi_card[512];
+                    // WiFi card with dynamic SSID and static IP options
+                    char wifi_card[1536];
                     snprintf(wifi_card, sizeof(wifi_card),
                              "<div class='card'><h2>📡 WiFi Uplink</h2>"
                              "<div id='wifiStatus' class='info-box'>Loading...</div>"
@@ -1669,8 +2179,23 @@ static void http_server_task(void *pvParameters)
                              "<label>Admin Password:</label><input type='password' id='adminPass' required>"
                              "<label>Router SSID:</label><input type='text' id='ssid' value='%s' required>"
                              "<label>Router Password:</label><input type='password' id='pass' required>"
+                             "<div style='margin:15px 0;padding:10px;background:#f8f9fa;border-radius:5px'>"
+                             "<label style='display:flex;align-items:center;cursor:pointer'>"
+                             "<input type='checkbox' id='useStatic' %s style='margin-right:8px'> Use Static IP</label>"
+                             "<div id='staticIpFields' style='display:%s;margin-top:10px'>"
+                             "<label>IP Address:</label><input type='text' id='staticIp' value='%s' placeholder='192.168.1.100'>"
+                             "<label>Gateway:</label><input type='text' id='staticGw' value='%s' placeholder='192.168.1.1'>"
+                             "<label>Subnet Mask:</label><input type='text' id='staticNm' value='%s' placeholder='255.255.255.0'>"
+                             "<label>DNS Server:</label><input type='text' id='staticDns' value='%s' placeholder='8.8.8.8'>"
+                             "</div></div>"
                              "<button type='submit'>Update WiFi</button></form></div>",
-                             current_wifi_ssid);
+                             current_wifi_ssid,
+                             use_static_ip ? "checked" : "",
+                             use_static_ip ? "block" : "none",
+                             static_ip,
+                             static_gateway,
+                             static_netmask,
+                             static_dns);
                     send(sock, wifi_card, strlen(wifi_card), 0);
 
                     // Password change card
@@ -1687,6 +2212,8 @@ static void http_server_task(void *pvParameters)
                     // JavaScript part 1
                     const char *script1 =
                         "<script>"
+                        "document.getElementById('useStatic').addEventListener('change',function(){"
+                        "document.getElementById('staticIpFields').style.display=this.checked?'block':'none'});"
                         "function logout(){fetch('/admin/logout',{method:'POST'}).then(()=>window.location.reload())}"
                         "function regenKey(){if(confirm('Regenerate API key? Old key will stop working.')){"
                         "fetch('/admin/regenerate_key',{method:'POST'}).then(r=>r.json()).then(d=>{"
@@ -1700,7 +2227,13 @@ static void http_server_task(void *pvParameters)
                         "e.preventDefault();if(!confirm('Update WiFi configuration?'))return;"
                         "var data='admin_password='+encodeURIComponent(document.getElementById('adminPass').value)+"
                         "'&ssid='+encodeURIComponent(document.getElementById('ssid').value)+"
-                        "'&password='+encodeURIComponent(document.getElementById('pass').value);"
+                        "'&password='+encodeURIComponent(document.getElementById('pass').value)+"
+                        "'&use_static='+document.getElementById('useStatic').checked;"
+                        "if(document.getElementById('useStatic').checked){"
+                        "data+='&static_ip='+encodeURIComponent(document.getElementById('staticIp').value)+"
+                        "'&static_gw='+encodeURIComponent(document.getElementById('staticGw').value)+"
+                        "'&static_nm='+encodeURIComponent(document.getElementById('staticNm').value)+"
+                        "'&static_dns='+encodeURIComponent(document.getElementById('staticDns').value)}"
                         "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})});";
                     send(sock, script1, strlen(script1), 0);
 
