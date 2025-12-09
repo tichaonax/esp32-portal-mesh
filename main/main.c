@@ -31,7 +31,8 @@ static const char *TAG = "esp32-mesh-portal";
 #define TOSTRING(x) STRINGIFY(x)
 
 // Mesh configuration
-#define MESH_ID "ESP32-PORTAL-MESH"
+#define MESH_ENABLED false           // Set to true to enable mesh networking
+#define MESH_ID "ESP32-Guest-Portal" // This will be the visible SSID
 #define MESH_PASSWORD "meshpass123"
 #define MESH_CHANNEL 4 // Same as uplink WiFi channel
 #define MESH_MAX_LAYER 6
@@ -160,6 +161,35 @@ static void add_authenticated_client(uint32_t client_ip, const uint8_t *mac)
     ESP_LOGW(TAG, "Authenticated clients list full!");
 }
 
+// Helper function to count authenticated clients
+static int get_authenticated_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < MAX_AUTHENTICATED_CLIENTS; i++)
+    {
+        if (authenticated_clients[i].active)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Helper function to count active tokens
+static int get_active_token_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < MAX_TOKENS; i++)
+    {
+        if (active_tokens[i].active)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+#if MESH_ENABLED
 // ESP-MESH event handler
 static void mesh_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -261,6 +291,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
         break;
     }
 }
+#endif // MESH_ENABLED
 
 // Generate random alphanumeric token
 static void generate_token(char *token_out)
@@ -899,6 +930,34 @@ static void reconnect_wifi(void)
     }
 }
 
+// Enable NAT for internet routing
+static void enable_nat_routing(void)
+{
+    if (ap_netif == NULL || sta_netif == NULL)
+    {
+        ESP_LOGW(TAG, "Cannot enable NAT: interfaces not initialized");
+        return;
+    }
+
+    esp_netif_ip_info_t ap_ip_info;
+    esp_netif_get_ip_info(ap_netif, &ap_ip_info);
+
+    esp_netif_ip_info_t sta_ip_info;
+    esp_netif_get_ip_info(sta_netif, &sta_ip_info);
+
+    if (sta_ip_info.ip.addr != 0)
+    {
+        // Enable NAPT on the AP interface
+        ip_napt_enable(ap_ip_info.ip.addr, 1);
+        ESP_LOGI(TAG, "✓ NAT ENABLED on AP: " IPSTR " forwarding through STA: " IPSTR,
+                 IP2STR(&ap_ip_info.ip), IP2STR(&sta_ip_info.ip));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "NAT not enabled: STA has no IP address yet");
+    }
+}
+
 // WiFi event handler
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -951,6 +1010,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "✓✓✓ INTERNET CONNECTED ✓✓✓ Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "✓ STA connected to: %s", current_wifi_ssid);
         wifi_retry_num = 0;
+
+        // Enable NAT routing for guest clients
+        enable_nat_routing();
     }
 }
 
@@ -1095,8 +1157,8 @@ static void http_server_task(void *pvParameters)
     int ip_protocol = IPPROTO_IP;
 
     struct sockaddr_in dest_addr;
-    // Bind only to AP IP (192.168.4.1) to avoid intercepting forwarded traffic
-    dest_addr.sin_addr.s_addr = inet_addr("192.168.4.1");
+    // Bind to all interfaces (0.0.0.0) to be accessible from AP and STA networks
+    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(80);
 
@@ -1162,6 +1224,7 @@ static void http_server_task(void *pvParameters)
             bool is_admin_page = (strstr(rx_buffer, "GET /admin") != NULL);
             bool is_admin_config = (strstr(rx_buffer, "POST /admin/configure") != NULL);
             bool is_admin_status = (strstr(rx_buffer, "GET /admin/status") != NULL);
+            bool is_customer_status = (strstr(rx_buffer, "GET /status") != NULL);
             bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL && strstr(rx_buffer, "POST /api/token/") == NULL);
             bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
             bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
@@ -2271,10 +2334,16 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
-            // If authenticated and NOT trying to login or admin, close connection to let traffic through
-            if (is_authenticated && !is_post_login && !is_admin_page && !is_admin_config && !is_admin_status)
+            // If authenticated and NOT accessing portal pages, close connection to let traffic through to internet
+            bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status || 
+                                  is_customer_status || is_api_token || is_api_token_disable || 
+                                  is_api_token_info || is_api_token_extend ||
+                                  (strstr(rx_buffer, "GET / HTTP") != NULL) ||  // Main portal page
+                                  (strstr(rx_buffer, "GET /favicon.ico") != NULL);
+            
+            if (is_authenticated && !is_portal_page)
             {
-                ESP_LOGI(TAG, "Authenticated client - closing connection to allow direct internet access");
+                ESP_LOGI(TAG, "Authenticated client accessing internet - closing connection to allow direct access");
                 close(sock);
                 continue;
             }
@@ -2455,7 +2524,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Create network interfaces for mesh
+#if MESH_ENABLED
+    // MESH MODE: Create network interfaces for mesh
+    ESP_LOGI(TAG, "Starting in MESH MODE");
     ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&sta_netif, &ap_netif));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -2542,10 +2613,111 @@ void app_main(void)
     // Wait for mesh connection
     ESP_LOGI(TAG, "Waiting for mesh network to stabilize...");
     vTaskDelay(pdMS_TO_TICKS(8000));
+#else
+    // STANDALONE AP MODE: Simple captive portal without mesh
+    ESP_LOGI(TAG, "Starting in STANDALONE AP MODE");
+
+    // Create AP and STA interfaces
+    ap_netif = esp_netif_create_default_wifi_ap();
+    sta_netif = esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // Register WiFi event handlers
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    // Configure WiFi for APSTA mode
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    // Configure the AP
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "ESP32-Guest-Portal",
+            .ssid_len = strlen("ESP32-Guest-Portal"),
+            .channel = MESH_CHANNEL,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+    // Configure the STA (for router connection)
+    wifi_config_t sta_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    strncpy((char *)sta_config.sta.ssid, current_wifi_ssid, sizeof(sta_config.sta.ssid));
+    strncpy((char *)sta_config.sta.password, current_wifi_pass, sizeof(sta_config.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+
+    // Configure static IP if enabled (BEFORE starting WiFi)
+    if (use_static_ip && sta_netif != NULL)
+    {
+        ESP_LOGI(TAG, "Configuring static IP: %s", static_ip);
+
+        // Stop DHCP client
+        esp_netif_dhcpc_stop(sta_netif);
+
+        // Configure static IP
+        esp_netif_ip_info_t ip_info;
+        memset(&ip_info, 0, sizeof(esp_netif_ip_info_t));
+
+        ip_info.ip.addr = esp_ip4addr_aton(static_ip);
+        ip_info.gw.addr = esp_ip4addr_aton(static_gateway);
+        ip_info.netmask.addr = esp_ip4addr_aton(static_netmask);
+
+        esp_netif_set_ip_info(sta_netif, &ip_info);
+
+        // Set DNS
+        esp_netif_dns_info_t dns_info;
+        dns_info.ip.u_addr.ip4.addr = esp_ip4addr_aton(static_dns);
+        dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+        esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+
+        ESP_LOGI(TAG, "✓ Static IP configured at startup: IP=%s, GW=%s, NM=%s, DNS=%s",
+                 static_ip, static_gateway, static_netmask, static_dns);
+    }
+
+    // Start WiFi
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "✓ WiFi started - AP: ESP32-Guest-Portal");
+
+    // Connect to router (non-blocking, will retry via event handler)
+    ESP_LOGI(TAG, "WiFi STA starting, attempting connection to: %s", current_wifi_ssid);
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Initial WiFi connect returned error (will retry): %s", esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "  → Connecting to router: %s", current_wifi_ssid);
+
+    // Wait for connection
+    vTaskDelay(pdMS_TO_TICKS(3000));
+#endif // MESH_ENABLED
 
     // Start captive portal services
     ESP_LOGI(TAG, "✓ Starting captive portal services");
 
+#if MESH_ENABLED
     // Enable NAT for internet routing - only if we're root node
     if (esp_mesh_is_root())
     {
@@ -2568,22 +2740,28 @@ void app_main(void)
 
     ESP_LOGI(TAG, "✓ MESH NETWORK ACTIVE: %s (Connected: %s)",
              MESH_ID, mesh_connected ? "YES" : "NO");
+#else
+    // In standalone mode, NAT is enabled automatically via enable_nat_routing() on IP_EVENT_STA_GOT_IP
+    enable_nat_routing();
+#endif
+
     ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_count);
     ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
 
     // Start DNS server for captive portal redirect
     xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL);
 
-    // Start HTTP server for captive portal with token validation
-    xTaskCreate(http_server_task, "http_server", 8192, NULL, 5, NULL);
+    // Start HTTP server for captive portal with token validation (32KB stack for large HTML pages & admin panel)
+    xTaskCreate(http_server_task, "http_server", 32768, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
 
-    // Keep running and monitor mesh status
+    // Keep running and monitor status
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(10000));
 
+#if MESH_ENABLED
         const char *role = esp_mesh_is_root() ? "ROOT" : "CHILD";
         int routing_table_size = esp_mesh_get_routing_table_size();
 
@@ -2594,5 +2772,10 @@ void app_main(void)
                  token_count,
                  authenticated_count,
                  routing_table_size);
+#else
+        ESP_LOGI(TAG, "Status: Role=CHILD, Layer=-1, Connected=0, Tokens=%d, Auth=%d, Routing=0",
+                 token_count,
+                 authenticated_count);
+#endif
     }
 }
