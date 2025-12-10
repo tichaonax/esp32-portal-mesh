@@ -23,8 +23,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "esp_sntp.h"
+#include "heartbeat.h"
 
 static const char *TAG = "esp32-mesh-portal";
+
+// Time sync state
+static bool time_synced = false;
+static time_t time_sync_timestamp = 0;
 
 // Helper macros
 #define STRINGIFY(x) #x
@@ -51,6 +57,9 @@ static const char *TAG = "esp32-mesh-portal";
 #define WIFI_STATIC_DNS_KEY "static_dns"
 #define ADMIN_SESSION_TIMEOUT 300 // 5 minutes in seconds
 #define API_KEY_LENGTH 32
+
+// Heartbeat LED configuration
+#define HEARTBEAT_LED_GPIO GPIO_NUM_2  // Built-in LED on most ESP32 boards
 
 // Current credentials (loaded from NVS or defaults)
 static char admin_password[64] = "admin123";
@@ -424,10 +433,36 @@ static void load_tokens_from_nvs(void)
     ESP_LOGI(TAG, "Loaded %d active tokens from NVS", token_count);
 }
 
+// Check if system time is synced and valid
+static bool is_time_valid(void)
+{
+    if (!time_synced)
+    {
+        return false;
+    }
+
+    // Check if sync was recent (within 24 hours)
+    time_t now = time(NULL);
+    if (now - time_sync_timestamp > 86400)
+    {
+        ESP_LOGW(TAG, "Time sync is stale (>24h old)");
+        return false;
+    }
+
+    return true;
+}
+
 // Create new access token with parameters
 static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
 {
+    // Check if time is valid before creating token
+    if (!is_time_valid())
+    {
+        ESP_LOGW(TAG, "Cannot create token: system time not synced");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (token_count >= MAX_TOKENS)
     {
         ESP_LOGE(TAG, "Maximum token limit reached");
@@ -486,6 +521,13 @@ static esp_err_t create_new_token(char *token_out)
 // Validate token and bind to client MAC
 static bool validate_token(const char *token, const uint8_t *client_mac)
 {
+    // Cannot validate tokens without valid time
+    if (!is_time_valid())
+    {
+        ESP_LOGW(TAG, "Cannot validate token: system time not synced");
+        return false;
+    }
+
     time_t now = time(NULL);
 
     for (int i = 0; i < token_count; i++)
@@ -574,7 +616,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
 }
 
 // Get token info by token string (helper function)
-static token_info_t* get_token_info_by_string(const char *token)
+static token_info_t *get_token_info_by_string(const char *token)
 {
     for (int i = 0; i < token_count; i++)
     {
@@ -584,6 +626,174 @@ static token_info_t* get_token_info_by_string(const char *token)
         }
     }
     return NULL;
+}
+
+// SNTP sync notification callback
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    time_synced = true;
+    time_sync_timestamp = tv->tv_sec;
+    
+    char time_str[64];
+    struct tm *timeinfo = localtime(&tv->tv_sec);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
+    ESP_LOGI(TAG, "✓ Time synchronized via SNTP: %s", time_str);
+}
+
+// Initialize SNTP time synchronization
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP time sync...");
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_setservername(2, "time.cloudflare.com");
+    esp_sntp_init();
+
+    // Set timezone to UTC
+    setenv("TZ", "UTC", 1);
+    tzset();
+
+    ESP_LOGI(TAG, "Waiting for time sync from NTP servers...");
+}
+
+// Task to poll SNTP every 30 seconds
+static void sntp_poll_task(void *pvParameters)
+{
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(30000)); // 30 seconds
+
+        if (sta_netif != NULL)
+        {
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0)
+            {
+                // We have internet, request time sync
+                esp_sntp_restart();
+            }
+        }
+    }
+}
+
+// Get token info by client MAC address
+static token_info_t *get_token_info_by_mac(const uint8_t *mac)
+{
+    for (int i = 0; i < token_count; i++)
+    {
+        if (!active_tokens[i].active)
+            continue;
+
+        // Check if this MAC is registered with the token
+        for (int j = 0; j < active_tokens[i].device_count; j++)
+        {
+            if (memcmp(active_tokens[i].client_macs[j], mac, 6) == 0)
+            {
+                return &active_tokens[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// Send stats page for authenticated user
+static void send_stats_page(int sock, const char *token_str, token_info_t *token_info)
+{
+    // Calculate remaining time
+    time_t now = time(NULL);
+    time_t expires_at = token_info->first_use + (token_info->duration_minutes * 60);
+    time_t time_remaining = expires_at - now;
+    int hours_left = time_remaining / 3600;
+    int minutes_left = (time_remaining % 3600) / 60;
+
+    // Format expiration date
+    struct tm *exp_time = localtime(&expires_at);
+    char exp_str[64];
+    strftime(exp_str, sizeof(exp_str), "%b %d, %Y %I:%M %p", exp_time);
+
+    // Build success response with detailed stats
+    char response[3072];
+    int offset = snprintf(response, sizeof(response),
+                          "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: text/html; charset=UTF-8\r\n"
+                          "Connection: close\r\n\r\n"
+                          "<!DOCTYPE html>"
+                          "<html><head><meta charset='UTF-8'><title>Connected</title>"
+                          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                          "<style>"
+                          "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);min-height:100vh;display:flex;align-items:center;justify-content:center}"
+                          ".box{background:white;padding:30px;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,0.2);max-width:400px;width:100%%}"
+                          "h1{color:#28a745;margin:0 0 10px 0;font-size:28px}h1::before{content:'✓ ';font-size:32px}"
+                          "p{color:#666;margin:0 0 20px 0}"
+                          ".divider{border-top:2px solid #f0f0f0;margin:20px 0}"
+                          ".token-code{background:#f8f9fa;padding:12px;border-radius:8px;font-family:monospace;font-size:18px;font-weight:bold;text-align:center;letter-spacing:2px;margin:15px 0;color:#333}"
+                          ".stat-group{margin:15px 0}"
+                          ".stat-label{font-size:20px;margin-right:8px}"
+                          ".stat-title{font-weight:600;color:#333;margin-bottom:8px;display:flex;align-items:center}"
+                          ".stat-value{color:#666;font-size:14px;margin-left:28px}"
+                          ".time-remaining{font-size:24px;font-weight:bold;color:#28a745;margin:5px 0}"
+                          ".expires{color:#999;font-size:12px}"
+                          ".usage-badge{display:inline-block;background:#e7f3ff;color:#0066cc;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;margin:5px 5px 5px 28px}"
+                          ".unlimited{color:#28a745;font-weight:600}"
+                          "</style></head><body><div class='box'>"
+                          "<h1>Connected!</h1>"
+                          "<p>Your device is now connected to the internet</p>"
+                          "<div class='divider'></div>"
+                          "<div class='token-code'>%s</div>",
+                          token_str);
+
+    // Time remaining section
+    offset += snprintf(response + offset, sizeof(response) - offset,
+                       "<div class='stat-group'>"
+                       "<div class='stat-title'><span class='stat-label'>⏱️</span> Time Remaining</div>"
+                       "<div class='time-remaining'>%dh %dm</div>"
+                       "<div class='expires'>Expires: %s</div>"
+                       "</div>",
+                       hours_left, minutes_left, exp_str);
+
+    // Usage statistics section
+    offset += snprintf(response + offset, sizeof(response) - offset,
+                       "<div class='stat-group'>"
+                       "<div class='stat-title'><span class='stat-label'>📊</span> Usage Statistics</div>"
+                       "<div class='usage-badge'>Used %lu times</div>"
+                       "<div class='usage-badge'>Device %d of %d</div>"
+                       "</div>",
+                       token_info->usage_count, token_info->device_count, MAX_DEVICES_PER_TOKEN);
+
+    // Bandwidth section
+    offset += snprintf(response + offset, sizeof(response) - offset,
+                       "<div class='stat-group'>"
+                       "<div class='stat-title'><span class='stat-label'>📶</span> Bandwidth</div>");
+
+    if (token_info->bandwidth_down_mb == 0)
+    {
+        offset += snprintf(response + offset, sizeof(response) - offset,
+                           "<div class='stat-value'>Download: <span class='unlimited'>Unlimited</span></div>");
+    }
+    else
+    {
+        offset += snprintf(response + offset, sizeof(response) - offset,
+                           "<div class='stat-value'>Download: %lu / %lu MB</div>",
+                           token_info->bandwidth_used_down, token_info->bandwidth_down_mb);
+    }
+
+    if (token_info->bandwidth_up_mb == 0)
+    {
+        offset += snprintf(response + offset, sizeof(response) - offset,
+                           "<div class='stat-value'>Upload: <span class='unlimited'>Unlimited</span></div>");
+    }
+    else
+    {
+        offset += snprintf(response + offset, sizeof(response) - offset,
+                           "<div class='stat-value'>Upload: %lu / %lu MB</div>",
+                           token_info->bandwidth_used_up, token_info->bandwidth_up_mb);
+    }
+
+    offset += snprintf(response + offset, sizeof(response) - offset,
+                       "</div></div></body></html>");
+
+    send(sock, response, strlen(response), 0);
 }
 
 // Load or generate API key
@@ -1005,6 +1215,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             break;
         }
 
+        // Switch LED back to fast blink (disconnected mode)
+        heartbeat_set_connected(false);
+        ESP_LOGI(TAG, "✓ Heartbeat: Fast blink (WiFi disconnected)");
+
         if (wifi_retry_num < MAX_WIFI_RETRY)
         {
             esp_wifi_connect();
@@ -1026,6 +1240,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
         // Enable NAT routing for guest clients
         enable_nat_routing();
+
+        // Initialize SNTP time sync
+        esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+        initialize_sntp();
+
+        // Start SNTP poll task
+        xTaskCreate(sntp_poll_task, "sntp_poll", 4096, NULL, 5, NULL);
+
+        // Switch LED to slow heartbeat (connected mode)
+        heartbeat_set_connected(true);
+        ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected)");
     }
 }
 
@@ -1323,6 +1548,16 @@ static void http_server_task(void *pvParameters)
                                          new_token, duration, bandwidth_down, bandwidth_up);
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGI(TAG, "API: Created token %s via API", new_token);
+                            }
+                            else if (err == ESP_ERR_INVALID_STATE)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Time not synchronized. Please wait for time sync.\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Token creation denied - time not synced");
                             }
                             else
                             {
@@ -1907,6 +2142,16 @@ static void http_server_task(void *pvParameters)
                                      new_token);
                             send(sock, response, strlen(response), 0);
                         }
+                        else if (err == ESP_ERR_INVALID_STATE)
+                        {
+                            const char *error =
+                                "HTTP/1.1 503 Service Unavailable\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Time not synchronized. Please connect to internet.\"}";
+                            send(sock, error, strlen(error), 0);
+                            ESP_LOGW(TAG, "Admin: Token creation denied - time not synced");
+                        }
                         else
                         {
                             const char *error =
@@ -2342,6 +2587,26 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle captive portal detection requests
+            bool is_captive_detection = 
+                (strstr(rx_buffer, "connectivitycheck") != NULL) ||
+                (strstr(rx_buffer, "msftconnecttest") != NULL) ||
+                (strstr(rx_buffer, "captive.apple.com") != NULL) ||
+                (strstr(rx_buffer, "clients3.google.com") != NULL) ||
+                (strstr(rx_buffer, "generate_204") != NULL);
+
+            if (is_captive_detection && !is_authenticated)
+            {
+                // Redirect unauthenticated clients to our portal
+                const char *redirect =
+                    "HTTP/1.1 302 Found\r\n"
+                    "Location: http://192.168.4.1/\r\n"
+                    "Connection: close\r\n\r\n";
+                send(sock, redirect, strlen(redirect), 0);
+                close(sock);
+                continue;
+            }
+
             // If authenticated and NOT accessing portal pages, close connection to let traffic through to internet
             bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status ||
                                   is_customer_status || is_api_token || is_api_token_disable ||
@@ -2391,92 +2656,9 @@ static void http_server_task(void *pvParameters)
 
                             // Get token info for display
                             token_info_t *token_info = get_token_info_by_string(token);
-                            
-                            // Calculate remaining time
-                            time_t now = time(NULL);
-                            time_t expires_at = token_info->first_use + (token_info->duration_minutes * 60);
-                            time_t time_remaining = expires_at - now;
-                            int hours_left = time_remaining / 3600;
-                            int minutes_left = (time_remaining % 3600) / 60;
 
-                            // Format expiration date
-                            struct tm *exp_time = localtime(&expires_at);
-                            char exp_str[64];
-                            strftime(exp_str, sizeof(exp_str), "%b %d, %Y %I:%M %p", exp_time);
-
-                            // Build success response with detailed stats
-                            char response[3072];
-                            int offset = snprintf(response, sizeof(response),
-                                "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: text/html; charset=UTF-8\r\n"
-                                "Connection: close\r\n\r\n"
-                                "<!DOCTYPE html>"
-                                "<html><head><meta charset='UTF-8'><title>Connected</title>"
-                                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                                "<style>"
-                                "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%%,#764ba2 100%%);min-height:100vh;display:flex;align-items:center;justify-content:center}"
-                                ".box{background:white;padding:30px;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,0.2);max-width:400px;width:100%%}"
-                                "h1{color:#28a745;margin:0 0 10px 0;font-size:28px}h1::before{content:'✓ ';font-size:32px}"
-                                "p{color:#666;margin:0 0 20px 0}"
-                                ".divider{border-top:2px solid #f0f0f0;margin:20px 0}"
-                                ".token-code{background:#f8f9fa;padding:12px;border-radius:8px;font-family:monospace;font-size:18px;font-weight:bold;text-align:center;letter-spacing:2px;margin:15px 0;color:#333}"
-                                ".stat-group{margin:15px 0}"
-                                ".stat-label{font-size:20px;margin-right:8px}"
-                                ".stat-title{font-weight:600;color:#333;margin-bottom:8px;display:flex;align-items:center}"
-                                ".stat-value{color:#666;font-size:14px;margin-left:28px}"
-                                ".time-remaining{font-size:24px;font-weight:bold;color:#28a745;margin:5px 0}"
-                                ".expires{color:#999;font-size:12px}"
-                                ".usage-badge{display:inline-block;background:#e7f3ff;color:#0066cc;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;margin:5px 5px 5px 28px}"
-                                ".unlimited{color:#28a745;font-weight:600}"
-                                "</style></head><body><div class='box'>"
-                                "<h1>Connected!</h1>"
-                                "<p>Your device is now connected to the internet</p>"
-                                "<div class='divider'></div>"
-                                "<div class='token-code'>%s</div>", token);
-
-                            // Time remaining section
-                            offset += snprintf(response + offset, sizeof(response) - offset,
-                                "<div class='stat-group'>"
-                                "<div class='stat-title'><span class='stat-label'>⏱️</span> Time Remaining</div>"
-                                "<div class='time-remaining'>%dh %dm</div>"
-                                "<div class='expires'>Expires: %s</div>"
-                                "</div>", hours_left, minutes_left, exp_str);
-
-                            // Usage statistics section
-                            offset += snprintf(response + offset, sizeof(response) - offset,
-                                "<div class='stat-group'>"
-                                "<div class='stat-title'><span class='stat-label'>📊</span> Usage Statistics</div>"
-                                "<div class='usage-badge'>Used %lu times</div>"
-                                "<div class='usage-badge'>Device %d of %d</div>"
-                                "</div>", token_info->usage_count, token_info->device_count, MAX_DEVICES_PER_TOKEN);
-
-                            // Bandwidth section
-                            offset += snprintf(response + offset, sizeof(response) - offset,
-                                "<div class='stat-group'>"
-                                "<div class='stat-title'><span class='stat-label'>📶</span> Bandwidth</div>");
-
-                            if (token_info->bandwidth_down_mb == 0) {
-                                offset += snprintf(response + offset, sizeof(response) - offset,
-                                    "<div class='stat-value'>Download: <span class='unlimited'>Unlimited</span></div>");
-                            } else {
-                                offset += snprintf(response + offset, sizeof(response) - offset,
-                                    "<div class='stat-value'>Download: %lu / %lu MB</div>",
-                                    token_info->bandwidth_used_down, token_info->bandwidth_down_mb);
-                            }
-
-                            if (token_info->bandwidth_up_mb == 0) {
-                                offset += snprintf(response + offset, sizeof(response) - offset,
-                                    "<div class='stat-value'>Upload: <span class='unlimited'>Unlimited</span></div>");
-                            } else {
-                                offset += snprintf(response + offset, sizeof(response) - offset,
-                                    "<div class='stat-value'>Upload: %lu / %lu MB</div>",
-                                    token_info->bandwidth_used_up, token_info->bandwidth_up_mb);
-                            }
-
-                            offset += snprintf(response + offset, sizeof(response) - offset,
-                                "</div></div></body></html>");
-
-                            send(sock, response, strlen(response), 0);
+                            // Send stats page
+                            send_stats_page(sock, token, token_info);
                         }
                         else
                         {
@@ -2505,34 +2687,68 @@ static void http_server_task(void *pvParameters)
             }
             else
             {
-                // Show login page
-                const char *response =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/html; charset=UTF-8\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    "<!DOCTYPE html>"
-                    "<html><head><meta charset='UTF-8'><title>ESP32 Portal</title>"
-                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                    "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
-                    ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
-                    "h1{color:#333}p{color:#666}input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}"
-                    "button{background:#007bff;color:white;padding:12px;border:none;border-radius:5px;width:100%;cursor:pointer}"
-                    "button:hover{background:#0056b3}.info{margin-top:20px;font-size:12px;color:#999}"
-                    ".admin-link{margin-top:20px;font-size:12px;color:#007bff;text-decoration:none;display:inline-block}"
-                    "</style>"
-                    "</head><body><div class='box'>"
-                    "<h1>🌐 ESP32 Mesh Portal</h1>"
-                    "<p>Enter your access token to connect</p>"
-                    "<form method='POST' action='/login'>"
-                    "<input type='text' name='token' placeholder='Enter 8-character token' maxlength='8' pattern='[A-Z0-9]{8}' required>"
-                    "<button type='submit'>Connect</button>"
-                    "</form>"
-                    "<p class='info'>Token expires in 24 hours after first use<br>Phase 2: Token validation active</p>"
-                    "<a href='/admin' class='admin-link'>🔧 Admin Panel</a>"
-                    "</div></body></html>";
+                // Check if user is already authenticated
+                if (is_authenticated)
+                {
+                    // Find the authenticated client's MAC address
+                    uint8_t client_mac[6] = {0};
+                    for (int i = 0; i < MAX_AUTHENTICATED_CLIENTS; i++)
+                    {
+                        if (authenticated_clients[i].active &&
+                            authenticated_clients[i].ip_addr == source_addr.sin_addr.s_addr)
+                        {
+                            memcpy(client_mac, authenticated_clients[i].mac, 6);
+                            break;
+                        }
+                    }
 
-                send(sock, response, strlen(response), 0);
+                    // Find token by MAC address
+                    token_info_t *token_info = get_token_info_by_mac(client_mac);
+
+                    if (token_info != NULL)
+                    {
+                        // Show stats page for authenticated user
+                        send_stats_page(sock, token_info->token, token_info);
+                    }
+                    else
+                    {
+                        // Token not found (shouldn't happen, but fallback to login)
+                        ESP_LOGW(TAG, "Authenticated client has no valid token");
+                        goto show_login;
+                    }
+                }
+                else
+                {
+                show_login:
+                    // Show login page for unauthenticated users
+                    const char *response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/html; charset=UTF-8\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "<!DOCTYPE html>"
+                        "<html><head><meta charset='UTF-8'><title>ESP32 Portal</title>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
+                        ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
+                        "h1{color:#333}p{color:#666}input{width:100%;padding:10px;margin:10px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}"
+                        "button{background:#007bff;color:white;padding:12px;border:none;border-radius:5px;width:100%;cursor:pointer}"
+                        "button:hover{background:#0056b3}.info{margin-top:20px;font-size:12px;color:#999}"
+                        ".admin-link{margin-top:20px;font-size:12px;color:#007bff;text-decoration:none;display:inline-block}"
+                        "</style>"
+                        "</head><body><div class='box'>"
+                        "<h1>🌐 ESP32 Mesh Portal</h1>"
+                        "<p>Enter your access token to connect</p>"
+                        "<form method='POST' action='/login'>"
+                        "<input type='text' name='token' placeholder='Enter 8-character token' maxlength='8' pattern='[A-Z0-9]{8}' required>"
+                        "<button type='submit'>Connect</button>"
+                        "</form>"
+                        "<p class='info'>Token expires in 24 hours after first use<br>Phase 2: Token validation active</p>"
+                        "<a href='/admin' class='admin-link'>🔧 Admin Panel</a>"
+                        "</div></body></html>";
+
+                    send(sock, response, strlen(response), 0);
+                }
             }
 
             close(sock);
@@ -2565,11 +2781,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize time (needed for token expiration)
-    struct timeval tv_now = {.tv_sec = 1733616000}; // Set to Dec 8, 2025
-    settimeofday(&tv_now, NULL);
-    setenv("TZ", "UTC", 1);
-    tzset();
+    // Initialize heartbeat LED (fast blink mode)
+    heartbeat_init(HEARTBEAT_LED_GPIO);
+    ESP_LOGI(TAG, "✓ Heartbeat LED initialized (fast blink - waiting for WiFi)");
+
+    // Time will be synced via SNTP after WiFi connection
+    ESP_LOGI(TAG, "Time sync will occur after WiFi connection");
 
     // Load admin password and API key
     load_admin_password();
@@ -2581,19 +2798,8 @@ void app_main(void)
     // Load WiFi credentials from NVS (or use defaults)
     load_wifi_credentials();
 
-    // Create some test tokens if none exist
-    if (token_count == 0)
-    {
-        ESP_LOGI(TAG, "Creating initial test tokens...");
-        char token[TOKEN_LENGTH + 1];
-        for (int i = 0; i < 5; i++)
-        {
-            if (create_new_token(token) == ESP_OK)
-            {
-                ESP_LOGI(TAG, "Test token %d: %s", i + 1, token);
-            }
-        }
-    }
+    // Tokens will be created via admin panel after time sync
+    ESP_LOGI(TAG, "Loaded %d tokens from storage", token_count);
 
     // Initialize TCP/IP and WiFi
     ESP_ERROR_CHECK(esp_netif_init());
