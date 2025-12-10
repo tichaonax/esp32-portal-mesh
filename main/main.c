@@ -529,6 +529,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
     }
 
     time_t now = time(NULL);
+    ESP_LOGI(TAG, "DEBUG: validate_token - now=%lld, time_synced=%d", (long long)now, time_synced);
 
     for (int i = 0; i < token_count; i++)
     {
@@ -541,7 +542,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             if (active_tokens[i].first_use == 0)
             {
                 active_tokens[i].first_use = now;
-                ESP_LOGI(TAG, "Token %s first use at %lld", token, (long long)now);
+                ESP_LOGI(TAG, "Token %s first use at %lld (now=%lld)", token, (long long)active_tokens[i].first_use, (long long)now);
             }
 
             // Check time-based expiration (from first use)
@@ -638,6 +639,10 @@ static void time_sync_notification_cb(struct timeval *tv)
     struct tm *timeinfo = localtime(&tv->tv_sec);
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
     ESP_LOGI(TAG, "✓ Time synchronized via SNTP: %s", time_str);
+
+    // Switch LED to slow heartbeat (connected mode) now that time is synced
+    heartbeat_set_connected(true);
+    ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected, time synced)");
 }
 
 // Initialize SNTP time synchronization
@@ -706,6 +711,11 @@ static void send_stats_page(int sock, const char *token_str, token_info_t *token
     time_t time_remaining = expires_at - now;
     int hours_left = time_remaining / 3600;
     int minutes_left = (time_remaining % 3600) / 60;
+
+    // Debug logging
+    ESP_LOGI(TAG, "DEBUG: send_stats_page - first_use=%lld, now=%lld, expires_at=%lld, time_remaining=%lld, duration_minutes=%ld",
+             (long long)token_info->first_use, (long long)now, (long long)expires_at, 
+             (long long)time_remaining, (long)token_info->duration_minutes);
 
     // Format expiration date
     struct tm *exp_time = localtime(&expires_at);
@@ -1248,9 +1258,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         // Start SNTP poll task
         xTaskCreate(sntp_poll_task, "sntp_poll", 4096, NULL, 5, NULL);
 
-        // Switch LED to slow heartbeat (connected mode)
-        heartbeat_set_connected(true);
-        ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected)");
+        // Note: Slow blink will be set after time sync completes (in callback)
+        ESP_LOGI(TAG, "Waiting for time sync before switching to slow blink...");
     }
 }
 
@@ -2720,6 +2729,36 @@ static void http_server_task(void *pvParameters)
                 else
                 {
                 show_login:
+                    // Check if time is synced before showing login page
+                    if (!is_time_valid())
+                    {
+                        // Show "waiting for time sync" page
+                        const char *waiting_response =
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/html; charset=UTF-8\r\n"
+                            "Connection: close\r\n"
+                            "Refresh: 3\r\n"  // Auto-refresh every 3 seconds
+                            "\r\n"
+                            "<!DOCTYPE html>"
+                            "<html><head><meta charset='UTF-8'><title>ESP32 Portal - Initializing</title>"
+                            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                            "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
+                            ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
+                            "h1{color:#333}p{color:#666}.spinner{border:4px solid #f3f3f3;border-top:4px solid #007bff;border-radius:50%;"
+                            "width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto}"
+                            "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}"
+                            ".info{margin-top:20px;font-size:14px;color:#999}</style>"
+                            "</head><body><div class='box'>"
+                            "<h1>⏳ Initializing Portal</h1>"
+                            "<div class='spinner'></div>"
+                            "<p>Synchronizing time with network...</p>"
+                            "<p class='info'>This usually takes 5-10 seconds.<br>The page will refresh automatically.</p>"
+                            "</div></body></html>";
+                        send(sock, waiting_response, strlen(waiting_response), 0);
+                        close(sock);
+                        continue;
+                    }
+
                     // Show login page for unauthenticated users
                     const char *response =
                         "HTTP/1.1 200 OK\r\n"
