@@ -99,6 +99,7 @@ typedef struct
     char token[TOKEN_LENGTH + 1];
     time_t created;
     time_t first_use;             // When token was first used (0 if not used yet)
+    time_t last_use;              // Most recent usage timestamp (for multi-token handling)
     uint32_t duration_minutes;    // Duration from first use
     uint32_t bandwidth_down_mb;   // Download limit in MB
     uint32_t bandwidth_up_mb;     // Upload limit in MB
@@ -483,6 +484,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     time_t now = time(NULL);
     new_token.created = now;
     new_token.first_use = 0; // Not used yet
+    new_token.last_use = 0;  // Not used yet
     new_token.duration_minutes = duration_minutes;
     new_token.bandwidth_down_mb = bandwidth_down_mb;
     new_token.bandwidth_up_mb = bandwidth_up_mb;
@@ -544,6 +546,9 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 active_tokens[i].first_use = now;
                 ESP_LOGI(TAG, "Token %s first use at %lld (now=%lld)", token, (long long)active_tokens[i].first_use, (long long)now);
             }
+
+            // Update last use time on every validation (for multi-token handling)
+            active_tokens[i].last_use = now;
 
             // Check time-based expiration (from first use)
             time_t token_expires = active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60);
@@ -685,6 +690,10 @@ static void sntp_poll_task(void *pvParameters)
 // Get token info by client MAC address
 static token_info_t *get_token_info_by_mac(const uint8_t *mac)
 {
+    token_info_t *most_recent_token = NULL;
+    time_t most_recent_use = 0;
+
+    // Find all tokens with this MAC and return the one used most recently
     for (int i = 0; i < token_count; i++)
     {
         if (!active_tokens[i].active)
@@ -695,11 +704,24 @@ static token_info_t *get_token_info_by_mac(const uint8_t *mac)
         {
             if (memcmp(active_tokens[i].client_macs[j], mac, 6) == 0)
             {
-                return &active_tokens[i];
+                // Found a token with this MAC - check if it's the most recent
+                if (active_tokens[i].last_use > most_recent_use)
+                {
+                    most_recent_use = active_tokens[i].last_use;
+                    most_recent_token = &active_tokens[i];
+                }
+                break; // Move to next token
             }
         }
     }
-    return NULL;
+
+    if (most_recent_token != NULL)
+    {
+        ESP_LOGI(TAG, "Found token %s for MAC (last_use=%lld)", 
+                 most_recent_token->token, (long long)most_recent_use);
+    }
+
+    return most_recent_token;
 }
 
 // Send stats page for authenticated user
