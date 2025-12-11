@@ -730,6 +730,278 @@ print(response.json())
 
 ---
 
+### GET /api/tokens/list
+Get a complete list of all active tokens in the system with their full metadata. This endpoint is essential for bulk token management, monitoring dashboards, and system auditing.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** Required (API key)
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456"
+```
+
+**Python:**
+```python
+import requests
+
+params = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456"
+}
+
+response = requests.get('http://192.168.0.100/api/tokens/list', params=params)
+data = response.json()
+
+print(f"Total tokens: {data['count']}")
+for token in data['tokens']:
+    print(f"Token: {token['token']}, Status: {token['status']}, "
+          f"Duration: {token['duration_minutes']} min")
+```
+
+**JavaScript:**
+```javascript
+const axios = require('axios');
+
+const params = {
+    api_key: 'abcd1234efgh5678ijkl9012mnop3456'
+};
+
+axios.get('http://192.168.0.100/api/tokens/list', { params })
+    .then(response => {
+        const data = response.data;
+        console.log(`Total tokens: ${data.count}`);
+        data.tokens.forEach(token => {
+            console.log(`${token.token}: ${token.status}, ${token.duration_minutes}min`);
+        });
+    })
+    .catch(error => console.error(error));
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "count": 3,
+    "tokens": [
+        {
+            "token": "A3K9M7P2",
+            "status": "active",
+            "duration_minutes": 120,
+            "first_use": 1702345678,
+            "expires_at": 1702352878,
+            "remaining_seconds": 3600,
+            "bandwidth_down_mb": 500,
+            "bandwidth_up_mb": 100,
+            "bandwidth_used_down": 245,
+            "bandwidth_used_up": 38,
+            "usage_count": 2
+        },
+        {
+            "token": "TT5N25GG",
+            "status": "unused",
+            "duration_minutes": 30,
+            "first_use": 0,
+            "expires_at": 1702349278,
+            "remaining_seconds": 1800,
+            "bandwidth_down_mb": 0,
+            "bandwidth_up_mb": 0,
+            "bandwidth_used_down": 0,
+            "bandwidth_used_up": 0,
+            "usage_count": 0
+        },
+        {
+            "token": "X8R2D4F1",
+            "status": "expired",
+            "duration_minutes": 60,
+            "first_use": 1702340000,
+            "expires_at": 1702343600,
+            "remaining_seconds": 0,
+            "bandwidth_down_mb": 1000,
+            "bandwidth_up_mb": 250,
+            "bandwidth_used_down": 890,
+            "bandwidth_used_up": 220,
+            "usage_count": 5
+        }
+    ]
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Always true for successful requests |
+| `count` | integer | Total number of active tokens in the system |
+| `tokens` | array | Array of token objects with detailed metadata |
+
+**Token Object Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `token` | string | 8-character token code |
+| `status` | string | Token status: "unused" (never used), "active" (in use), "expired" (time/bandwidth exceeded) |
+| `duration_minutes` | integer | Token duration from creation (30-43200 minutes) |
+| `first_use` | integer | Unix timestamp of first use (0 = never used) |
+| `expires_at` | integer | Unix timestamp when token expires |
+| `remaining_seconds` | integer | Seconds until expiration (0 if expired) |
+| `bandwidth_down_mb` | integer | Download limit in MB (0 = unlimited) |
+| `bandwidth_up_mb` | integer | Upload limit in MB (0 = unlimited) |
+| `bandwidth_used_down` | integer | Downloaded data in MB |
+| `bandwidth_used_up` | integer | Uploaded data in MB |
+| `usage_count` | integer | Number of times token was authenticated |
+
+**Status Values:**
+- `"unused"` - Token created but never used (first_use = 0)
+- `"active"` - Token currently in use and not expired (remaining_seconds > 0)
+- `"expired"` - Token expired due to time or bandwidth limit (remaining_seconds = 0)
+
+#### Use Cases
+
+**1. Bulk Token Cleanup**
+```bash
+#!/bin/bash
+API_KEY="your_api_key_here"
+ESP32_IP="192.168.0.100"
+
+# Get all expired tokens and disable them
+tokens=$(curl -s "http://$ESP32_IP/api/tokens/list?api_key=$API_KEY" | \
+  python3 -c "import sys, json; data=json.load(sys.stdin); \
+  print(' '.join([t['token'] for t in data['tokens'] if t['status']=='expired']))")
+
+for token in $tokens; do
+  curl -s -X POST "http://$ESP32_IP/api/token/disable" \
+    -d "api_key=$API_KEY&token=$token"
+  echo "Cleaned up expired token: $token"
+done
+```
+
+**2. Monitoring Dashboard**
+```python
+def get_token_statistics(api_key, esp32_ip):
+    """Get aggregated token statistics for monitoring"""
+    response = requests.get(
+        f'http://{esp32_ip}/api/tokens/list',
+        params={'api_key': api_key}
+    )
+    data = response.json()
+    
+    stats = {
+        'total': data['count'],
+        'unused': sum(1 for t in data['tokens'] if t['status'] == 'unused'),
+        'active': sum(1 for t in data['tokens'] if t['status'] == 'active'),
+        'expired': sum(1 for t in data['tokens'] if t['status'] == 'expired'),
+        'total_bandwidth_used': sum(
+            t['bandwidth_used_down'] + t['bandwidth_used_up'] 
+            for t in data['tokens']
+        )
+    }
+    
+    return stats
+```
+
+**3. Token Usage Analytics**
+```python
+def analyze_token_usage(api_key, esp32_ip):
+    """Analyze token usage patterns"""
+    response = requests.get(
+        f'http://{esp32_ip}/api/tokens/list',
+        params={'api_key': api_key}
+    )
+    data = response.json()
+    
+    # Find most used tokens
+    active_tokens = [t for t in data['tokens'] if t['usage_count'] > 0]
+    active_tokens.sort(key=lambda t: t['usage_count'], reverse=True)
+    
+    print(f"Top 5 most used tokens:")
+    for token in active_tokens[:5]:
+        print(f"  {token['token']}: {token['usage_count']} logins, "
+              f"{token['bandwidth_used_down']}MB down")
+```
+
+**4. Clear All Tokens**
+```bash
+# Disable all tokens in the system
+tokens=$(curl -s "http://192.168.0.100/api/tokens/list?api_key=$API_KEY" | \
+  python3 -c "import sys, json; data=json.load(sys.stdin); \
+  print(' '.join([t['token'] for t in data['tokens']]))")
+
+for token in $tokens; do
+  curl -s -X POST "http://192.168.0.100/api/token/disable" \
+    -d "api_key=$API_KEY&token=$token"
+  sleep 0.15  # Rate limiting
+done
+```
+
+#### Error Responses
+
+**Missing API Key**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Missing required parameter: api_key"
+}
+```
+
+**Invalid API Key**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Invalid API key"
+}
+```
+
+**Request from AP Network**
+
+**Code:** `403 Forbidden`
+```json
+{
+    "error": "API only accessible from uplink network"
+}
+```
+
+**Memory Allocation Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Memory allocation failed"
+}
+```
+
+This error is rare and indicates the device is under extreme memory pressure. If this occurs:
+1. Reduce the number of active tokens
+2. Reboot the device to clear memory
+3. Consider implementing periodic token cleanup
+
+#### Performance Notes
+
+- **Response Size:** Approximately 200-250 bytes per token
+- **Maximum Response:** ~58KB for 230 tokens (8KB buffer, may truncate if list is very large)
+- **Response Time:** Typically 50-200ms depending on token count
+- **Rate Limiting:** Recommend 100ms minimum between requests to avoid overwhelming device
+
+---
+
 ## Error Code Reference
 
 All API endpoints may return the following standard error codes:
@@ -773,6 +1045,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `POST /api/token/extend`
 - `POST /api/token/info`
 - `POST /api/token/disable`
+- `GET /api/tokens/list`
 - `GET /api/uptime`
 - `GET /api/health`
 
@@ -1035,6 +1308,13 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.1** (2025-12-10): Bulk Token Management & Analytics
+  - **NEW:** `GET /api/tokens/list` - List all active tokens with full metadata
+  - Bulk token operations support (disable all, cleanup expired)
+  - Token usage analytics and monitoring dashboard integration
+  - System auditing and reporting capabilities
+  - Comprehensive integration test suite (102 tests, 81% pass rate)
+
 - **v3.0** (2025-12-10): Monitoring & Capacity Improvements
   - **NEW:** `GET /api/uptime` - System uptime monitoring (no auth required)
   - **NEW:** `GET /api/health` - Comprehensive health check endpoint
