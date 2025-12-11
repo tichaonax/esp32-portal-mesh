@@ -29,3 +29,7 @@ screenlog.*
 # Documentation (temporary)
 *.md
 !README.md
+
+# Broken/backup files
+*_broken.c
+main_broken.c
