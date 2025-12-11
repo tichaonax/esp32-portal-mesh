@@ -1944,7 +1944,7 @@ static void http_server_task(void *pvParameters)
                                                                     : 0;
 
                                     char response[1024];
-                                    snprintf(response, sizeof(response),
+                                    int offset = snprintf(response, sizeof(response),
                                              "HTTP/1.1 200 OK\r\n"
                                              "Content-Type: application/json\r\n"
                                              "Connection: close\r\n\r\n"
@@ -1961,7 +1961,8 @@ static void http_server_task(void *pvParameters)
                                              "\"bandwidth_used_up_mb\":%lu,"
                                              "\"usage_count\":%lu,"
                                              "\"device_count\":%u,"
-                                             "\"max_devices\":%d}",
+                                             "\"max_devices\":%d,"
+                                             "\"client_macs\":[",
                                              active_tokens[i].token,
                                              is_expired ? "expired" : (is_used ? "active" : "unused"),
                                              (long long)active_tokens[i].created,
@@ -1976,6 +1977,25 @@ static void http_server_task(void *pvParameters)
                                              active_tokens[i].usage_count,
                                              active_tokens[i].device_count,
                                              MAX_DEVICES_PER_TOKEN);
+                                    
+                                    // Add MAC addresses
+                                    for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                    {
+                                        if (mac_idx > 0)
+                                        {
+                                            offset += snprintf(response + offset, sizeof(response) - offset, ",");
+                                        }
+                                        offset += snprintf(response + offset, sizeof(response) - offset,
+                                                          "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                          active_tokens[i].client_macs[mac_idx][0],
+                                                          active_tokens[i].client_macs[mac_idx][1],
+                                                          active_tokens[i].client_macs[mac_idx][2],
+                                                          active_tokens[i].client_macs[mac_idx][3],
+                                                          active_tokens[i].client_macs[mac_idx][4],
+                                                          active_tokens[i].client_macs[mac_idx][5]);
+                                    }
+                                    
+                                    offset += snprintf(response + offset, sizeof(response) - offset, "]}");
                                     send(sock, response, strlen(response), 0);
                                     break;
                                 }
@@ -2242,7 +2262,9 @@ static void http_server_task(void *pvParameters)
                                                        "\"bandwidth_up_mb\":%lu,"
                                                        "\"bandwidth_used_down\":%lu,"
                                                        "\"bandwidth_used_up\":%lu,"
-                                                       "\"usage_count\":%lu}",
+                                                       "\"usage_count\":%lu,"
+                                                       "\"device_count\":%u,"
+                                                       "\"client_macs\":[",
                                                        (i > 0) ? "," : "",
                                                        active_tokens[i].token,
                                                        status,
@@ -2254,7 +2276,27 @@ static void http_server_task(void *pvParameters)
                                                        active_tokens[i].bandwidth_up_mb,
                                                        active_tokens[i].bandwidth_used_down,
                                                        active_tokens[i].bandwidth_used_up,
-                                                       active_tokens[i].usage_count);
+                                                       active_tokens[i].usage_count,
+                                                       active_tokens[i].device_count);
+                                    
+                                    // Add MAC addresses for this token
+                                    for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                    {
+                                        if (mac_idx > 0)
+                                        {
+                                            offset += snprintf(response + offset, 8192 - offset, ",");
+                                        }
+                                        offset += snprintf(response + offset, 8192 - offset,
+                                                          "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                          active_tokens[i].client_macs[mac_idx][0],
+                                                          active_tokens[i].client_macs[mac_idx][1],
+                                                          active_tokens[i].client_macs[mac_idx][2],
+                                                          active_tokens[i].client_macs[mac_idx][3],
+                                                          active_tokens[i].client_macs[mac_idx][4],
+                                                          active_tokens[i].client_macs[mac_idx][5]);
+                                    }
+                                    
+                                    offset += snprintf(response + offset, 8192 - offset, "]}");
 
                                     if (offset >= 7800)
                                     { // Leave room for closing

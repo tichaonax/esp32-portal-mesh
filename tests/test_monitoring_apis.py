@@ -315,7 +315,7 @@ class TestTokensListAPI:
             "token", "status", "duration_minutes", "first_use",
             "expires_at", "remaining_seconds", "bandwidth_down_mb",
             "bandwidth_up_mb", "bandwidth_used_down", "bandwidth_used_up",
-            "usage_count"
+            "usage_count", "device_count", "client_macs"
         ]
         
         for field in required_fields:
@@ -333,6 +333,8 @@ class TestTokensListAPI:
         assert isinstance(token_data["bandwidth_used_down"], int), "bandwidth_used_down must be integer"
         assert isinstance(token_data["bandwidth_used_up"], int), "bandwidth_used_up must be integer"
         assert isinstance(token_data["usage_count"], int), "usage_count must be integer"
+        assert isinstance(token_data["device_count"], int), "device_count must be integer"
+        assert isinstance(token_data["client_macs"], list), "client_macs must be list"
         
         # Verify status is one of valid values
         assert token_data["status"] in ["unused", "active", "expired"], \
@@ -368,6 +370,85 @@ class TestTokensListAPI:
         assert token_data["status"] == "unused", "New token should have 'unused' status"
         assert token_data["first_use"] == 0, "New token should have first_use = 0"
         assert token_data["usage_count"] == 0, "New token should have usage_count = 0"
+    
+    def test_tokens_list_mac_address_fields(self, base_url, test_config, session, test_token):
+        """Verify MAC address fields are present and correct type"""
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        token_data = next((t for t in data["tokens"] if t["token"] == test_token), None)
+        
+        assert token_data is not None, f"Token {test_token} not found"
+        assert "device_count" in token_data, "Missing device_count field"
+        assert "client_macs" in token_data, "Missing client_macs field"
+        
+        # Verify types
+        assert isinstance(token_data["device_count"], int), "device_count must be integer"
+        assert isinstance(token_data["client_macs"], list), "client_macs must be list"
+        
+        # For unused token, should have empty MAC array
+        assert token_data["device_count"] == 0, "Unused token should have device_count = 0"
+        assert len(token_data["client_macs"]) == 0, "Unused token should have empty client_macs"
+    
+    def test_tokens_list_mac_address_format(self, base_url, test_config, session):
+        """Verify MAC addresses are formatted correctly when present"""
+        import re
+        
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        data = response.json()
+        
+        # MAC address format regex: XX:XX:XX:XX:XX:XX (uppercase hex)
+        mac_pattern = re.compile(r'^[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}$')
+        
+        for token in data["tokens"]:
+            # Verify device_count matches MAC array length
+            assert token["device_count"] == len(token["client_macs"]), \
+                f"device_count ({token['device_count']}) != len(client_macs) ({len(token['client_macs'])})"
+            
+            # Verify each MAC address format
+            for mac in token["client_macs"]:
+                assert isinstance(mac, str), f"MAC address must be string, got {type(mac)}"
+                assert mac_pattern.match(mac), f"Invalid MAC format: {mac}"
+            
+            # Verify device_count is within valid range (0-2)
+            assert 0 <= token["device_count"] <= 2, \
+                f"device_count must be 0-2, got {token['device_count']}"
+    
+    def test_token_info_includes_mac_addresses(self, base_url, test_config, session, test_token):
+        """Verify /api/token/info includes client_macs field"""
+        response = session.get(
+            f"{base_url}/api/token/info",
+            params={"api_key": test_config.API_KEY, "token": test_token}
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        
+        # Verify MAC fields exist
+        assert "device_count" in data, "Missing device_count in token info"
+        assert "max_devices" in data, "Missing max_devices in token info"
+        assert "client_macs" in data, "Missing client_macs in token info"
+        
+        # Verify types
+        assert isinstance(data["device_count"], int), "device_count must be integer"
+        assert isinstance(data["max_devices"], int), "max_devices must be integer"
+        assert isinstance(data["client_macs"], list), "client_macs must be list"
+        
+        # Verify values
+        assert data["max_devices"] == 2, "max_devices should always be 2"
+        
+        # For unused token
+        if data["first_use"] == 0:
+            assert data["device_count"] == 0, "Unused token should have device_count = 0"
+            assert len(data["client_macs"]) == 0, "Unused token should have empty client_macs"
 
 
 @pytest.mark.monitoring

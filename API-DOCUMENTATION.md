@@ -344,6 +344,30 @@ axios.get('http://192.168.0.100/api/token/info', {
 #### Success Response
 
 **Code:** `200 OK`
+
+**Example 1: Unused Token**
+```json
+{
+    "success": true,
+    "token": "A3K9M7P2",
+    "status": "unused",
+    "created": 1702123456,
+    "first_use": 0,
+    "duration_minutes": 120,
+    "expires_at": 1702130656,
+    "remaining_seconds": 0,
+    "bandwidth_down_mb": 500,
+    "bandwidth_up_mb": 100,
+    "bandwidth_used_down_mb": 0,
+    "bandwidth_used_up_mb": 0,
+    "usage_count": 0,
+    "device_count": 0,
+    "max_devices": 2,
+    "client_macs": []
+}
+```
+
+**Example 2: Active Token (Single Device)**
 ```json
 {
     "success": true,
@@ -360,7 +384,30 @@ axios.get('http://192.168.0.100/api/token/info', {
     "bandwidth_used_up_mb": 25,
     "usage_count": 12,
     "device_count": 1,
-    "max_devices": 2
+    "max_devices": 2,
+    "client_macs": ["AA:BB:CC:DD:EE:FF"]
+}
+```
+
+**Example 3: Active Token (Multiple Devices)**
+```json
+{
+    "success": true,
+    "token": "B7X2K9L4",
+    "status": "active",
+    "created": 1702123456,
+    "first_use": 1702124000,
+    "duration_minutes": 120,
+    "expires_at": 1702131200,
+    "remaining_seconds": 3600,
+    "bandwidth_down_mb": 500,
+    "bandwidth_up_mb": 100,
+    "bandwidth_used_down_mb": 280,
+    "bandwidth_used_up_mb": 45,
+    "usage_count": 24,
+    "device_count": 2,
+    "max_devices": 2,
+    "client_macs": ["AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"]
 }
 ```
 
@@ -381,6 +428,7 @@ axios.get('http://192.168.0.100/api/token/info', {
 | `usage_count` | integer | Number of times token has been used |
 | `device_count` | integer | Number of devices currently using token |
 | `max_devices` | integer | Maximum allowed devices (always 2) |
+| `client_macs` | array | MAC addresses of devices using token (empty array if unused) |
 
 #### Error Responses
 
@@ -808,7 +856,9 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
             "bandwidth_up_mb": 100,
             "bandwidth_used_down": 245,
             "bandwidth_used_up": 38,
-            "usage_count": 2
+            "usage_count": 2,
+            "device_count": 2,
+            "client_macs": ["AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"]
         },
         {
             "token": "TT5N25GG",
@@ -821,7 +871,9 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
             "bandwidth_up_mb": 0,
             "bandwidth_used_down": 0,
             "bandwidth_used_up": 0,
-            "usage_count": 0
+            "usage_count": 0,
+            "device_count": 0,
+            "client_macs": []
         },
         {
             "token": "X8R2D4F1",
@@ -834,7 +886,9 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
             "bandwidth_up_mb": 250,
             "bandwidth_used_down": 890,
             "bandwidth_used_up": 220,
-            "usage_count": 5
+            "usage_count": 5,
+            "device_count": 1,
+            "client_macs": ["77:88:99:AA:BB:CC"]
         }
     ]
 }
@@ -863,6 +917,8 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
 | `bandwidth_used_down` | integer | Downloaded data in MB |
 | `bandwidth_used_up` | integer | Uploaded data in MB |
 | `usage_count` | integer | Number of times token was authenticated |
+| `device_count` | integer | Number of devices currently using this token (0-2) |
+| `client_macs` | array | MAC addresses of devices using token (empty array if unused, max 2 devices) |
 
 **Status Values:**
 - `"unused"` - Token created but never used (first_use = 0)
@@ -933,7 +989,75 @@ def analyze_token_usage(api_key, esp32_ip):
               f"{token['bandwidth_used_down']}MB down")
 ```
 
-**4. Clear All Tokens**
+**4. Find Tokens by MAC Address**
+```python
+def find_tokens_by_mac(api_key, esp32_ip, target_mac):
+    """Find all tokens associated with a specific device MAC address"""
+    response = requests.get(
+        f'http://{esp32_ip}/api/tokens/list',
+        params={'api_key': api_key}
+    )
+    data = response.json()
+    
+    # Find tokens containing the target MAC
+    matching_tokens = [
+        token for token in data['tokens']
+        if target_mac.upper() in [mac.upper() for mac in token['client_macs']]
+    ]
+    
+    if matching_tokens:
+        print(f"Found {len(matching_tokens)} token(s) for MAC {target_mac}:")
+        for token in matching_tokens:
+            print(f"  Token: {token['token']}")
+            print(f"    Status: {token['status']}")
+            print(f"    Devices: {token['device_count']}")
+            print(f"    MACs: {', '.join(token['client_macs'])}")
+            print(f"    Bandwidth used: {token['bandwidth_used_down']}MB down, "
+                  f"{token['bandwidth_used_up']}MB up")
+    else:
+        print(f"No tokens found for MAC {target_mac}")
+    
+    return matching_tokens
+
+# Example usage
+find_tokens_by_mac('your_api_key', '192.168.0.100', 'AA:BB:CC:DD:EE:FF')
+```
+
+**5. Device Tracking Report**
+```python
+def generate_device_report(api_key, esp32_ip):
+    """Generate report of all devices using tokens"""
+    response = requests.get(
+        f'http://{esp32_ip}/api/tokens/list',
+        params={'api_key': api_key}
+    )
+    data = response.json()
+    
+    # Collect all unique MACs
+    devices = {}
+    for token in data['tokens']:
+        for mac in token['client_macs']:
+            if mac not in devices:
+                devices[mac] = []
+            devices[mac].append({
+                'token': token['token'],
+                'status': token['status'],
+                'bandwidth_down': token['bandwidth_used_down'],
+                'bandwidth_up': token['bandwidth_used_up']
+            })
+    
+    print(f"Device Report - {len(devices)} unique devices:")
+    for mac, tokens in devices.items():
+        total_bandwidth = sum(t['bandwidth_down'] + t['bandwidth_up'] for t in tokens)
+        print(f"\n{mac}:")
+        print(f"  Tokens used: {len(tokens)}")
+        print(f"  Total bandwidth: {total_bandwidth}MB")
+        for t in tokens:
+            print(f"    - {t['token']} ({t['status']}): "
+                  f"{t['bandwidth_down']}MB down, {t['bandwidth_up']}MB up")
+```
+
+**6. Clear All Tokens**
 ```bash
 # Disable all tokens in the system
 tokens=$(curl -s "http://192.168.0.100/api/tokens/list?api_key=$API_KEY" | \
