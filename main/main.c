@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include "heartbeat.h"
 
 static const char *TAG = "esp32-mesh-portal";
@@ -31,6 +32,45 @@ static const char *TAG = "esp32-mesh-portal";
 // Time sync state
 static bool time_synced = false;
 static time_t time_sync_timestamp = 0;
+
+// ==================== HTTP Response Constants ====================
+// Common HTTP headers
+#define HTTP_HEADER_JSON \
+    "Content-Type: application/json\r\n" \
+    "Connection: close\r\n\r\n"
+
+// HTTP 403 Forbidden (API access from local network)
+static const char HTTP_403_API_UPLINK_ONLY[] = 
+    "HTTP/1.1 403 Forbidden\r\n"
+    HTTP_HEADER_JSON
+    "{\"error\":\"API only accessible from uplink network\"}";
+
+// HTTP 401 Unauthorized (Invalid API key)
+static const char HTTP_401_INVALID_API_KEY[] = 
+    "HTTP/1.1 401 Unauthorized\r\n"
+    HTTP_HEADER_JSON
+    "{\"success\":false,\"error\":\"Invalid API key\"}";
+
+// Helper macro to check if request is from local AP network
+#define IS_LOCAL_AP_REQUEST(ip_str) (strncmp(ip_str, "192.168.4.", 10) == 0)
+
+// Helper macro to send error and close connection
+#define SEND_ERROR_AND_CLOSE(sock, response) \
+    do { \
+        send(sock, response, strlen(response), 0); \
+        close(sock); \
+    } while(0)
+
+// Helper macro to reject local AP requests to API endpoints
+#define REJECT_LOCAL_AP_REQUEST(sock, source_addr) \
+    do { \
+        char client_ip_str[16]; \
+        inet_ntop(AF_INET, &(source_addr).sin_addr, client_ip_str, sizeof(client_ip_str)); \
+        if (IS_LOCAL_AP_REQUEST(client_ip_str)) { \
+            SEND_ERROR_AND_CLOSE(sock, HTTP_403_API_UPLINK_ONLY); \
+            continue; \
+        } \
+    } while(0)
 
 // Helper macros
 #define STRINGIFY(x) #x
@@ -59,7 +99,7 @@ static time_t time_sync_timestamp = 0;
 #define API_KEY_LENGTH 32
 
 // Heartbeat LED configuration
-#define HEARTBEAT_LED_GPIO GPIO_NUM_2  // Built-in LED on most ESP32 boards
+#define HEARTBEAT_LED_GPIO GPIO_NUM_2 // Built-in LED on most ESP32 boards
 
 // Current credentials (loaded from NVS or defaults)
 static char admin_password[64] = "admin123";
@@ -89,7 +129,7 @@ static esp_netif_t *ap_netif = NULL;
 // Token management
 #define TOKEN_LENGTH 8
 #define TOKEN_EXPIRY_HOURS 24
-#define MAX_TOKENS 230  // Increased from 50 to match NVS capacity (~231 max)
+#define MAX_TOKENS 230 // Increased from 50 to match NVS capacity (~231 max)
 #define TOKEN_MIN_DURATION_MINUTES 30
 #define TOKEN_MAX_DURATION_MINUTES (30 * 24 * 60) // 30 days
 #define MAX_DEVICES_PER_TOKEN 2
@@ -645,7 +685,7 @@ static void cleanup_expired_tokens(void)
 
     time_t now = time(NULL);
     int cleaned = 0;
-    
+
     for (int i = 0; i < token_count; i++)
     {
         if (!active_tokens[i].active)
@@ -659,7 +699,7 @@ static void cleanup_expired_tokens(void)
         // Check time-based expiration
         if (active_tokens[i].first_use > 0)
         {
-            time_t token_expires = active_tokens[i].first_use + 
+            time_t token_expires = active_tokens[i].first_use +
                                    (active_tokens[i].duration_minutes * 60);
             if (now > token_expires)
             {
@@ -675,7 +715,7 @@ static void cleanup_expired_tokens(void)
             expired = true;
             reason = "bandwidth down limit";
         }
-        
+
         if (!expired && active_tokens[i].bandwidth_up_mb > 0 &&
             active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
         {
@@ -685,12 +725,12 @@ static void cleanup_expired_tokens(void)
 
         if (expired)
         {
-            ESP_LOGI(TAG, "🧹 Cleaning up expired token %s (%s)", 
+            ESP_LOGI(TAG, "🧹 Cleaning up expired token %s (%s)",
                      active_tokens[i].token, reason);
-            
+
             // Mark as inactive in memory
             active_tokens[i].active = false;
-            
+
             // Remove from NVS
             nvs_handle_t nvs_handle;
             if (nvs_open("tokens", NVS_READWRITE, &nvs_handle) == ESP_OK)
@@ -699,7 +739,7 @@ static void cleanup_expired_tokens(void)
                 nvs_commit(nvs_handle);
                 nvs_close(nvs_handle);
             }
-            
+
             cleaned++;
         }
     }
@@ -720,8 +760,8 @@ static void cleanup_expired_tokens(void)
             }
         }
         token_count = write_idx;
-        
-        ESP_LOGI(TAG, "🧹 Cleanup complete: %d token(s) removed, %d active token(s) remaining", 
+
+        ESP_LOGI(TAG, "🧹 Cleanup complete: %d token(s) removed, %d active token(s) remaining",
                  cleaned, token_count);
     }
 }
@@ -731,7 +771,7 @@ static void time_sync_notification_cb(struct timeval *tv)
 {
     time_synced = true;
     time_sync_timestamp = tv->tv_sec;
-    
+
     char time_str[64];
     struct tm *timeinfo = localtime(&tv->tv_sec);
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
@@ -740,7 +780,7 @@ static void time_sync_notification_cb(struct timeval *tv)
     // Switch LED to slow heartbeat (connected mode) now that time is synced
     heartbeat_set_connected(true);
     ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected, time synced)");
-    
+
     // Cleanup expired tokens every 30s (on each SNTP sync)
     cleanup_expired_tokens();
 }
@@ -812,7 +852,7 @@ static token_info_t *get_token_info_by_mac(const uint8_t *mac)
 
     if (most_recent_token != NULL)
     {
-        ESP_LOGI(TAG, "Found token %s for MAC (last_use=%lld)", 
+        ESP_LOGI(TAG, "Found token %s for MAC (last_use=%lld)",
                  most_recent_token->token, (long long)most_recent_use);
     }
 
@@ -831,7 +871,7 @@ static void send_stats_page(int sock, const char *token_str, token_info_t *token
 
     // Debug logging
     ESP_LOGI(TAG, "DEBUG: send_stats_page - first_use=%lld, now=%lld, expires_at=%lld, time_remaining=%lld, duration_minutes=%ld",
-             (long long)token_info->first_use, (long long)now, (long long)expires_at, 
+             (long long)token_info->first_use, (long long)now, (long long)expires_at,
              (long long)time_remaining, (long)token_info->duration_minutes);
 
     // Format expiration date
@@ -1588,6 +1628,8 @@ static void http_server_task(void *pvParameters)
             bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
             bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
             bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
+            bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
+            bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
             bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
             bool is_admin_logout = (strstr(rx_buffer, "POST /admin/logout") != NULL);
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
@@ -1599,21 +1641,7 @@ static void http_server_task(void *pvParameters)
             {
                 // This endpoint is for third-party applications
                 // Must check that request comes from uplink IP (not 192.168.4.x)
-                char client_ip_str[16];
-                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-
-                // Check if request is from local AP network (reject these)
-                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
-                {
-                    const char *error_response =
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n\r\n"
-                        "{\"error\":\"API only accessible from uplink network\"}";
-                    send(sock, error_response, strlen(error_response), 0);
-                    close(sock);
-                    continue;
-                }
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
                 // Parse POST body for API key and token parameters
                 char *body = strstr(rx_buffer, "\r\n\r\n");
@@ -1697,12 +1725,9 @@ static void http_server_task(void *pvParameters)
                         }
                         else
                         {
-                            const char *auth_error =
-                                "HTTP/1.1 401 Unauthorized\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Connection: close\r\n\r\n"
-                                "{\"success\":false,\"error\":\"Invalid API key\"}";
-                            send(sock, auth_error, strlen(auth_error), 0);
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                            char client_ip_str[16];
+                            inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
                             ESP_LOGW(TAG, "API: Invalid API key attempt from %s", client_ip_str);
                         }
                     }
@@ -1723,21 +1748,7 @@ static void http_server_task(void *pvParameters)
             // Handle Token Disable API endpoint
             if (is_api_token_disable)
             {
-                char client_ip_str[16];
-                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-
-                // Check if request is from local AP network (reject these)
-                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
-                {
-                    const char *error_response =
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n\r\n"
-                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
-                    send(sock, error_response, strlen(error_response), 0);
-                    close(sock);
-                    continue;
-                }
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
                 char *body = strstr(rx_buffer, "\r\n\r\n");
                 if (body != NULL)
@@ -1796,12 +1807,7 @@ static void http_server_task(void *pvParameters)
                         }
                         else
                         {
-                            const char *auth_error =
-                                "HTTP/1.1 401 Unauthorized\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Connection: close\r\n\r\n"
-                                "{\"success\":false,\"error\":\"Invalid API key\"}";
-                            send(sock, auth_error, strlen(auth_error), 0);
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
                         }
                     }
                     else
@@ -1821,20 +1827,7 @@ static void http_server_task(void *pvParameters)
             // Handle Token Info API endpoint
             if (is_api_token_info)
             {
-                char client_ip_str[16];
-                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-
-                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
-                {
-                    const char *error_response =
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n\r\n"
-                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
-                    send(sock, error_response, strlen(error_response), 0);
-                    close(sock);
-                    continue;
-                }
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
                 // Parse query string: /api/token/info?api_key=XXX&token=XXX
                 char received_key[API_KEY_LENGTH + 1] = {0};
@@ -1926,12 +1919,7 @@ static void http_server_task(void *pvParameters)
                         }
                         else
                         {
-                            const char *auth_error =
-                                "HTTP/1.1 401 Unauthorized\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Connection: close\r\n\r\n"
-                                "{\"success\":false,\"error\":\"Invalid API key\"}";
-                            send(sock, auth_error, strlen(auth_error), 0);
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
                         }
                     }
                     else
@@ -1951,20 +1939,7 @@ static void http_server_task(void *pvParameters)
             // Handle Token Extend API endpoint
             if (is_api_token_extend)
             {
-                char client_ip_str[16];
-                inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-
-                if (strncmp(client_ip_str, "192.168.4.", 10) == 0)
-                {
-                    const char *error_response =
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n\r\n"
-                        "{\"success\":false,\"error\":\"API only accessible from uplink network\"}";
-                    send(sock, error_response, strlen(error_response), 0);
-                    close(sock);
-                    continue;
-                }
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
                 char *body = strstr(rx_buffer, "\r\n\r\n");
                 if (body != NULL)
@@ -2047,12 +2022,7 @@ static void http_server_task(void *pvParameters)
                         }
                         else
                         {
-                            const char *auth_error =
-                                "HTTP/1.1 401 Unauthorized\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Connection: close\r\n\r\n"
-                                "{\"success\":false,\"error\":\"Invalid API key\"}";
-                            send(sock, auth_error, strlen(auth_error), 0);
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
                         }
                     }
                     else
@@ -2065,6 +2035,69 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
+                close(sock);
+                continue;
+            }
+
+            // Handle Uptime API endpoint
+            if (is_api_uptime)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Calculate uptime using esp_timer
+                int64_t uptime_us = esp_timer_get_time();
+                int64_t uptime_sec = uptime_us / 1000000;
+                
+                char response[512];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         HTTP_HEADER_JSON
+                         "{\"success\":true,\"uptime_seconds\":%lld,"
+                         "\"uptime_microseconds\":%lld}",
+                         uptime_sec, uptime_us);
+                send(sock, response, strlen(response), 0);
+                close(sock);
+                continue;
+            }
+
+            // Handle Health Check API endpoint
+            if (is_api_health)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Gather health metrics
+                int64_t uptime_us = esp_timer_get_time();
+                int64_t uptime_sec = uptime_us / 1000000;
+                uint32_t free_heap = esp_get_free_heap_size();
+                time_t now = time(NULL);
+                
+                // Count active tokens
+                int active_count = 0;
+                for (int i = 0; i < token_count; i++)
+                {
+                    if (active_tokens[i].active) active_count++;
+                }
+                
+                char response[1024];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         HTTP_HEADER_JSON
+                         "{\"success\":true,\"status\":\"healthy\","
+                         "\"uptime_seconds\":%lld,"
+                         "\"time_synced\":%s,"
+                         "\"last_time_sync\":%lld,"
+                         "\"current_time\":%lld,"
+                         "\"active_tokens\":%d,"
+                         "\"max_tokens\":%d,"
+                         "\"free_heap_bytes\":%lu}",
+                         uptime_sec,
+                         time_synced ? "true" : "false",
+                         (long long)time_sync_timestamp,
+                         (long long)now,
+                         active_count,
+                         MAX_TOKENS,
+                         free_heap);
+                send(sock, response, strlen(response), 0);
                 close(sock);
                 continue;
             }
@@ -2714,7 +2747,7 @@ static void http_server_task(void *pvParameters)
             }
 
             // Handle captive portal detection requests
-            bool is_captive_detection = 
+            bool is_captive_detection =
                 (strstr(rx_buffer, "connectivitycheck") != NULL) ||
                 (strstr(rx_buffer, "msftconnecttest") != NULL) ||
                 (strstr(rx_buffer, "captive.apple.com") != NULL) ||
@@ -2854,7 +2887,7 @@ static void http_server_task(void *pvParameters)
                             "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/html; charset=UTF-8\r\n"
                             "Connection: close\r\n"
-                            "Refresh: 3\r\n"  // Auto-refresh every 3 seconds
+                            "Refresh: 3\r\n" // Auto-refresh every 3 seconds
                             "\r\n"
                             "<!DOCTYPE html>"
                             "<html><head><meta charset='UTF-8'><title>ESP32 Portal - Initializing</title>"

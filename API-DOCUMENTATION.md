@@ -141,7 +141,7 @@ axios.post('http://192.168.0.100/api/token', params)
 
 Possible reasons:
 - Duration outside allowed range (30-43200 minutes)
-- Token storage limit reached (max 50 tokens)
+- Token storage limit reached (max 230 tokens)
 - Missing required parameters
 
 **Missing Parameters**
@@ -448,6 +448,136 @@ This error occurs when:
 
 ---
 
+### GET /api/uptime
+Get the system uptime since last reboot. This endpoint does not require authentication and is useful for monitoring device availability.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** None required
+
+**Query Parameters:** None
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/uptime"
+```
+
+**Python:**
+```python
+import requests
+
+response = requests.get('http://192.168.0.100/api/uptime')
+print(response.json())
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "uptime_seconds": 12345,
+    "uptime_microseconds": 12345678901
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Always true for successful requests |
+| `uptime_seconds` | integer | System uptime in seconds |
+| `uptime_microseconds` | integer | System uptime in microseconds (higher precision) |
+
+#### Error Responses
+
+**Request from AP Network**
+
+**Code:** `403 Forbidden`
+```json
+{
+    "error": "API only accessible from uplink network"
+}
+```
+
+---
+
+### GET /api/health
+Get comprehensive device health status including uptime, time sync, token count, and memory usage. This endpoint does not require authentication and follows standard health check patterns for monitoring systems.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** None required
+
+**Query Parameters:** None
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/health"
+```
+
+**Python:**
+```python
+import requests
+
+response = requests.get('http://192.168.0.100/api/health')
+print(response.json())
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "status": "healthy",
+    "uptime_seconds": 12345,
+    "time_synced": true,
+    "last_time_sync": 1702345678,
+    "current_time": 1702358023,
+    "active_tokens": 5,
+    "max_tokens": 230,
+    "free_heap_bytes": 245760
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Always true for successful requests |
+| `status` | string | Overall health status ("healthy") |
+| `uptime_seconds` | integer | System uptime in seconds since boot |
+| `time_synced` | boolean | Whether SNTP time sync is complete |
+| `last_time_sync` | integer | Unix timestamp of last SNTP sync (0 if never) |
+| `current_time` | integer | Current Unix timestamp |
+| `active_tokens` | integer | Number of currently active tokens |
+| `max_tokens` | integer | Maximum token capacity (230) |
+| `free_heap_bytes` | integer | Available RAM in bytes |
+
+#### Error Responses
+
+**Request from AP Network**
+
+**Code:** `403 Forbidden`
+```json
+{
+    "error": "API only accessible from uplink network"
+}
+```
+
+---
+
 ## Error Code Reference
 
 All API endpoints may return the following standard error codes:
@@ -574,11 +704,12 @@ Currently no rate limiting is implemented. Consider implementing rate limiting i
 
 ### Token Management
 1. **Set Appropriate Limits:** Match duration/bandwidth to expected usage
-2. **Clean Up:** Expired tokens are automatically removed on device reboot
-3. **Storage Limit:** Max 50 active tokens (create cleanup routines if needed)
+2. **Automatic Cleanup:** Expired tokens are automatically removed every 30 seconds (SNTP sync)
+3. **Storage Capacity:** Max 230 active tokens supported (automatically cleaned up when expired)
 4. **Use Extend for Renewals:** Instead of creating new tokens, extend existing ones to maintain token string consistency
 5. **Monitor Status:** Use `/api/token/info` to track usage before limits are reached
 6. **Graceful Revocation:** Use `/api/token/disable` for immediate access removal
+7. **Device Health:** Use `/api/health` to monitor token capacity usage and system resources
 
 ### Error Handling
 1. **Retry Logic:** Implement exponential backoff for failures
@@ -717,6 +848,15 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.0** (2025-12-10): Monitoring & Capacity Improvements
+  - **NEW:** `GET /api/uptime` - System uptime monitoring (no auth required)
+  - **NEW:** `GET /api/health` - Comprehensive health check endpoint
+  - Increased token capacity from 50 to 230 tokens
+  - Automatic token cleanup every 30 seconds (on SNTP sync)
+  - HTTP response refactoring for code reuse and flash savings
+  - Kubernetes/Prometheus integration examples
+  - Enhanced monitoring and alerting documentation
+
 - **v2.0** (2025-12-09): Enhanced Token Management
   - **NEW:** `POST /api/token/disable` - Revoke tokens instantly
   - **NEW:** `GET /api/token/info` - Query token status and usage statistics
