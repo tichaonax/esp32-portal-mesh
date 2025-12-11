@@ -1126,6 +1126,488 @@ This error is rare and indicates the device is under extreme memory pressure. If
 
 ---
 
+## MAC Address Filtering
+
+The ESP32 Portal includes MAC address filtering capabilities to manage device access:
+- **Blacklist:** Block specific devices from accessing the network
+- **Whitelist:** Grant VIP bypass access (no token needed after first redemption)
+
+All MAC filtering operations enforce **mutual exclusivity** - adding a MAC to one list automatically removes it from the other.
+
+### POST /api/mac/blacklist
+Add all MAC addresses associated with a token to the blacklist. Blacklisted devices will see an "Access Denied" page and cannot access the network.
+
+#### Request
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `token` | string | Yes | 8-character token to extract MACs from |
+| `reason` | string | No | Reason for blocking (max 31 chars, default: "Blocked by admin") |
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/blacklist \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "token=A3K9M7P2" \
+  -d "reason=Policy violation"
+```
+
+**Python:**
+```python
+import requests
+
+data = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "token": "A3K9M7P2",
+    "reason": "Policy violation"
+}
+
+response = requests.post('http://192.168.0.100/api/mac/blacklist', data=data)
+result = response.json()
+
+if result['success']:
+    print(f"Blacklisted {result['count']} MAC address(es)")
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "message": "Added 2 MAC(s) to blacklist",
+    "count": 2
+}
+```
+
+#### Error Responses
+
+**Token Not Found**
+
+**Code:** `404 Not Found`
+```json
+{
+    "success": false,
+    "error": "Token not found",
+    "error_code": "TOKEN_NOT_FOUND"
+}
+```
+
+**No MACs to Blacklist**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Token has no client MACs to blacklist"
+}
+```
+
+**Other Errors:** Same as other API endpoints (401, 403, 400 for missing parameters)
+
+---
+
+### POST /api/mac/whitelist
+Add all MAC addresses associated with a token to the whitelist. Whitelisted devices receive VIP bypass access - they can use the internet without needing to redeem a token after their first use.
+
+#### Request
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `token` | string | Yes | 8-character token to extract MACs from |
+| `note` | string | No | Note about the whitelist entry (max 31 chars, default: "VIP access") |
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/whitelist \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "token=A3K9M7P2" \
+  -d "note=Premium customer"
+```
+
+**Python:**
+```python
+import requests
+
+data = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "token": "A3K9M7P2",
+    "note": "Premium customer"
+}
+
+response = requests.post('http://192.168.0.100/api/mac/whitelist', data=data)
+result = response.json()
+
+if result['success']:
+    print(f"Whitelisted {result['count']} MAC address(es) for VIP bypass")
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "message": "Added 2 MAC(s) to whitelist (VIP bypass)",
+    "count": 2
+}
+```
+
+#### Error Responses
+
+Same as `/api/mac/blacklist` endpoint.
+
+---
+
+### GET /api/mac/list
+Retrieve all blacklist and whitelist entries with their associated metadata.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** Required (API key)
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/mac/list?api_key=abcd1234efgh5678ijkl9012mnop3456"
+```
+
+**Python:**
+```python
+import requests
+
+params = {"api_key": "abcd1234efgh5678ijkl9012mnop3456"}
+response = requests.get('http://192.168.0.100/api/mac/list', params=params)
+data = response.json()
+
+print(f"Blacklist: {data['blacklist_count']} entries")
+for entry in data['blacklist']:
+    print(f"  {entry['mac']}: {entry['reason']}")
+
+print(f"\nWhitelist: {data['whitelist_count']} entries")
+for entry in data['whitelist']:
+    print(f"  {entry['mac']}: {entry['note']}")
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "blacklist": [
+        {
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "token": "A3K9M7P2",
+            "reason": "Policy violation",
+            "added": 1702234567
+        }
+    ],
+    "whitelist": [
+        {
+            "mac": "11:22:33:44:55:66",
+            "token": "B7X2K9F1",
+            "note": "Premium customer",
+            "added": 1702234890
+        }
+    ],
+    "blacklist_count": 1,
+    "whitelist_count": 1
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blacklist` | array | Array of blacklist entries |
+| `whitelist` | array | Array of whitelist entries |
+| `blacklist_count` | integer | Total number of blacklisted MACs |
+| `whitelist_count` | integer | Total number of whitelisted MACs |
+| `mac` | string | MAC address (format: XX:XX:XX:XX:XX:XX) |
+| `token` | string | Token that was used to add this MAC |
+| `reason` | string | Blacklist reason |
+| `note` | string | Whitelist note |
+| `added` | integer | Unix timestamp when entry was added |
+
+---
+
+### POST /api/mac/remove
+Remove a MAC address from the blacklist, whitelist, or both.
+
+#### Request
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `mac` | string | Yes | MAC address to remove (format: XX:XX:XX:XX:XX:XX) |
+| `list` | string | No | Which list to remove from: "blacklist", "whitelist", or "both" (default: "both") |
+
+#### Example Requests
+
+**cURL - Remove from both lists:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/remove \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "mac=AA:BB:CC:DD:EE:FF"
+```
+
+**cURL - Remove from blacklist only:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/remove \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "mac=AA:BB:CC:DD:EE:FF" \
+  -d "list=blacklist"
+```
+
+**Python:**
+```python
+import requests
+
+# Remove from both lists
+data = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "list": "both"
+}
+
+response = requests.post('http://192.168.0.100/api/mac/remove', data=data)
+result = response.json()
+
+if result['success']:
+    print(f"MAC removed from {data['list']}")
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "message": "MAC removed from both"
+}
+```
+
+#### Error Responses
+
+**MAC Not Found**
+
+**Code:** `404 Not Found`
+```json
+{
+    "success": false,
+    "error": "MAC not found in specified list(s)"
+}
+```
+
+**Invalid MAC Format**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Invalid MAC address format (use XX:XX:XX:XX:XX:XX)"
+}
+```
+
+---
+
+### POST /api/mac/clear
+Clear all entries from the blacklist, whitelist, or both. Use with caution - this operation cannot be undone.
+
+#### Request
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `list` | string | No | Which list to clear: "blacklist", "whitelist", or "both" (default: "both") |
+
+#### Example Requests
+
+**cURL - Clear both lists:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/clear \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456"
+```
+
+**cURL - Clear blacklist only:**
+```bash
+curl -X POST http://192.168.0.100/api/mac/clear \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "list=blacklist"
+```
+
+**Python:**
+```python
+import requests
+
+data = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "list": "blacklist"
+}
+
+response = requests.post('http://192.168.0.100/api/mac/clear', data=data)
+result = response.json()
+
+if result['success']:
+    print(f"Cleared {result['entries_removed']} entries from {data['list']}")
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "message": "Cleared blacklist",
+    "entries_removed": 5
+}
+```
+
+---
+
+### MAC Filtering Use Cases
+
+**1. Block Abusive Users**
+```python
+# Block all devices used by a specific token
+def block_token_devices(api_key, esp32_ip, token, reason):
+    response = requests.post(
+        f'http://{esp32_ip}/api/mac/blacklist',
+        data={
+            'api_key': api_key,
+            'token': token,
+            'reason': reason
+        }
+    )
+    return response.json()
+
+# Example: Block excessive bandwidth user
+block_token_devices(
+    'your_api_key',
+    '192.168.0.100',
+    'A3K9M7P2',
+    'Excessive bandwidth usage'
+)
+```
+
+**2. VIP Customer Management**
+```python
+# Grant VIP access to premium customers
+def grant_vip_access(api_key, esp32_ip, token, note):
+    response = requests.post(
+        f'http://{esp32_ip}/api/mac/whitelist',
+        data={
+            'api_key': api_key,
+            'token': token,
+            'note': note
+        }
+    )
+    return response.json()
+
+# Example: Add premium customer
+grant_vip_access(
+    'your_api_key',
+    '192.168.0.100',
+    'B7X2K9F1',
+    'Premium subscription'
+)
+```
+
+**3. Audit MAC Filters**
+```python
+# Generate report of all filtered MACs
+def audit_mac_filters(api_key, esp32_ip):
+    response = requests.get(
+        f'http://{esp32_ip}/api/mac/list',
+        params={'api_key': api_key}
+    )
+    data = response.json()
+    
+    print(f"Blacklisted Devices: {data['blacklist_count']}")
+    for entry in data['blacklist']:
+        print(f"  {entry['mac']}: {entry['reason']} (added: {entry['added']})")
+    
+    print(f"\nVIP Devices: {data['whitelist_count']}")
+    for entry in data['whitelist']:
+        print(f"  {entry['mac']}: {entry['note']} (added: {entry['added']})")
+
+audit_mac_filters('your_api_key', '192.168.0.100')
+```
+
+**4. Temporary Block with Auto-Unblock**
+```python
+import time
+
+# Block device temporarily
+def temporary_block(api_key, esp32_ip, mac, duration_minutes, reason):
+    # Add to blacklist
+    requests.post(
+        f'http://{esp32_ip}/api/mac/blacklist',
+        data={'api_key': api_key, 'token': 'TEMP0001', 'reason': reason}
+    )
+    
+    print(f"Blocked {mac} for {duration_minutes} minutes")
+    
+    # Wait
+    time.sleep(duration_minutes * 60)
+    
+    # Remove from blacklist
+    requests.post(
+        f'http://{esp32_ip}/api/mac/remove',
+        data={'api_key': api_key, 'mac': mac, 'list': 'blacklist'}
+    )
+    
+    print(f"Unblocked {mac}")
+
+# Example: 30-minute timeout
+temporary_block(
+    'your_api_key',
+    '192.168.0.100',
+    'AA:BB:CC:DD:EE:FF',
+    30,
+    'Rate limit exceeded'
+)
+```
+
+---
+
 ## Error Code Reference
 
 All API endpoints may return the following standard error codes:
@@ -1165,13 +1647,18 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - Accessing endpoints that don't exist (e.g., `/api/token/list`)
 
 **Valid API Endpoints:**
-- `POST /api/token/create`
-- `POST /api/token/extend`
-- `POST /api/token/info`
-- `POST /api/token/disable`
-- `GET /api/tokens/list`
-- `GET /api/uptime`
-- `GET /api/health`
+- `POST /api/token` - Create new token
+- `POST /api/token/extend` - Reset/extend token
+- `GET /api/token/info` - Query token information
+- `POST /api/token/disable` - Disable token
+- `GET /api/tokens/list` - List all tokens
+- `POST /api/mac/blacklist` - Block devices
+- `POST /api/mac/whitelist` - Grant VIP access
+- `GET /api/mac/list` - List MAC filters
+- `POST /api/mac/remove` - Remove MAC from filter
+- `POST /api/mac/clear` - Clear MAC filters
+- `GET /api/uptime` - Device uptime
+- `GET /api/health` - System health metrics
 
 ### Handling TOKEN_NOT_FOUND
 
