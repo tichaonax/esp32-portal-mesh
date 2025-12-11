@@ -168,6 +168,44 @@ typedef struct
 static authenticated_client_t authenticated_clients[MAX_AUTHENTICATED_CLIENTS];
 static int authenticated_count = 0;
 
+// ==================== MAC Filtering (Blacklist/Whitelist) ====================
+#define MAX_BLACKLIST_ENTRIES 50
+#define MAX_WHITELIST_ENTRIES 50
+#define MAC_FILTER_REASON_LENGTH 32
+#define MAC_FILTER_NOTE_LENGTH 32
+
+// Blacklist entry - Devices blocked from network access
+typedef struct
+{
+    uint8_t mac[6];                        // MAC address
+    char token[TOKEN_LENGTH + 1];          // Token that was used to identify device
+    time_t added;                          // When added to blacklist
+    char reason[MAC_FILTER_REASON_LENGTH]; // Reason for blocking
+    bool active;                           // Entry is in use
+} blacklist_entry_t;
+
+// Whitelist entry - VIP devices with permanent bypass (no token needed)
+typedef struct
+{
+    uint8_t mac[6];                    // MAC address
+    char token[TOKEN_LENGTH + 1];      // Token that granted whitelist status
+    time_t added;                      // When added to whitelist
+    char note[MAC_FILTER_NOTE_LENGTH]; // Optional note
+    bool active;                       // Entry is in use
+} whitelist_entry_t;
+
+static blacklist_entry_t blacklist[MAX_BLACKLIST_ENTRIES];
+static int blacklist_count = 0;
+
+static whitelist_entry_t whitelist[MAX_WHITELIST_ENTRIES];
+static int whitelist_count = 0;
+
+// NVS keys for MAC filtering
+#define NVS_BLACKLIST_COUNT "bl_count"
+#define NVS_BLACKLIST_PREFIX "bl_"
+#define NVS_WHITELIST_COUNT "wl_count"
+#define NVS_WHITELIST_PREFIX "wl_"
+
 // Check if a client IP is authenticated
 static bool is_client_authenticated(uint32_t client_ip)
 {
@@ -475,6 +513,186 @@ static void load_tokens_from_nvs(void)
     ESP_LOGI(TAG, "Loaded %d active tokens from NVS", token_count);
 }
 
+// ==================== MAC Filtering NVS Functions ====================
+
+// Save blacklist to NVS
+static esp_err_t save_blacklist_to_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("mac_filter", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error opening NVS for blacklist: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Save blacklist count
+    err = nvs_set_i32(nvs_handle, NVS_BLACKLIST_COUNT, blacklist_count);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error saving blacklist count: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    // Save each blacklist entry
+    int saved_count = 0;
+    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    {
+        if (blacklist[i].active)
+        {
+            char key[16];
+            snprintf(key, sizeof(key), "%s%d", NVS_BLACKLIST_PREFIX, saved_count);
+            err = nvs_set_blob(nvs_handle, key, &blacklist[i], sizeof(blacklist_entry_t));
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Error saving blacklist entry %d: %s", i, esp_err_to_name(err));
+            }
+            saved_count++;
+        }
+    }
+
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    ESP_LOGI(TAG, "✓ Saved %d blacklist entries to NVS", saved_count);
+    return err;
+}
+
+// Load blacklist from NVS
+static void load_blacklist_from_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("mac_filter", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGI(TAG, "No existing blacklist found in NVS");
+        return;
+    }
+
+    // Load blacklist count
+    int32_t count = 0;
+    err = nvs_get_i32(nvs_handle, NVS_BLACKLIST_COUNT, &count);
+    if (err != ESP_OK || count <= 0)
+    {
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    // Load each blacklist entry
+    blacklist_count = 0;
+    for (int i = 0; i < count && i < MAX_BLACKLIST_ENTRIES; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "%s%d", NVS_BLACKLIST_PREFIX, i);
+
+        size_t required_size = sizeof(blacklist_entry_t);
+        err = nvs_get_blob(nvs_handle, key, &blacklist[blacklist_count], &required_size);
+
+        if (err == ESP_OK && blacklist[blacklist_count].active)
+        {
+            ESP_LOGI(TAG, "Loaded blacklist entry: %02X:%02X:%02X:%02X:%02X:%02X (token: %s)",
+                     blacklist[blacklist_count].mac[0], blacklist[blacklist_count].mac[1],
+                     blacklist[blacklist_count].mac[2], blacklist[blacklist_count].mac[3],
+                     blacklist[blacklist_count].mac[4], blacklist[blacklist_count].mac[5],
+                     blacklist[blacklist_count].token);
+            blacklist_count++;
+        }
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "✓ Loaded %d blacklist entries from NVS", blacklist_count);
+}
+
+// Save whitelist to NVS
+static esp_err_t save_whitelist_to_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("mac_filter", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error opening NVS for whitelist: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Save whitelist count
+    err = nvs_set_i32(nvs_handle, NVS_WHITELIST_COUNT, whitelist_count);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error saving whitelist count: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    // Save each whitelist entry
+    int saved_count = 0;
+    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    {
+        if (whitelist[i].active)
+        {
+            char key[16];
+            snprintf(key, sizeof(key), "%s%d", NVS_WHITELIST_PREFIX, saved_count);
+            err = nvs_set_blob(nvs_handle, key, &whitelist[i], sizeof(whitelist_entry_t));
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Error saving whitelist entry %d: %s", i, esp_err_to_name(err));
+            }
+            saved_count++;
+        }
+    }
+
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    ESP_LOGI(TAG, "✓ Saved %d whitelist entries to NVS", saved_count);
+    return err;
+}
+
+// Load whitelist from NVS
+static void load_whitelist_from_nvs(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("mac_filter", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGI(TAG, "No existing whitelist found in NVS");
+        return;
+    }
+
+    // Load whitelist count
+    int32_t count = 0;
+    err = nvs_get_i32(nvs_handle, NVS_WHITELIST_COUNT, &count);
+    if (err != ESP_OK || count <= 0)
+    {
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    // Load each whitelist entry
+    whitelist_count = 0;
+    for (int i = 0; i < count && i < MAX_WHITELIST_ENTRIES; i++)
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "%s%d", NVS_WHITELIST_PREFIX, i);
+
+        size_t required_size = sizeof(whitelist_entry_t);
+        err = nvs_get_blob(nvs_handle, key, &whitelist[whitelist_count], &required_size);
+
+        if (err == ESP_OK && whitelist[whitelist_count].active)
+        {
+            ESP_LOGI(TAG, "Loaded whitelist entry: %02X:%02X:%02X:%02X:%02X:%02X (token: %s)",
+                     whitelist[whitelist_count].mac[0], whitelist[whitelist_count].mac[1],
+                     whitelist[whitelist_count].mac[2], whitelist[whitelist_count].mac[3],
+                     whitelist[whitelist_count].mac[4], whitelist[whitelist_count].mac[5],
+                     whitelist[whitelist_count].token);
+            whitelist_count++;
+        }
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "✓ Loaded %d whitelist entries from NVS", whitelist_count);
+}
+
 // Check if system time is synced and valid
 static bool is_time_valid(void)
 {
@@ -564,9 +782,33 @@ static esp_err_t create_new_token(char *token_out)
     return create_new_token_with_params(token_out, TOKEN_EXPIRY_HOURS * 60, 0, 0);
 }
 
+// Forward declarations for MAC filtering functions
+static bool is_mac_blacklisted(const uint8_t *mac);
+static bool is_mac_whitelisted(const uint8_t *mac);
+
 // Validate token and bind to client MAC
 static bool validate_token(const char *token, const uint8_t *client_mac)
 {
+    // ===== MAC FILTERING CHECKS =====
+    // Check blacklist FIRST - Always block blacklisted devices
+    if (is_mac_blacklisted(client_mac))
+    {
+        ESP_LOGW(TAG, "✗ Blacklisted MAC attempt: %02X:%02X:%02X:%02X:%02X:%02X",
+                 client_mac[0], client_mac[1], client_mac[2],
+                 client_mac[3], client_mac[4], client_mac[5]);
+        return false;
+    }
+
+    // Check whitelist SECOND - VIP bypass (no token needed)
+    if (is_mac_whitelisted(client_mac))
+    {
+        ESP_LOGI(TAG, "✓ Whitelisted MAC (VIP bypass): %02X:%02X:%02X:%02X:%02X:%02X",
+                 client_mac[0], client_mac[1], client_mac[2],
+                 client_mac[3], client_mac[4], client_mac[5]);
+        return true; // Grant access immediately, no token validation needed
+    }
+
+    // ===== NORMAL TOKEN VALIDATION =====
     // Cannot validate tokens without valid time
     if (!is_time_valid())
     {
@@ -768,6 +1010,160 @@ static void cleanup_expired_tokens(void)
         ESP_LOGI(TAG, "🧹 Cleanup complete: %d token(s) removed, %d active token(s) remaining",
                  cleaned, token_count);
     }
+}
+
+// ==================== MAC Filtering Functions ====================
+
+// Check if a MAC address is blacklisted
+static bool is_mac_blacklisted(const uint8_t *mac)
+{
+    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    {
+        if (blacklist[i].active && memcmp(blacklist[i].mac, mac, 6) == 0)
+        {
+            ESP_LOGD(TAG, "MAC %02X:%02X:%02X:%02X:%02X:%02X is blacklisted",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if a MAC address is whitelisted
+static bool is_mac_whitelisted(const uint8_t *mac)
+{
+    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    {
+        if (whitelist[i].active && memcmp(whitelist[i].mac, mac, 6) == 0)
+        {
+            ESP_LOGD(TAG, "MAC %02X:%02X:%02X:%02X:%02X:%02X is whitelisted (VIP bypass)",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Remove MAC from whitelist (used when adding to blacklist)
+static esp_err_t remove_from_whitelist(const uint8_t *mac)
+{
+    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    {
+        if (whitelist[i].active && memcmp(whitelist[i].mac, mac, 6) == 0)
+        {
+            whitelist[i].active = false;
+            whitelist_count--;
+            ESP_LOGI(TAG, "Removed MAC %02X:%02X:%02X:%02X:%02X:%02X from whitelist",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+// Remove MAC from blacklist (used when adding to whitelist)
+static esp_err_t remove_from_blacklist(const uint8_t *mac)
+{
+    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    {
+        if (blacklist[i].active && memcmp(blacklist[i].mac, mac, 6) == 0)
+        {
+            blacklist[i].active = false;
+            blacklist_count--;
+            ESP_LOGI(TAG, "Removed MAC %02X:%02X:%02X:%02X:%02X:%02X from blacklist",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+// Add MAC to blacklist
+static esp_err_t add_to_blacklist(const uint8_t *mac, const char *token, const char *reason)
+{
+    // Check if already blacklisted
+    if (is_mac_blacklisted(mac))
+    {
+        ESP_LOGW(TAG, "MAC already blacklisted");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Remove from whitelist if present (mutual exclusivity)
+    remove_from_whitelist(mac);
+
+    // Find empty slot
+    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    {
+        if (!blacklist[i].active)
+        {
+            memcpy(blacklist[i].mac, mac, 6);
+            strncpy(blacklist[i].token, token, TOKEN_LENGTH);
+            blacklist[i].token[TOKEN_LENGTH] = '\0';
+            blacklist[i].added = time(NULL);
+            if (reason)
+            {
+                strncpy(blacklist[i].reason, reason, MAC_FILTER_REASON_LENGTH - 1);
+                blacklist[i].reason[MAC_FILTER_REASON_LENGTH - 1] = '\0';
+            }
+            else
+            {
+                blacklist[i].reason[0] = '\0';
+            }
+            blacklist[i].active = true;
+            blacklist_count++;
+
+            ESP_LOGI(TAG, "✓ Added MAC %02X:%02X:%02X:%02X:%02X:%02X to blacklist (token: %s)",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], token);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGW(TAG, "Blacklist full (max %d entries)", MAX_BLACKLIST_ENTRIES);
+    return ESP_ERR_NO_MEM;
+}
+
+// Add MAC to whitelist
+static esp_err_t add_to_whitelist(const uint8_t *mac, const char *token, const char *note)
+{
+    // Check if already whitelisted
+    if (is_mac_whitelisted(mac))
+    {
+        ESP_LOGW(TAG, "MAC already whitelisted");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Remove from blacklist if present (mutual exclusivity)
+    remove_from_blacklist(mac);
+
+    // Find empty slot
+    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    {
+        if (!whitelist[i].active)
+        {
+            memcpy(whitelist[i].mac, mac, 6);
+            strncpy(whitelist[i].token, token, TOKEN_LENGTH);
+            whitelist[i].token[TOKEN_LENGTH] = '\0';
+            whitelist[i].added = time(NULL);
+            if (note)
+            {
+                strncpy(whitelist[i].note, note, MAC_FILTER_NOTE_LENGTH - 1);
+                whitelist[i].note[MAC_FILTER_NOTE_LENGTH - 1] = '\0';
+            }
+            else
+            {
+                whitelist[i].note[0] = '\0';
+            }
+            whitelist[i].active = true;
+            whitelist_count++;
+
+            ESP_LOGI(TAG, "✓ Added MAC %02X:%02X:%02X:%02X:%02X:%02X to whitelist (VIP bypass, token: %s)",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], token);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGW(TAG, "Whitelist full (max %d entries)", MAX_WHITELIST_ENTRIES);
+    return ESP_ERR_NO_MEM;
 }
 
 // SNTP sync notification callback
@@ -1635,6 +2031,11 @@ static void http_server_task(void *pvParameters)
             bool is_api_tokens_list = (strstr(rx_buffer, "GET /api/tokens/list") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
             bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
+            bool is_api_mac_blacklist = (strstr(rx_buffer, "POST /api/mac/blacklist") != NULL);
+            bool is_api_mac_whitelist = (strstr(rx_buffer, "POST /api/mac/whitelist") != NULL);
+            bool is_api_mac_remove = (strstr(rx_buffer, "POST /api/mac/remove") != NULL);
+            bool is_api_mac_list = (strstr(rx_buffer, "GET /api/mac/list") != NULL);
+            bool is_api_mac_clear = (strstr(rx_buffer, "POST /api/mac/clear") != NULL);
             bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
             bool is_admin_logout = (strstr(rx_buffer, "POST /admin/logout") != NULL);
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
@@ -1945,39 +2346,39 @@ static void http_server_task(void *pvParameters)
 
                                     char response[1024];
                                     int offset = snprintf(response, sizeof(response),
-                                             "HTTP/1.1 200 OK\r\n"
-                                             "Content-Type: application/json\r\n"
-                                             "Connection: close\r\n\r\n"
-                                             "{\"success\":true,\"token\":\"%s\","
-                                             "\"status\":\"%s\","
-                                             "\"created\":%lld,"
-                                             "\"first_use\":%lld,"
-                                             "\"duration_minutes\":%lu,"
-                                             "\"expires_at\":%lld,"
-                                             "\"remaining_seconds\":%lld,"
-                                             "\"bandwidth_down_mb\":%lu,"
-                                             "\"bandwidth_up_mb\":%lu,"
-                                             "\"bandwidth_used_down_mb\":%lu,"
-                                             "\"bandwidth_used_up_mb\":%lu,"
-                                             "\"usage_count\":%lu,"
-                                             "\"device_count\":%u,"
-                                             "\"max_devices\":%d,"
-                                             "\"client_macs\":[",
-                                             active_tokens[i].token,
-                                             is_expired ? "expired" : (is_used ? "active" : "unused"),
-                                             (long long)active_tokens[i].created,
-                                             (long long)active_tokens[i].first_use,
-                                             active_tokens[i].duration_minutes,
-                                             (long long)expires_at,
-                                             remaining_seconds,
-                                             active_tokens[i].bandwidth_down_mb,
-                                             active_tokens[i].bandwidth_up_mb,
-                                             active_tokens[i].bandwidth_used_down,
-                                             active_tokens[i].bandwidth_used_up,
-                                             active_tokens[i].usage_count,
-                                             active_tokens[i].device_count,
-                                             MAX_DEVICES_PER_TOKEN);
-                                    
+                                                          "HTTP/1.1 200 OK\r\n"
+                                                          "Content-Type: application/json\r\n"
+                                                          "Connection: close\r\n\r\n"
+                                                          "{\"success\":true,\"token\":\"%s\","
+                                                          "\"status\":\"%s\","
+                                                          "\"created\":%lld,"
+                                                          "\"first_use\":%lld,"
+                                                          "\"duration_minutes\":%lu,"
+                                                          "\"expires_at\":%lld,"
+                                                          "\"remaining_seconds\":%lld,"
+                                                          "\"bandwidth_down_mb\":%lu,"
+                                                          "\"bandwidth_up_mb\":%lu,"
+                                                          "\"bandwidth_used_down_mb\":%lu,"
+                                                          "\"bandwidth_used_up_mb\":%lu,"
+                                                          "\"usage_count\":%lu,"
+                                                          "\"device_count\":%u,"
+                                                          "\"max_devices\":%d,"
+                                                          "\"client_macs\":[",
+                                                          active_tokens[i].token,
+                                                          is_expired ? "expired" : (is_used ? "active" : "unused"),
+                                                          (long long)active_tokens[i].created,
+                                                          (long long)active_tokens[i].first_use,
+                                                          active_tokens[i].duration_minutes,
+                                                          (long long)expires_at,
+                                                          remaining_seconds,
+                                                          active_tokens[i].bandwidth_down_mb,
+                                                          active_tokens[i].bandwidth_up_mb,
+                                                          active_tokens[i].bandwidth_used_down,
+                                                          active_tokens[i].bandwidth_used_up,
+                                                          active_tokens[i].usage_count,
+                                                          active_tokens[i].device_count,
+                                                          MAX_DEVICES_PER_TOKEN);
+
                                     // Add MAC addresses
                                     for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                     {
@@ -1986,15 +2387,15 @@ static void http_server_task(void *pvParameters)
                                             offset += snprintf(response + offset, sizeof(response) - offset, ",");
                                         }
                                         offset += snprintf(response + offset, sizeof(response) - offset,
-                                                          "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                                                          active_tokens[i].client_macs[mac_idx][0],
-                                                          active_tokens[i].client_macs[mac_idx][1],
-                                                          active_tokens[i].client_macs[mac_idx][2],
-                                                          active_tokens[i].client_macs[mac_idx][3],
-                                                          active_tokens[i].client_macs[mac_idx][4],
-                                                          active_tokens[i].client_macs[mac_idx][5]);
+                                                           "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                           active_tokens[i].client_macs[mac_idx][0],
+                                                           active_tokens[i].client_macs[mac_idx][1],
+                                                           active_tokens[i].client_macs[mac_idx][2],
+                                                           active_tokens[i].client_macs[mac_idx][3],
+                                                           active_tokens[i].client_macs[mac_idx][4],
+                                                           active_tokens[i].client_macs[mac_idx][5]);
                                     }
-                                    
+
                                     offset += snprintf(response + offset, sizeof(response) - offset, "]}");
                                     send(sock, response, strlen(response), 0);
                                     break;
@@ -2278,7 +2679,7 @@ static void http_server_task(void *pvParameters)
                                                        active_tokens[i].bandwidth_used_up,
                                                        active_tokens[i].usage_count,
                                                        active_tokens[i].device_count);
-                                    
+
                                     // Add MAC addresses for this token
                                     for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                     {
@@ -2287,15 +2688,15 @@ static void http_server_task(void *pvParameters)
                                             offset += snprintf(response + offset, 8192 - offset, ",");
                                         }
                                         offset += snprintf(response + offset, 8192 - offset,
-                                                          "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                                                          active_tokens[i].client_macs[mac_idx][0],
-                                                          active_tokens[i].client_macs[mac_idx][1],
-                                                          active_tokens[i].client_macs[mac_idx][2],
-                                                          active_tokens[i].client_macs[mac_idx][3],
-                                                          active_tokens[i].client_macs[mac_idx][4],
-                                                          active_tokens[i].client_macs[mac_idx][5]);
+                                                           "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                           active_tokens[i].client_macs[mac_idx][0],
+                                                           active_tokens[i].client_macs[mac_idx][1],
+                                                           active_tokens[i].client_macs[mac_idx][2],
+                                                           active_tokens[i].client_macs[mac_idx][3],
+                                                           active_tokens[i].client_macs[mac_idx][4],
+                                                           active_tokens[i].client_macs[mac_idx][5]);
                                     }
-                                    
+
                                     offset += snprintf(response + offset, 8192 - offset, "]}");
 
                                     if (offset >= 7800)
@@ -2329,12 +2730,527 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle POST /api/mac/blacklist - Add MAC(s) from token to blacklist
+            if (is_api_mac_blacklist)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char token_str[TOKEN_LENGTH + 1] = {0};
+                    char reason[32] = "Blocked by admin";
+
+                    // Parse parameters
+                    char *key_start = strstr(body, "api_key=");
+                    char *token_start = strstr(body, "token=");
+                    char *reason_start = strstr(body, "reason=");
+
+                    if (key_start && token_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        token_start += 6;
+                        sscanf(token_start, "%8[^&\r\n]", token_str);
+
+                        if (reason_start)
+                        {
+                            reason_start += 7;
+                            sscanf(reason_start, "%31[^&\r\n]", reason);
+                        }
+
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Find token and extract MACs
+                            bool found = false;
+                            int macs_added = 0;
+
+                            for (int i = 0; i < token_count; i++)
+                            {
+                                if (active_tokens[i].active && strcmp(active_tokens[i].token, token_str) == 0)
+                                {
+                                    found = true;
+
+                                    // Add all client MACs from this token to blacklist
+                                    for (int j = 0; j < active_tokens[i].device_count; j++)
+                                    {
+                                        if (add_to_blacklist(active_tokens[i].client_macs[j], token_str, reason) == ESP_OK)
+                                        {
+                                            macs_added++;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (found && macs_added > 0)
+                            {
+                                // Save to NVS
+                                save_blacklist_to_nvs();
+
+                                char response_buffer[512];
+                                snprintf(response_buffer, sizeof(response_buffer),
+                                         "HTTP/1.1 200 OK\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":true,\"message\":\"Added %d MAC(s) to blacklist\",\"count\":%d}",
+                                         macs_added, macs_added);
+                                send(sock, response_buffer, strlen(response_buffer), 0);
+                                ESP_LOGI(TAG, "API: Added %d MAC(s) from token %s to blacklist", macs_added, token_str);
+                            }
+                            else if (found && macs_added == 0)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token has no client MACs to blacklist\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                            }
+                            else
+                            {
+                                const char *not_found_response =
+                                    "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token not found\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
+                                send(sock, not_found_response, strlen(not_found_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle POST /api/mac/whitelist - Add MAC(s) from token to whitelist (VIP bypass)
+            if (is_api_mac_whitelist)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char token_str[TOKEN_LENGTH + 1] = {0};
+                    char note[32] = "VIP access";
+
+                    // Parse parameters
+                    char *key_start = strstr(body, "api_key=");
+                    char *token_start = strstr(body, "token=");
+                    char *note_start = strstr(body, "note=");
+
+                    if (key_start && token_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        token_start += 6;
+                        sscanf(token_start, "%8[^&\r\n]", token_str);
+
+                        if (note_start)
+                        {
+                            note_start += 5;
+                            sscanf(note_start, "%31[^&\r\n]", note);
+                        }
+
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Find token and extract MACs
+                            bool found = false;
+                            int macs_added = 0;
+
+                            for (int i = 0; i < token_count; i++)
+                            {
+                                if (active_tokens[i].active && strcmp(active_tokens[i].token, token_str) == 0)
+                                {
+                                    found = true;
+
+                                    // Add all client MACs from this token to whitelist
+                                    for (int j = 0; j < active_tokens[i].device_count; j++)
+                                    {
+                                        if (add_to_whitelist(active_tokens[i].client_macs[j], token_str, note) == ESP_OK)
+                                        {
+                                            macs_added++;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (found && macs_added > 0)
+                            {
+                                // Save to NVS
+                                save_whitelist_to_nvs();
+
+                                char response_buffer[512];
+                                snprintf(response_buffer, sizeof(response_buffer),
+                                         "HTTP/1.1 200 OK\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":true,\"message\":\"Added %d MAC(s) to whitelist (VIP bypass)\",\"count\":%d}",
+                                         macs_added, macs_added);
+                                send(sock, response_buffer, strlen(response_buffer), 0);
+                                ESP_LOGI(TAG, "API: Added %d MAC(s) from token %s to whitelist", macs_added, token_str);
+                            }
+                            else if (found && macs_added == 0)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token has no client MACs to whitelist\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                            }
+                            else
+                            {
+                                const char *not_found_response =
+                                    "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Token not found\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
+                                send(sock, not_found_response, strlen(not_found_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle GET /api/mac/list - List all blacklist and whitelist entries
+            if (is_api_mac_list)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Parse query string for API key
+                char received_key[API_KEY_LENGTH + 1] = {0};
+                char *query_start = strstr(rx_buffer, "GET /api/mac/list?");
+
+                if (query_start)
+                {
+                    query_start += 18; // skip "GET /api/mac/list?"
+                    char *key_start = strstr(query_start, "api_key=");
+
+                    if (key_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n ]", received_key);
+
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Build JSON response with both lists
+                            char *response_buffer = (char *)malloc(8192);
+                            if (response_buffer)
+                            {
+                                int len = snprintf(response_buffer, 8192,
+                                                   "HTTP/1.1 200 OK\r\n"
+                                                   "Content-Type: application/json\r\n"
+                                                   "Connection: close\r\n\r\n"
+                                                   "{\"success\":true,\"blacklist\":[");
+
+                                // Add blacklist entries
+                                bool first = true;
+                                for (int i = 0; i < blacklist_count; i++)
+                                {
+                                    if (blacklist[i].active)
+                                    {
+                                        if (!first)
+                                            len += snprintf(response_buffer + len, 8192 - len, ",");
+                                        first = false;
+
+                                        char mac_str[18];
+                                        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                                 blacklist[i].mac[0], blacklist[i].mac[1], blacklist[i].mac[2],
+                                                 blacklist[i].mac[3], blacklist[i].mac[4], blacklist[i].mac[5]);
+
+                                        len += snprintf(response_buffer + len, 8192 - len,
+                                                        "{\"mac\":\"%s\",\"token\":\"%s\",\"reason\":\"%s\",\"added\":%ld}",
+                                                        mac_str, blacklist[i].token, blacklist[i].reason, (long)blacklist[i].added);
+                                    }
+                                }
+
+                                len += snprintf(response_buffer + len, 8192 - len, "],\"whitelist\":[");
+
+                                // Add whitelist entries
+                                first = true;
+                                for (int i = 0; i < whitelist_count; i++)
+                                {
+                                    if (whitelist[i].active)
+                                    {
+                                        if (!first)
+                                            len += snprintf(response_buffer + len, 8192 - len, ",");
+                                        first = false;
+
+                                        char mac_str[18];
+                                        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                                 whitelist[i].mac[0], whitelist[i].mac[1], whitelist[i].mac[2],
+                                                 whitelist[i].mac[3], whitelist[i].mac[4], whitelist[i].mac[5]);
+
+                                        len += snprintf(response_buffer + len, 8192 - len,
+                                                        "{\"mac\":\"%s\",\"token\":\"%s\",\"note\":\"%s\",\"added\":%ld}",
+                                                        mac_str, whitelist[i].token, whitelist[i].note, (long)whitelist[i].added);
+                                    }
+                                }
+
+                                len += snprintf(response_buffer + len, 8192 - len,
+                                                "],\"blacklist_count\":%d,\"whitelist_count\":%d}",
+                                                blacklist_count, whitelist_count);
+
+                                send(sock, response_buffer, len, 0);
+                                free(response_buffer);
+                                ESP_LOGI(TAG, "API: Listed MAC filters (BL:%d, WL:%d)", blacklist_count, whitelist_count);
+                            }
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameter: api_key\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle POST /api/mac/remove - Remove MAC from blacklist/whitelist
+            if (is_api_mac_remove)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char mac_str[18] = {0};
+                    char list_type[16] = "both"; // Default: remove from both lists
+
+                    // Parse parameters
+                    char *key_start = strstr(body, "api_key=");
+                    char *mac_start = strstr(body, "mac=");
+                    char *list_start = strstr(body, "list=");
+
+                    if (key_start && mac_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        mac_start += 4;
+                        sscanf(mac_start, "%17[^&\r\n]", mac_str);
+
+                        if (list_start)
+                        {
+                            list_start += 5;
+                            sscanf(list_start, "%15[^&\r\n]", list_type);
+                        }
+
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Parse MAC address
+                            uint8_t mac[6];
+                            int parsed = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                                                &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+
+                            if (parsed == 6)
+                            {
+                                bool removed = false;
+
+                                // Remove from blacklist if requested
+                                if (strcmp(list_type, "blacklist") == 0 || strcmp(list_type, "both") == 0)
+                                {
+                                    if (remove_from_blacklist(mac) == ESP_OK)
+                                    {
+                                        save_blacklist_to_nvs();
+                                        removed = true;
+                                    }
+                                }
+
+                                // Remove from whitelist if requested
+                                if (strcmp(list_type, "whitelist") == 0 || strcmp(list_type, "both") == 0)
+                                {
+                                    if (remove_from_whitelist(mac) == ESP_OK)
+                                    {
+                                        save_whitelist_to_nvs();
+                                        removed = true;
+                                    }
+                                }
+
+                                if (removed)
+                                {
+                                    char response_buffer[256];
+                                    snprintf(response_buffer, sizeof(response_buffer),
+                                             "HTTP/1.1 200 OK\r\n"
+                                             "Content-Type: application/json\r\n"
+                                             "Connection: close\r\n\r\n"
+                                             "{\"success\":true,\"message\":\"MAC removed from %s\"}",
+                                             list_type);
+                                    send(sock, response_buffer, strlen(response_buffer), 0);
+                                    ESP_LOGI(TAG, "API: Removed MAC %s from %s", mac_str, list_type);
+                                }
+                                else
+                                {
+                                    const char *not_found_response =
+                                        "HTTP/1.1 404 Not Found\r\n"
+                                        "Content-Type: application/json\r\n"
+                                        "Connection: close\r\n\r\n"
+                                        "{\"success\":false,\"error\":\"MAC not found in specified list(s)\"}";
+                                    send(sock, not_found_response, strlen(not_found_response), 0);
+                                }
+                            }
+                            else
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Invalid MAC address format (use XX:XX:XX:XX:XX:XX)\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                            }
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, mac)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle POST /api/mac/clear - Clear blacklist/whitelist
+            if (is_api_mac_clear)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    char list_type[16] = "both"; // Default: clear both lists
+
+                    // Parse parameters
+                    char *key_start = strstr(body, "api_key=");
+                    char *list_start = strstr(body, "list=");
+
+                    if (key_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        if (list_start)
+                        {
+                            list_start += 5;
+                            sscanf(list_start, "%15[^&\r\n]", list_type);
+                        }
+
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            int cleared = 0;
+
+                            // Clear blacklist if requested
+                            if (strcmp(list_type, "blacklist") == 0 || strcmp(list_type, "both") == 0)
+                            {
+                                cleared += blacklist_count;
+                                blacklist_count = 0;
+                                memset(blacklist, 0, sizeof(blacklist));
+                                save_blacklist_to_nvs();
+                            }
+
+                            // Clear whitelist if requested
+                            if (strcmp(list_type, "whitelist") == 0 || strcmp(list_type, "both") == 0)
+                            {
+                                cleared += whitelist_count;
+                                whitelist_count = 0;
+                                memset(whitelist, 0, sizeof(whitelist));
+                                save_whitelist_to_nvs();
+                            }
+
+                            char response_buffer[256];
+                            snprintf(response_buffer, sizeof(response_buffer),
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Type: application/json\r\n"
+                                     "Connection: close\r\n\r\n"
+                                     "{\"success\":true,\"message\":\"Cleared %s\",\"entries_removed\":%d}",
+                                     list_type, cleared);
+                            send(sock, response_buffer, strlen(response_buffer), 0);
+                            ESP_LOGI(TAG, "API: Cleared %s (%d entries)", list_type, cleared);
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameter: api_key\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
             // Handle invalid API endpoints - return 404 for unmatched /api/* routes
             if (strstr(rx_buffer, "GET /api/") != NULL || strstr(rx_buffer, "POST /api/") != NULL)
             {
                 // Check if it's not one of our known endpoints
                 bool is_known_api = is_api_token || is_api_token_disable || is_api_token_info ||
-                                    is_api_token_extend || is_api_tokens_list || is_api_uptime || is_api_health;
+                                    is_api_token_extend || is_api_tokens_list || is_api_uptime || is_api_health ||
+                                    is_api_mac_blacklist || is_api_mac_whitelist || is_api_mac_remove ||
+                                    is_api_mac_list || is_api_mac_clear;
 
                 if (!is_known_api)
                 {
@@ -3156,6 +4072,64 @@ static void http_server_task(void *pvParameters)
                         continue;
                     }
 
+                    // Check if MAC is blacklisted before showing login page
+                    uint8_t client_mac[6] = {0};
+                    memcpy(client_mac, &source_addr.sin_addr.s_addr, 4);
+
+                    if (is_mac_blacklisted(client_mac))
+                    {
+                        // Find blacklist entry to get reason
+                        const char *reason = "Access blocked by administrator";
+                        for (int i = 0; i < blacklist_count; i++)
+                        {
+                            if (blacklist[i].active && memcmp(blacklist[i].mac, client_mac, 6) == 0)
+                            {
+                                if (strlen(blacklist[i].reason) > 0)
+                                {
+                                    reason = blacklist[i].reason;
+                                }
+                                break;
+                            }
+                        }
+
+                        // Format MAC address for display
+                        char mac_display[18];
+                        snprintf(mac_display, sizeof(mac_display), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                 client_mac[0], client_mac[1], client_mac[2],
+                                 client_mac[3], client_mac[4], client_mac[5]);
+
+                        // Show blacklist blocked page
+                        char blocked_response[2048];
+                        snprintf(blocked_response, sizeof(blocked_response),
+                                 "HTTP/1.1 403 Forbidden\r\n"
+                                 "Content-Type: text/html; charset=UTF-8\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n"
+                                 "<!DOCTYPE html>"
+                                 "<html><head><meta charset='UTF-8'><title>Access Denied</title>"
+                                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                                 "<style>body{font-family:Arial;margin:40px;text-align:center;background:#f0f0f0}"
+                                 ".box{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);max-width:400px;margin:0 auto}"
+                                 "h1{color:#dc3545}.icon{font-size:48px;margin-bottom:20px}"
+                                 "p{color:#666;margin:10px 0}.mac{font-family:monospace;background:#f8f9fa;padding:8px;border-radius:4px;color:#333}"
+                                 ".reason{font-weight:bold;color:#dc3545;margin-top:20px}"
+                                 ".info{margin-top:30px;font-size:12px;color:#999}</style>"
+                                 "</head><body><div class='box'>"
+                                 "<div class='icon'>🚫</div>"
+                                 "<h1>Access Denied</h1>"
+                                 "<p>Your device has been blocked from accessing this network.</p>"
+                                 "<p class='mac'>MAC: %s</p>"
+                                 "<p class='reason'>Reason: %s</p>"
+                                 "<p class='info'>If you believe this is an error, please contact the network administrator.</p>"
+                                 "</div></body></html>",
+                                 mac_display, reason);
+
+                        send(sock, blocked_response, strlen(blocked_response), 0);
+                        ESP_LOGW(TAG, "Blocked blacklisted MAC %s from accessing portal", mac_display);
+                        close(sock);
+                        continue;
+                    }
+
                     // Show login page for unauthenticated users
                     const char *response =
                         "HTTP/1.1 200 OK\r\n"
@@ -3230,6 +4204,10 @@ void app_main(void)
 
     // Load existing tokens from NVS
     load_tokens_from_nvs();
+
+    // Load MAC filtering lists from NVS
+    load_blacklist_from_nvs();
+    load_whitelist_from_nvs();
 
     // Load WiFi credentials from NVS (or use defaults)
     load_wifi_credentials();
