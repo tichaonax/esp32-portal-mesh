@@ -35,42 +35,43 @@ static time_t time_sync_timestamp = 0;
 
 // ==================== HTTP Response Constants ====================
 // Common HTTP headers
-#define HTTP_HEADER_JSON \
+#define HTTP_HEADER_JSON                 \
     "Content-Type: application/json\r\n" \
     "Connection: close\r\n\r\n"
 
 // HTTP 403 Forbidden (API access from local network)
-static const char HTTP_403_API_UPLINK_ONLY[] = 
-    "HTTP/1.1 403 Forbidden\r\n"
-    HTTP_HEADER_JSON
+static const char HTTP_403_API_UPLINK_ONLY[] =
+    "HTTP/1.1 403 Forbidden\r\n" HTTP_HEADER_JSON
     "{\"error\":\"API only accessible from uplink network\"}";
 
 // HTTP 401 Unauthorized (Invalid API key)
-static const char HTTP_401_INVALID_API_KEY[] = 
-    "HTTP/1.1 401 Unauthorized\r\n"
-    HTTP_HEADER_JSON
+static const char HTTP_401_INVALID_API_KEY[] =
+    "HTTP/1.1 401 Unauthorized\r\n" HTTP_HEADER_JSON
     "{\"success\":false,\"error\":\"Invalid API key\"}";
 
 // Helper macro to check if request is from local AP network
 #define IS_LOCAL_AP_REQUEST(ip_str) (strncmp(ip_str, "192.168.4.", 10) == 0)
 
 // Helper macro to send error and close connection
-#define SEND_ERROR_AND_CLOSE(sock, response) \
-    do { \
+#define SEND_ERROR_AND_CLOSE(sock, response)       \
+    do                                             \
+    {                                              \
         send(sock, response, strlen(response), 0); \
-        close(sock); \
-    } while(0)
+        close(sock);                               \
+    } while (0)
 
 // Helper macro to reject local AP requests to API endpoints
-#define REJECT_LOCAL_AP_REQUEST(sock, source_addr) \
-    do { \
-        char client_ip_str[16]; \
+#define REJECT_LOCAL_AP_REQUEST(sock, source_addr)                                         \
+    do                                                                                     \
+    {                                                                                      \
+        char client_ip_str[16];                                                            \
         inet_ntop(AF_INET, &(source_addr).sin_addr, client_ip_str, sizeof(client_ip_str)); \
-        if (IS_LOCAL_AP_REQUEST(client_ip_str)) { \
-            SEND_ERROR_AND_CLOSE(sock, HTTP_403_API_UPLINK_ONLY); \
-            continue; \
-        } \
-    } while(0)
+        if (IS_LOCAL_AP_REQUEST(client_ip_str))                                            \
+        {                                                                                  \
+            SEND_ERROR_AND_CLOSE(sock, HTTP_403_API_UPLINK_ONLY);                          \
+            continue;                                                                      \
+        }                                                                                  \
+    } while (0)
 
 // Helper macros
 #define STRINGIFY(x) #x
@@ -506,7 +507,8 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
 
     if (token_count >= MAX_TOKENS)
     {
-        ESP_LOGE(TAG, "Maximum token limit reached");
+        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
+                 token_count, MAX_TOKENS);
         return ESP_ERR_NO_MEM;
     }
 
@@ -539,6 +541,8 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     esp_err_t err = save_token_to_nvs(new_token.token, &new_token);
     if (err != ESP_OK)
     {
+        ESP_LOGE(TAG, "Failed to create token - NVS save error: %s (0x%x)",
+                 esp_err_to_name(err), err);
         return err;
     }
 
@@ -1668,17 +1672,53 @@ static void http_server_task(void *pvParameters)
 
                         // Extract duration (in minutes)
                         dur_start += 9;
+                        // Check for negative sign before parsing
+                        if (*dur_start == '-')
+                        {
+                            const char *error_response =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Duration cannot be negative\"}";
+                            send(sock, error_response, strlen(error_response), 0);
+                            close(sock);
+                            continue;
+                        }
                         sscanf(dur_start, "%lu", &duration);
 
                         // Extract bandwidth limits (optional)
                         if (down_start)
                         {
                             down_start += 15;
+                            // Check for negative bandwidth
+                            if (*down_start == '-')
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
                             sscanf(down_start, "%lu", &bandwidth_down);
                         }
                         if (up_start)
                         {
                             up_start += 13;
+                            // Check for negative bandwidth
+                            if (*up_start == '-')
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
                             sscanf(up_start, "%lu", &bandwidth_up);
                         }
 
@@ -1774,14 +1814,44 @@ static void http_server_task(void *pvParameters)
                         {
                             // Find and disable token
                             bool found = false;
-                            for (int i = 0; i < MAX_TOKENS; i++)
+                            for (int i = 0; i < token_count; i++)
                             {
                                 if (active_tokens[i].active &&
                                     strcmp(active_tokens[i].token, token_to_disable) == 0)
                                 {
                                     active_tokens[i].active = false;
+
+                                    // Remove from NVS
+                                    nvs_handle_t nvs_handle;
+                                    if (nvs_open("tokens", NVS_READWRITE, &nvs_handle) == ESP_OK)
+                                    {
+                                        esp_err_t erase_err = nvs_erase_key(nvs_handle, token_to_disable);
+                                        if (erase_err != ESP_OK)
+                                        {
+                                            ESP_LOGE(TAG, "Failed to erase token %s from NVS: %s (0x%x)",
+                                                     token_to_disable, esp_err_to_name(erase_err), erase_err);
+                                        }
+                                        esp_err_t commit_err = nvs_commit(nvs_handle);
+                                        if (commit_err != ESP_OK)
+                                        {
+                                            ESP_LOGE(TAG, "Failed to commit NVS after erasing token %s: %s (0x%x)",
+                                                     token_to_disable, esp_err_to_name(commit_err), commit_err);
+                                        }
+                                        nvs_close(nvs_handle);
+                                        ESP_LOGI(TAG, "Erased token %s from NVS (erase=%s, commit=%s)",
+                                                 token_to_disable, esp_err_to_name(erase_err), esp_err_to_name(commit_err));
+                                    }
+                                    else
+                                    {
+                                        ESP_LOGE(TAG, "Failed to open NVS for erasing token %s", token_to_disable);
+                                    }
+
+                                    // Compact array immediately by shifting remaining tokens
+                                    for (int j = i; j < token_count - 1; j++)
+                                    {
+                                        active_tokens[j] = active_tokens[j + 1];
+                                    }
                                     token_count--;
-                                    save_token_to_nvs(token_to_disable, &active_tokens[i]); // Persist to NVS
                                     found = true;
 
                                     const char *success_response =
@@ -1790,7 +1860,8 @@ static void http_server_task(void *pvParameters)
                                         "Connection: close\r\n\r\n"
                                         "{\"success\":true,\"message\":\"Token disabled successfully\"}";
                                     send(sock, success_response, strlen(success_response), 0);
-                                    ESP_LOGI(TAG, "API: Token %s disabled via API", token_to_disable);
+                                    ESP_LOGI(TAG, "API: Token %s disabled via API (count now: %d)",
+                                             token_to_disable, token_count);
                                     break;
                                 }
                             }
@@ -1851,18 +1922,20 @@ static void http_server_task(void *pvParameters)
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
-                            // Find token
+                            // Find token (only search through active token_count, not MAX_TOKENS)
                             bool found = false;
-                            for (int i = 0; i < MAX_TOKENS; i++)
+                            for (int i = 0; i < token_count; i++)
                             {
                                 if (active_tokens[i].active &&
                                     strcmp(active_tokens[i].token, token_to_query) == 0)
                                 {
                                     found = true;
                                     time_t now = time(NULL);
+                                    // For unused tokens, expires_at is creation + duration
+                                    // For used tokens, expires_at is first_use + duration
                                     time_t expires_at = active_tokens[i].first_use > 0
                                                             ? active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60)
-                                                            : 0;
+                                                            : active_tokens[i].created + (active_tokens[i].duration_minutes * 60);
                                     bool is_expired = (active_tokens[i].first_use > 0 && now > expires_at);
                                     bool is_used = (active_tokens[i].first_use > 0);
                                     int64_t remaining_seconds = is_used && !is_expired
@@ -1996,10 +2069,12 @@ static void http_server_task(void *pvParameters)
                                              "\"message\":\"Token extended successfully\","
                                              "\"token\":\"%s\","
                                              "\"duration_minutes\":%lu,"
+                                             "\"new_duration_minutes\":%lu,"
                                              "\"new_expires_at\":%lld,"
                                              "\"bandwidth_down_mb\":%lu,"
                                              "\"bandwidth_up_mb\":%lu}",
                                              active_tokens[i].token,
+                                             active_tokens[i].duration_minutes,
                                              active_tokens[i].duration_minutes,
                                              (long long)new_expires,
                                              active_tokens[i].bandwidth_down_mb,
@@ -2047,11 +2122,10 @@ static void http_server_task(void *pvParameters)
                 // Calculate uptime using esp_timer
                 int64_t uptime_us = esp_timer_get_time();
                 int64_t uptime_sec = uptime_us / 1000000;
-                
+
                 char response[512];
                 snprintf(response, sizeof(response),
-                         "HTTP/1.1 200 OK\r\n"
-                         HTTP_HEADER_JSON
+                         "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
                          "{\"success\":true,\"uptime_seconds\":%lld,"
                          "\"uptime_microseconds\":%lld}",
                          uptime_sec, uptime_us);
@@ -2070,18 +2144,18 @@ static void http_server_task(void *pvParameters)
                 int64_t uptime_sec = uptime_us / 1000000;
                 uint32_t free_heap = esp_get_free_heap_size();
                 time_t now = time(NULL);
-                
+
                 // Count active tokens
                 int active_count = 0;
                 for (int i = 0; i < token_count; i++)
                 {
-                    if (active_tokens[i].active) active_count++;
+                    if (active_tokens[i].active)
+                        active_count++;
                 }
-                
+
                 char response[1024];
                 snprintf(response, sizeof(response),
-                         "HTTP/1.1 200 OK\r\n"
-                         HTTP_HEADER_JSON
+                         "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
                          "{\"success\":true,\"status\":\"healthy\","
                          "\"uptime_seconds\":%lld,"
                          "\"time_synced\":%s,"
@@ -2100,6 +2174,26 @@ static void http_server_task(void *pvParameters)
                 send(sock, response, strlen(response), 0);
                 close(sock);
                 continue;
+            }
+
+            // Handle invalid API endpoints - return 404 for unmatched /api/* routes
+            if (strstr(rx_buffer, "GET /api/") != NULL || strstr(rx_buffer, "POST /api/") != NULL)
+            {
+                // Check if it's not one of our known endpoints
+                bool is_known_api = is_api_token || is_api_token_disable || is_api_token_info ||
+                                    is_api_token_extend || is_api_uptime || is_api_health;
+
+                if (!is_known_api)
+                {
+                    const char *not_found_response =
+                        "HTTP/1.1 404 Not Found\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"API endpoint not found\",\"error_code\":\"NOT_FOUND\"}";
+                    send(sock, not_found_response, strlen(not_found_response), 0);
+                    close(sock);
+                    continue;
+                }
             }
 
             // Handle admin login

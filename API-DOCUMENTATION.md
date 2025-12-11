@@ -35,20 +35,25 @@ Create a new guest access token with specified duration and bandwidth limits.
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
 | `duration` | integer | Yes | Token duration in minutes (min: 30, max: 43200) |
-| `bandwidth_down` | integer | No | Download limit in MB (0 = unlimited) |
-| `bandwidth_up` | integer | No | Upload limit in MB (0 = unlimited) |
+| `bandwidth_down` | integer | **No** | Download limit in MB (0 or omitted = unlimited, **no negative values**) |
+| `bandwidth_up` | integer | **No** | Upload limit in MB (0 or omitted = unlimited, **no negative values**) |
 
-**Duration Limits:**
+**Duration Validation:**
 - Minimum: 30 minutes
-- Maximum: 43,200 minutes (30 days)
+- Maximum: 43,200 minutes (30 days = 43,200 minutes exactly)
+- **Must be positive** - negative values return 400 error
+- Range is inclusive: 30 ≤ duration ≤ 43200
 
-**Bandwidth Limits:**
-- Set to 0 or omit for unlimited bandwidth
-- Token expires when either time OR bandwidth limit is reached
+**Bandwidth Limits (Optional):**
+- Set to 0 or **omit entirely** for unlimited bandwidth
+- **Must be non-negative** - negative values return 400 error with specific message
+- Token expires when either time OR bandwidth limit is reached (whichever comes first)
+- Bandwidth tracking is per-token across all devices using it
 
 **Device Limit:**
 - Each token supports maximum 2 simultaneous devices
 - Devices are tracked by MAC address
+- Device slots released when device disconnects
 
 #### Example Requests
 
@@ -141,8 +146,31 @@ axios.post('http://192.168.0.100/api/token', params)
 
 Possible reasons:
 - Duration outside allowed range (30-43200 minutes)
-- Token storage limit reached (max 230 tokens)
-- Missing required parameters
+- Token storage limit reached (max 230 active tokens)
+- Missing required parameters (api_key or duration)
+- System time not synchronized yet (wait ~10 seconds after boot)
+
+**Negative Values**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Duration cannot be negative"
+}
+```
+OR
+```json
+{
+    "success": false,
+    "error": "Bandwidth cannot be negative"
+}
+```
+
+These specific errors occur when:
+- `duration` parameter contains a negative value (e.g., `-30`)
+- `bandwidth_down` or `bandwidth_up` contains a negative value (e.g., `-100`)
+- **Validation happens before any other processing** to prevent invalid data entry
 
 **Missing Parameters**
 
@@ -157,7 +185,20 @@ Possible reasons:
 ---
 
 ### POST /api/token/disable
-Disable a previously issued token, preventing further use. Useful for revoking access or canceling unused tokens.
+Permanently disable and delete a token from the system. This operation:
+- Immediately revokes token access (active sessions are terminated)
+- Removes token from memory (active_tokens array)
+- Erases token from NVS flash storage
+- Decrements the active token count
+- **Persists across device reboots** - token cannot be recovered
+
+**Use Cases:**
+- Revoking access for security reasons
+- Canceling unused/expired tokens to free capacity
+- Bulk cleanup of old tokens
+- Subscription cancellation
+
+**Important:** This is a permanent deletion. The token cannot be restored and will not reappear after device reboot.
 
 #### Request
 
@@ -168,7 +209,7 @@ Disable a previously issued token, preventing further use. Useful for revoking a
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
-| `token` | string | Yes | The 8-character token to disable |
+| `token` | string | Yes | The 8-character token to permanently delete |
 
 #### Example Requests
 
@@ -203,6 +244,18 @@ print(response.json())
 }
 ```
 
+**Verification:**
+After successful deletion, you can verify the token is gone by:
+1. Query `/api/token/info` - will return 404
+2. Check `/api/health` - `active_tokens` count decremented
+3. Reboot device - token remains deleted (persists in NVS)
+
+**Internal Operations (logged to device console):**
+```
+I (143100) esp32-mesh-portal: Erased token C25DL85Y from NVS (erase=ESP_OK, commit=ESP_OK)
+I (143100) esp32-mesh-portal: API: Token C25DL85Y disabled via API (count now: 89)
+```
+
 #### Error Responses
 
 **Token Not Found**
@@ -217,9 +270,23 @@ print(response.json())
 ```
 
 This error occurs when:
-- The token doesn't exist
-- The token has already been disabled
-- The token was entered incorrectly
+- The token doesn't exist in the system
+- The token has already been disabled and deleted
+- The token string was entered incorrectly (case-sensitive)
+
+**Note:** If you receive 404, the token is guaranteed not to exist in the system. This is idempotent - calling disable on an already-disabled token returns 404, not an error.
+
+**NVS Storage Errors (Rare)**
+
+If the device encounters an NVS storage error during deletion, it will still be logged to the console:
+```
+E (xxxxx) esp32-mesh-portal: Failed to erase token XXXXXXXX from NVS: <error_name> (0x<code>)
+E (xxxxx) esp32-mesh-portal: Failed to commit NVS after erasing token XXXXXXXX: <error_name> (0x<code>)
+```
+
+Common NVS errors:
+- `ESP_ERR_NVS_NOT_FOUND` (0x1102) - Already deleted
+- `ESP_ERR_NVS_INVALID_HANDLE` (0x1101) - Storage corruption
 
 **Other Errors:** Same as `/api/token` endpoint (401, 403, 400)
 
@@ -338,7 +405,23 @@ This error occurs when:
 ---
 
 ### POST /api/token/extend
-Extend/renew a token by resetting its usage timer and bandwidth counters. This effectively gives the token a fresh start with the same original duration and bandwidth limits. Perfect for "top-up" or subscription renewal scenarios.
+Extend/renew an existing token by resetting its timer and usage counters back to zero. This gives the token a complete "fresh start" as if it was just created, using the same duration and bandwidth limits as the original token.
+
+**What It Does:**
+- ✅ Resets `first_use` to current time → Duration countdown restarts from 0
+- ✅ Resets `bandwidth_used_down` and `bandwidth_used_up` to 0 → Bandwidth allowance fully restored
+- ✅ Resets `usage_count` to 0 → Usage counter cleared
+- ✅ Persists changes to NVS → Survives device reboots
+- ⚠️ **Does NOT change** `duration_minutes`, `bandwidth_down_mb`, or `bandwidth_up_mb` → Original limits preserved
+- ⚠️ **Does NOT remove** device bindings → Same devices can continue using the token
+
+**Use Cases:**
+- **Subscription Renewal:** Customer pays for another period, extend their existing token
+- **Top-Up Service:** Add more time/bandwidth without issuing a new token
+- **Grace Period:** Reset token for customers who exceeded limits but want to continue
+- **Customer Retention:** Offer free extension as promotional benefit
+
+**Important:** The token keeps its original duration and bandwidth parameters from creation. You cannot change these values via extend - if different limits are needed, create a new token instead.
 
 #### Request
 
@@ -351,12 +434,11 @@ Extend/renew a token by resetting its usage timer and bandwidth counters. This e
 | `api_key` | string | Yes | Your 32-character API key |
 | `token` | string | Yes | The 8-character token to extend |
 
-**Important Notes:**
-- Resets `first_use` to current time, restarting the duration countdown
-- Resets bandwidth usage counters to 0
-- Keeps the same `duration_minutes` and bandwidth limits as original
-- Resets `usage_count` to 0
-- Does NOT remove device bindings (same devices can continue using)
+**No Additional Parameters:**
+- Cannot modify `duration_minutes` - uses original value
+- Cannot modify `bandwidth_down_mb` - uses original value  
+- Cannot modify `bandwidth_up_mb` - uses original value
+- To change these values, create a new token with `/api/token/create`
 
 #### Example Requests
 
@@ -404,6 +486,7 @@ axios.post('http://192.168.0.100/api/token/extend', params)
     "message": "Token extended successfully",
     "token": "A3K9M7P2",
     "duration_minutes": 120,
+    "new_duration_minutes": 120,
     "new_expires_at": 1702138400,
     "bandwidth_down_mb": 500,
     "bandwidth_up_mb": 100
@@ -414,12 +497,26 @@ axios.post('http://192.168.0.100/api/token/extend', params)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `message` | string | Confirmation message |
-| `token` | string | The extended token |
-| `duration_minutes` | integer | Token duration (unchanged from original) |
-| `new_expires_at` | integer | New expiration timestamp (current time + duration) |
-| `bandwidth_down_mb` | integer | Download limit (unchanged) |
-| `bandwidth_up_mb` | integer | Upload limit (unchanged) |
+| `message` | string | Confirmation message: "Token extended successfully" |
+| `token` | string | The extended token (same as input) |
+| `duration_minutes` | integer | **Original** duration from token creation (unchanged) |
+| `new_duration_minutes` | integer | Duration for this extension period (always same as `duration_minutes`) |
+| `new_expires_at` | integer | **New** expiration Unix timestamp (current time + duration_minutes) |
+| `bandwidth_down_mb` | integer | Download limit in MB (unchanged from original, 0 = unlimited) |
+| `bandwidth_up_mb` | integer | Upload limit in MB (unchanged from original, 0 = unlimited) |
+
+**What Actually Changed:**
+- `first_use` → Set to current timestamp (timer restarted)
+- `bandwidth_used_down` → Reset to 0 (usage cleared)
+- `bandwidth_used_up` → Reset to 0 (usage cleared)
+- `usage_count` → Reset to 0 (login counter cleared)
+- `new_expires_at` → Calculated as: current time + (duration_minutes × 60)
+
+**What Stayed The Same:**
+- `duration_minutes` → Kept from original token creation
+- `bandwidth_down_mb` → Kept from original token creation
+- `bandwidth_up_mb` → Kept from original token creation
+- Device bindings → Previous devices can still use the token
 
 #### Error Responses
 
@@ -444,7 +541,62 @@ This error occurs when:
 - Offering to create a new token instead
 - Informing the user the token is no longer valid
 
-**Other Errors:** Same as `/api/token` endpoint (401, 403, 400)
+**Example - Extend with Fallback to Create:**
+```python
+def renew_or_create_token(api_key, token, duration=120):
+    """Try to extend existing token, create new one if not found"""
+    # Try extending first
+    response = requests.post(
+        'http://192.168.0.100/api/token/extend',
+        data={'api_key': api_key, 'token': token}
+    )
+    
+    if response.status_code == 404:
+        # Token doesn't exist - create a new one
+        return requests.post(
+            'http://192.168.0.100/api/token/create',
+            data={
+                'api_key': api_key,
+                'duration': duration,
+                'bandwidth_down': 500,  # Set new limits
+                'bandwidth_up': 100
+            }
+        ).json()
+    
+    return response.json()
+```
+
+**Other Errors:** Same as `/api/token/create` endpoint (401, 403, 400)
+
+#### Internal State Changes
+
+When a token is extended, the following internal state changes occur:
+
+**Before Extend (Example Token):**
+```
+Token: A3K9M7P2
+first_use: 1702050000 (Dec 8, 2024 12:00:00)
+duration_minutes: 120
+bandwidth_used_down: 450 MB (out of 500 MB limit)
+bandwidth_used_up: 80 MB (out of 100 MB limit)
+usage_count: 15
+expires_at: 1702057200 (Dec 8, 2024 14:00:00) ← EXPIRED
+```
+
+**After Extend:**
+```
+Token: A3K9M7P2 (same token)
+first_use: 1702138400 (Dec 9, 2024 12:00:00) ← RESET to now
+duration_minutes: 120 (unchanged)
+bandwidth_used_down: 0 ← RESET
+bandwidth_used_up: 0 ← RESET
+usage_count: 0 ← RESET
+expires_at: 1702145600 (Dec 9, 2024 14:00:00) ← NEW expiration
+```
+
+**Persisted to NVS:** All changes are immediately saved to non-volatile storage and survive device reboots.
+
+**Device Bindings:** If the token was previously used by devices with MACs `AA:BB:CC:DD:EE:FF` and `11:22:33:44:55:66`, these same devices can continue using the token without re-authenticating.
 
 ---
 
@@ -585,9 +737,44 @@ All API endpoints may return the following standard error codes:
 | Error Code | HTTP Status | Description | Resolution |
 |------------|-------------|-------------|------------|
 | `TOKEN_NOT_FOUND` | 404 | Token doesn't exist or has been disabled | Check token spelling, verify it wasn't disabled, or create a new token |
+| `ENDPOINT_NOT_FOUND` | 404 | Invalid API endpoint | Verify URL path matches documented endpoints exactly |
 | N/A (Invalid API key) | 401 | API key is incorrect | Verify API key from admin dashboard, regenerate if needed |
 | N/A (Forbidden) | 403 | Request from guest network | Make API calls from uplink network only |
 | N/A (Bad Request) | 400 | Missing or invalid parameters | Check required parameters and value formats |
+| N/A (Duration negative) | 400 | Duration parameter is negative | Use positive values: 30 ≤ duration ≤ 43200 |
+| N/A (Bandwidth negative) | 400 | Bandwidth parameter is negative | Use positive values or omit parameter for unlimited |
+
+### Handling ENDPOINT_NOT_FOUND
+
+All invalid API endpoints return a `404 Not Found` response with an `ENDPOINT_NOT_FOUND` error:
+
+**Request Example:**
+```bash
+curl -X POST http://192.168.0.100/api/invalid/path \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "api_key=your_api_key_here"
+```
+
+**Response:**
+```json
+{
+    "success": false,
+    "error": "ENDPOINT_NOT_FOUND"
+}
+```
+
+**Common Mistakes:**
+- Typos in endpoint path (e.g., `/api/token/crete` instead of `/api/token/create`)
+- Using GET instead of POST for API endpoints
+- Accessing endpoints that don't exist (e.g., `/api/token/list`)
+
+**Valid API Endpoints:**
+- `POST /api/token/create`
+- `POST /api/token/extend`
+- `POST /api/token/info`
+- `POST /api/token/disable`
+- `GET /api/uptime`
+- `GET /api/health`
 
 ### Handling TOKEN_NOT_FOUND
 
