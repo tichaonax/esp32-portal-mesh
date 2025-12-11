@@ -1632,6 +1632,7 @@ static void http_server_task(void *pvParameters)
             bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
             bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
             bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
+            bool is_api_tokens_list = (strstr(rx_buffer, "GET /api/tokens/list") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
             bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
             bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
@@ -2176,12 +2177,122 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle Tokens List API endpoint
+            if (is_api_tokens_list)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Parse query string: /api/tokens/list?api_key=XXX
+                char *query_start = strstr(rx_buffer, "GET /api/tokens/list?");
+                if (query_start != NULL)
+                {
+                    query_start += 21; // skip "GET /api/tokens/list?"
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+
+                    char *key_start = strstr(query_start, "api_key=");
+                    if (key_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^& \r\n]", received_key);
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Build JSON response with all tokens
+                            char *response = malloc(8192); // Allocate larger buffer for token list
+                            if (response == NULL)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 500 Internal Server Error\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Memory allocation failed\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
+                            int offset = snprintf(response, 8192,
+                                                  "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
+                                                  "{\"success\":true,\"count\":%d,\"tokens\":[",
+                                                  token_count);
+
+                            time_t now = time(NULL);
+                            for (int i = 0; i < token_count; i++)
+                            {
+                                if (active_tokens[i].active)
+                                {
+                                    time_t expires_at = active_tokens[i].first_use > 0
+                                                            ? active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60)
+                                                            : now + (active_tokens[i].duration_minutes * 60);
+
+                                    int remaining_sec = (int)difftime(expires_at, now);
+                                    const char *status = (active_tokens[i].first_use == 0) ? "unused"
+                                                         : (remaining_sec > 0)             ? "active"
+                                                                                           : "expired";
+
+                                    offset += snprintf(response + offset, 8192 - offset,
+                                                       "%s{\"token\":\"%s\","
+                                                       "\"status\":\"%s\","
+                                                       "\"duration_minutes\":%lu,"
+                                                       "\"first_use\":%lld,"
+                                                       "\"expires_at\":%lld,"
+                                                       "\"remaining_seconds\":%d,"
+                                                       "\"bandwidth_down_mb\":%lu,"
+                                                       "\"bandwidth_up_mb\":%lu,"
+                                                       "\"bandwidth_used_down\":%lu,"
+                                                       "\"bandwidth_used_up\":%lu,"
+                                                       "\"usage_count\":%lu}",
+                                                       (i > 0) ? "," : "",
+                                                       active_tokens[i].token,
+                                                       status,
+                                                       active_tokens[i].duration_minutes,
+                                                       (long long)active_tokens[i].first_use,
+                                                       (long long)expires_at,
+                                                       remaining_sec > 0 ? remaining_sec : 0,
+                                                       active_tokens[i].bandwidth_down_mb,
+                                                       active_tokens[i].bandwidth_up_mb,
+                                                       active_tokens[i].bandwidth_used_down,
+                                                       active_tokens[i].bandwidth_used_up,
+                                                       active_tokens[i].usage_count);
+
+                                    if (offset >= 7800)
+                                    { // Leave room for closing
+                                        break;
+                                    }
+                                }
+                            }
+
+                            snprintf(response + offset, 8192 - offset, "]}");
+                            send(sock, response, strlen(response), 0);
+                            free(response);
+                            ESP_LOGI(TAG, "API: Listed %d tokens via API", token_count);
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameter: api_key\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
             // Handle invalid API endpoints - return 404 for unmatched /api/* routes
             if (strstr(rx_buffer, "GET /api/") != NULL || strstr(rx_buffer, "POST /api/") != NULL)
             {
                 // Check if it's not one of our known endpoints
                 bool is_known_api = is_api_token || is_api_token_disable || is_api_token_info ||
-                                    is_api_token_extend || is_api_uptime || is_api_health;
+                                    is_api_token_extend || is_api_tokens_list || is_api_uptime || is_api_health;
 
                 if (!is_known_api)
                 {
@@ -3026,7 +3137,7 @@ static void http_server_task(void *pvParameters)
                         "<input type='text' name='token' placeholder='Enter 8-character token' maxlength='8' pattern='[A-Z0-9]{8}' required>"
                         "<button type='submit'>Connect</button>"
                         "</form>"
-                        "<p class='info'>Token expires in 24 hours after first use<br>Phase 2: Token validation active</p>"
+                        "<p class='info'>Token expire count down starts after first use<br>Phase 2: Token validation active</p>"
                         "<a href='/admin' class='admin-link'>🔧 Admin Panel</a>"
                         "</div></body></html>";
 

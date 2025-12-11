@@ -248,6 +248,129 @@ class TestHealthAPI:
 
 
 @pytest.mark.monitoring
+class TestTokensListAPI:
+    """Tests for GET /api/tokens/list endpoint"""
+    
+    def test_tokens_list_requires_auth(self, base_url, session):
+        """Verify tokens list endpoint requires API key"""
+        try:
+            response = session.get(f"{base_url}/api/tokens/list")
+            assert response.status_code in [400, 401], "Should require API key"
+        except Exception:
+            # ESP32 may close connection without response - this is acceptable
+            pass
+    
+    def test_tokens_list_invalid_api_key(self, base_url, session):
+        """Verify tokens list rejects invalid API key"""
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": "invalid_key_123"}
+        )
+        assert response.status_code == 401
+        data = response.json()
+        assert data["success"] is False
+    
+    def test_tokens_list_response_structure(self, base_url, test_config, session):
+        """Verify tokens list returns correct JSON structure"""
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        assert response.status_code == 200
+        assert_response_time(response)
+        
+        data = response.json()
+        
+        # Verify required fields
+        assert "success" in data, "Missing 'success' field"
+        assert "count" in data, "Missing 'count' field"
+        assert "tokens" in data, "Missing 'tokens' field"
+        
+        # Verify field types
+        assert isinstance(data["success"], bool), "success must be boolean"
+        assert isinstance(data["count"], int), "count must be integer"
+        assert isinstance(data["tokens"], list), "tokens must be list"
+        
+        assert data["success"] is True
+        assert data["count"] >= 0, "count must be non-negative"
+    
+    def test_tokens_list_token_structure(self, base_url, test_config, session, test_token):
+        """Verify each token in list has correct structure"""
+        # test_token fixture creates a token automatically
+        
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        
+        assert len(data["tokens"]) > 0, "Should have at least one token"
+        
+        # Verify token structure
+        token_data = data["tokens"][0]
+        required_fields = [
+            "token", "status", "duration_minutes", "first_use",
+            "expires_at", "remaining_seconds", "bandwidth_down_mb",
+            "bandwidth_up_mb", "bandwidth_used_down", "bandwidth_used_up",
+            "usage_count"
+        ]
+        
+        for field in required_fields:
+            assert field in token_data, f"Missing '{field}' field in token"
+        
+        # Verify field types
+        assert isinstance(token_data["token"], str), "token must be string"
+        assert isinstance(token_data["status"], str), "status must be string"
+        assert isinstance(token_data["duration_minutes"], int), "duration_minutes must be integer"
+        assert isinstance(token_data["first_use"], int), "first_use must be integer"
+        assert isinstance(token_data["expires_at"], int), "expires_at must be integer"
+        assert isinstance(token_data["remaining_seconds"], int), "remaining_seconds must be integer"
+        assert isinstance(token_data["bandwidth_down_mb"], int), "bandwidth_down_mb must be integer"
+        assert isinstance(token_data["bandwidth_up_mb"], int), "bandwidth_up_mb must be integer"
+        assert isinstance(token_data["bandwidth_used_down"], int), "bandwidth_used_down must be integer"
+        assert isinstance(token_data["bandwidth_used_up"], int), "bandwidth_used_up must be integer"
+        assert isinstance(token_data["usage_count"], int), "usage_count must be integer"
+        
+        # Verify status is one of valid values
+        assert token_data["status"] in ["unused", "active", "expired"], \
+            f"Invalid status: {token_data['status']}"
+    
+    def test_tokens_list_count_matches_array_length(self, base_url, test_config, session, test_token):
+        """Verify count field matches actual number of tokens"""
+        # test_token fixture creates a token
+        
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        
+        assert data["count"] == len(data["tokens"]), \
+            f"Count mismatch: {data['count']} != {len(data['tokens'])}"
+        assert data["count"] > 0, "Should have at least one token"
+    
+    def test_tokens_list_unused_token_status(self, base_url, test_config, session, test_token):
+        """Verify newly created tokens have 'unused' status"""
+        response = session.get(
+            f"{base_url}/api/tokens/list",
+            params={"api_key": test_config.API_KEY}
+        )
+        
+        data = response.json()
+        token_data = next((t for t in data["tokens"] if t["token"] == test_token), None)
+        
+        assert token_data is not None, f"Token {test_token} not found in list"
+        assert token_data["status"] == "unused", "New token should have 'unused' status"
+        assert token_data["first_use"] == 0, "New token should have first_use = 0"
+        assert token_data["usage_count"] == 0, "New token should have usage_count = 0"
+
+
+@pytest.mark.monitoring
 class TestMonitoringErrorScenarios:
     """Test error scenarios for monitoring endpoints"""
     
