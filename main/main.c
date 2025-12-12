@@ -154,8 +154,18 @@ typedef struct
     bool active;
 } token_info_t;
 
+// Blob structure for storing all tokens in a single NVS entry
+typedef struct
+{
+    token_info_t tokens[MAX_TOKENS];
+    int token_count;
+} token_blob_t;
+
 static token_info_t active_tokens[MAX_TOKENS];
 static int token_count = 0;
+
+// Global token blob for NVS storage
+static token_blob_t token_blob;
 
 // Authenticated clients tracking
 #define MAX_AUTHENTICATED_CLIENTS 50
@@ -408,111 +418,187 @@ static void generate_api_key(char *key_out)
     key_out[API_KEY_LENGTH] = '\0';
 }
 
-// Save token to NVS
-static esp_err_t save_token_to_nvs(const char *token, token_info_t *info)
+// Save all tokens as a single blob to NVS
+static esp_err_t save_tokens_blob_to_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("tokens", NVS_READWRITE, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error opening NVS for tokens: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error opening NVS tokens partition: %s", esp_err_to_name(err));
         return err;
     }
 
-    // Save token info as blob
-    err = nvs_set_blob(nvs_handle, token, info, sizeof(token_info_t));
+    // Copy current active_tokens to token_blob
+    memcpy(token_blob.tokens, active_tokens, sizeof(active_tokens));
+    token_blob.token_count = token_count;
+
+    // Save entire token blob
+    err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, sizeof(token_blob_t));
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error saving token to NVS: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error saving token blob to NVS: %s", esp_err_to_name(err));
+        // Short-term mitigation: erase only the tokens namespace if space error
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE)
+        {
+            ESP_LOGW(TAG, "NVS space exhausted in tokens namespace, attempting namespace recovery...");
+
+            // Get stats before erase
+            nvs_stats_t nvs_stats;
+            err = nvs_get_stats("nvs_tokens", &nvs_stats);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "DEBUG: NVS stats before erase - used: %d, free: %d, total: %d",
+                         nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
+            }
+
+            // Try to erase all keys in the tokens namespace to free space
+            ESP_LOGI(TAG, "DEBUG: Calling nvs_erase_all on tokens namespace...");
+            err = nvs_erase_all(nvs_handle);
+            ESP_LOGI(TAG, "DEBUG: nvs_erase_all returned: %s", esp_err_to_name(err));
+
+            err = nvs_commit(nvs_handle);
+            ESP_LOGI(TAG, "DEBUG: nvs_commit after erase returned: %s", esp_err_to_name(err));
+
+            // Get stats after erase
+            err = nvs_get_stats("nvs_tokens", &nvs_stats);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "DEBUG: NVS stats after erase - used: %d, free: %d, total: %d",
+                         nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
+            }
+
+            nvs_close(nvs_handle);
+
+            ESP_LOGI(TAG, "Erased tokens namespace, retrying save...");
+            err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &nvs_handle);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "DEBUG: Failed to reopen tokens partition after erase: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            // Get stats after reopen
+            err = nvs_get_stats("nvs_tokens", &nvs_stats);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "DEBUG: NVS stats after reopen - used: %d, free: %d, total: %d",
+                         nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
+            }
+
+            err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, sizeof(token_blob_t));
+            if (err == ESP_OK)
+            {
+                err = nvs_commit(nvs_handle);
+                ESP_LOGI(TAG, "Token blob saved to NVS after namespace recovery");
+            }
+            else
+            {
+                ESP_LOGE(TAG, "Failed to save token blob even after namespace erase: %s", esp_err_to_name(err));
+
+                // Additional debugging: try to save a smaller test blob
+                char test_data[10] = "test";
+                esp_err_t test_err = nvs_set_str(nvs_handle, "test_key", test_data);
+                ESP_LOGI(TAG, "DEBUG: Test save result: %s", esp_err_to_name(test_err));
+
+                if (test_err == ESP_OK) {
+                    test_err = nvs_commit(nvs_handle);
+                    ESP_LOGI(TAG, "DEBUG: Test commit result: %s", esp_err_to_name(test_err));
+                }
+
+                // Check global NVS stats
+                nvs_stats_t global_stats;
+                esp_err_t global_err = nvs_get_stats(NULL, &global_stats);
+                if (global_err == ESP_OK) {
+                    ESP_LOGI(TAG, "DEBUG: Global NVS stats - used: %d, free: %d, total: %d",
+                             global_stats.used_entries, global_stats.free_entries, global_stats.total_entries);
+                } else {
+                    ESP_LOGI(TAG, "DEBUG: Failed to get global NVS stats: %s", esp_err_to_name(global_err));
+                }
+            }
+        }
     }
     else
     {
         err = nvs_commit(nvs_handle);
-        ESP_LOGI(TAG, "Token %s saved to NVS (expires in %d hours)", token, TOKEN_EXPIRY_HOURS);
+        ESP_LOGI(TAG, "Token blob saved to NVS (%d tokens)", token_count);
     }
 
     nvs_close(nvs_handle);
     return err;
 }
 
-// Load all tokens from NVS
-static void load_tokens_from_nvs(void)
+// Load all tokens from NVS blob
+static void load_tokens_blob_from_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("tokens", NVS_READONLY, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGI(TAG, "No existing tokens found in NVS");
+        ESP_LOGI(TAG, "No existing token blob found in NVS tokens partition");
         return;
     }
 
-    nvs_iterator_t it = NULL;
-    err = nvs_entry_find("nvs", "tokens", NVS_TYPE_BLOB, &it);
-    token_count = 0;
+    size_t required_size = sizeof(token_blob_t);
+    err = nvs_get_blob(nvs_handle, "token_blob", &token_blob, &required_size);
 
-    while (err == ESP_OK && token_count < MAX_TOKENS)
+    if (err != ESP_OK)
     {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
+        ESP_LOGI(TAG, "No token blob found in NVS (%s)", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return;
+    }
 
-        size_t required_size = sizeof(token_info_t);
-        err = nvs_get_blob(nvs_handle, info.key, &active_tokens[token_count], &required_size);
+    // Copy loaded blob to active_tokens and validate
+    memcpy(active_tokens, token_blob.tokens, sizeof(active_tokens));
+    token_count = 0; // Will be incremented for each valid token
 
-        if (err == ESP_OK && active_tokens[token_count].active)
+    time_t now = time(NULL);
+    for (int i = 0; i < token_blob.token_count && token_count < MAX_TOKENS; i++)
+    {
+        if (active_tokens[i].active)
         {
-            // Check if token has expired
-            time_t now = time(NULL);
             bool expired = false;
 
-            if (active_tokens[token_count].first_use > 0)
+            // Check time expiration
+            if (active_tokens[i].first_use > 0)
             {
-                time_t token_expires = active_tokens[token_count].first_use +
-                                       (active_tokens[token_count].duration_minutes * 60);
+                time_t token_expires = active_tokens[i].first_use +
+                                       (active_tokens[i].duration_minutes * 60);
                 if (now > token_expires)
                 {
-                    ESP_LOGI(TAG, "Token %s expired (time), removing", active_tokens[token_count].token);
+                    ESP_LOGI(TAG, "Token %s expired (time), removing", active_tokens[i].token);
                     expired = true;
                 }
             }
 
             // Check bandwidth limits
-            if (active_tokens[token_count].bandwidth_down_mb > 0 &&
-                active_tokens[token_count].bandwidth_used_down >= active_tokens[token_count].bandwidth_down_mb)
+            if (active_tokens[i].bandwidth_down_mb > 0 &&
+                active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
             {
-                ESP_LOGI(TAG, "Token %s expired (bandwidth down), removing", active_tokens[token_count].token);
+                ESP_LOGI(TAG, "Token %s expired (bandwidth down), removing", active_tokens[i].token);
                 expired = true;
             }
-            if (active_tokens[token_count].bandwidth_up_mb > 0 &&
-                active_tokens[token_count].bandwidth_used_up >= active_tokens[token_count].bandwidth_up_mb)
+            if (active_tokens[i].bandwidth_up_mb > 0 &&
+                active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
             {
-                ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", active_tokens[token_count].token);
+                ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", active_tokens[i].token);
                 expired = true;
             }
 
             if (expired)
             {
-                active_tokens[token_count].active = false;
+                active_tokens[i].active = false;
             }
             else
             {
                 ESP_LOGI(TAG, "Loaded token %s (used %lu times, %d devices)",
-                         active_tokens[token_count].token,
-                         active_tokens[token_count].usage_count,
-                         active_tokens[token_count].device_count);
+                         active_tokens[i].token,
+                         active_tokens[i].usage_count,
+                         active_tokens[i].device_count);
                 token_count++;
             }
         }
-
-        err = nvs_entry_next(&it);
-    }
-
-    if (it != NULL)
-    {
-        nvs_release_iterator(it);
     }
 
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Loaded %d active tokens from NVS", token_count);
+    ESP_LOGI(TAG, "Loaded %d active tokens from NVS blob", token_count);
 }
 
 // ==================== MAC Filtering NVS Functions ====================
@@ -800,18 +886,20 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     new_token.device_count = 0;
     new_token.active = true;
 
-    // Save to NVS
-    esp_err_t err = save_token_to_nvs(new_token.token, &new_token);
+    // Add to active tokens first
+    memcpy(&active_tokens[token_count], &new_token, sizeof(token_info_t));
+    token_count++;
+
+    // Save all tokens to NVS blob
+    esp_err_t err = save_tokens_blob_to_nvs();
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to create token - NVS save error: %s (0x%x)",
                  esp_err_to_name(err), err);
+        // Rollback the addition
+        token_count--;
         return err;
     }
-
-    // Add to active tokens
-    memcpy(&active_tokens[token_count], &new_token, sizeof(token_info_t));
-    token_count++;
 
     strcpy(token_out, new_token.token);
     ESP_LOGI(TAG, "✓ Created new token: %s (duration: %lu min, down: %lu MB, up: %lu MB)",
@@ -887,7 +975,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             {
                 ESP_LOGW(TAG, "Token %s has expired (time limit)", token);
                 active_tokens[i].active = false;
-                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+                save_tokens_blob_to_nvs();
                 return false;
             }
 
@@ -897,7 +985,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             {
                 ESP_LOGW(TAG, "Token %s exceeded download limit", token);
                 active_tokens[i].active = false;
-                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+                save_tokens_blob_to_nvs();
                 return false;
             }
             if (active_tokens[i].bandwidth_up_mb > 0 &&
@@ -905,7 +993,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             {
                 ESP_LOGW(TAG, "Token %s exceeded upload limit", token);
                 active_tokens[i].active = false;
-                save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+                save_tokens_blob_to_nvs();
                 return false;
             }
 
@@ -941,7 +1029,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
 
             // Increment usage count
             active_tokens[i].usage_count++;
-            save_token_to_nvs(active_tokens[i].token, &active_tokens[i]);
+            save_tokens_blob_to_nvs();
 
             ESP_LOGI(TAG, "✓ Token %s validated (usage: %lu)", token, active_tokens[i].usage_count);
             return true;
@@ -1022,15 +1110,6 @@ static void cleanup_expired_tokens(void)
             // Mark as inactive in memory
             active_tokens[i].active = false;
 
-            // Remove from NVS
-            nvs_handle_t nvs_handle;
-            if (nvs_open("tokens", NVS_READWRITE, &nvs_handle) == ESP_OK)
-            {
-                nvs_erase_key(nvs_handle, active_tokens[i].token);
-                nvs_commit(nvs_handle);
-                nvs_close(nvs_handle);
-            }
-
             cleaned++;
         }
     }
@@ -1054,6 +1133,9 @@ static void cleanup_expired_tokens(void)
 
         ESP_LOGI(TAG, "🧹 Cleanup complete: %d token(s) removed, %d active token(s) remaining",
                  cleaned, token_count);
+
+        // Persist the cleaned state to NVS blob
+        save_tokens_blob_to_nvs();
     }
 }
 
@@ -2223,7 +2305,6 @@ static void http_server_task(void *pvParameters)
 
             // Check request type
             bool is_post_login = (strstr(rx_buffer, "POST /login") != NULL);
-            bool is_admin_page = (strstr(rx_buffer, "GET /admin") != NULL);
             bool is_admin_config = (strstr(rx_buffer, "POST /admin/configure") != NULL);
             bool is_admin_status = (strstr(rx_buffer, "GET /admin/status") != NULL);
             bool is_customer_status = (strstr(rx_buffer, "GET /status") != NULL);
@@ -2245,6 +2326,7 @@ static void http_server_task(void *pvParameters)
             bool is_admin_regen_key = (strstr(rx_buffer, "POST /admin/regenerate_key") != NULL);
             bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
             bool is_admin_set_ap_ssid = (strstr(rx_buffer, "POST /admin/set_ap_ssid") != NULL);
+            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_set_ap_ssid);
 
             // Handle Token API endpoint
             if (is_api_token)
@@ -2710,7 +2792,7 @@ static void http_server_task(void *pvParameters)
                                     // Reset usage count
                                     active_tokens[i].usage_count = 0;
 
-                                    save_token_to_nvs(token_to_extend, &active_tokens[i]); // Persist to NVS
+                                    save_tokens_blob_to_nvs(); // Persist to NVS
 
                                     time_t new_expires = active_tokens[i].first_use +
                                                          (active_tokens[i].duration_minutes * 60);
@@ -4612,14 +4694,34 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 Mesh Portal Starting...");
 
-    // Initialize NVS
+    // Initialize NVS with comprehensive recovery for fragmented storage
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
+    // Additional recovery for severely fragmented NVS (from old per-token storage)
+    if (ret == ESP_ERR_NVS_NOT_ENOUGH_SPACE)
+    {
+        ESP_LOGW(TAG, "NVS severely fragmented, performing full recovery...");
+        // Try to deinit if already initialized, but don't fail if not
+        nvs_flash_deinit();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+        ESP_LOGI(TAG, "NVS fully recovered and reinitialized");
+    }
     ESP_ERROR_CHECK(ret);
+
+    // Initialize dedicated NVS partition for tokens
+    ret = nvs_flash_init_partition("nvs_tokens");
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase_partition("nvs_tokens"));
+        ret = nvs_flash_init_partition("nvs_tokens");
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "✓ Token NVS partition initialized");
 
     // Initialize heartbeat LED (fast blink mode)
     heartbeat_init(HEARTBEAT_LED_GPIO);
@@ -4633,7 +4735,7 @@ void app_main(void)
     load_or_generate_api_key();
 
     // Load existing tokens from NVS
-    load_tokens_from_nvs();
+    load_tokens_blob_from_nvs();
 
     // Load MAC filtering lists from NVS
     load_blacklist_from_nvs();
