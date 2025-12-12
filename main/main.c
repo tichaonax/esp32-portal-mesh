@@ -96,6 +96,7 @@ static const char HTTP_401_INVALID_API_KEY[] =
 #define WIFI_STATIC_GATEWAY_KEY "static_gw"
 #define WIFI_STATIC_NETMASK_KEY "static_nm"
 #define WIFI_STATIC_DNS_KEY "static_dns"
+#define AP_SSID_KEY "ap_ssid"
 #define ADMIN_SESSION_TIMEOUT 300 // 5 minutes in seconds
 #define API_KEY_LENGTH 32
 
@@ -107,6 +108,7 @@ static char admin_password[64] = "admin123";
 static char api_key[API_KEY_LENGTH + 1] = {0};
 static char current_wifi_ssid[32] = MESH_ROUTER_SSID;
 static char current_wifi_pass[64] = MESH_ROUTER_PASS;
+static char ap_ssid[33] = MESH_ID; // Default AP SSID (1-32 chars + null terminator)
 
 // Static IP configuration
 static bool use_static_ip = false;
@@ -712,6 +714,40 @@ static bool is_time_valid(void)
     return true;
 }
 
+// Validate AP SSID format
+static bool is_valid_ssid(const char *ssid)
+{
+    if (ssid == NULL)
+    {
+        return false;
+    }
+
+    size_t len = strlen(ssid);
+
+    // Length check (WiFi standard: 1-32 bytes)
+    if (len < 1 || len > 32)
+    {
+        ESP_LOGW(TAG, "Invalid SSID length: %zu (must be 1-32)", len);
+        return false;
+    }
+
+    // Character validation (printable ASCII: 32-126)
+    for (size_t i = 0; i < len; i++)
+    {
+        if (ssid[i] < 32 || ssid[i] > 126)
+        {
+            ESP_LOGW(TAG, "Invalid SSID character at position %zu: 0x%02X", i, (uint8_t)ssid[i]);
+            return false;
+        }
+    }
+
+    ESP_LOGI(TAG, "✓ SSID validation passed: \"%s\" (%zu chars)", ssid, len);
+    return true;
+}
+
+// Forward declaration for cleanup function (needed by create_new_token_with_params)
+static void cleanup_expired_tokens(void);
+
 // Create new access token with parameters
 static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
@@ -723,19 +759,28 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (token_count >= MAX_TOKENS)
-    {
-        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
-                 token_count, MAX_TOKENS);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Validate duration
+    // Validate duration first (before checking token count)
     if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
     {
         ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)",
                  duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
         return ESP_ERR_INVALID_ARG;
+    }
+
+    // If at or near token limit, run cleanup first to free expired slots
+    if (token_count >= MAX_TOKENS - 5)
+    {
+        ESP_LOGI(TAG, "Token count (%d) near limit (%d), running cleanup first...",
+                 token_count, MAX_TOKENS);
+        cleanup_expired_tokens();
+    }
+
+    // Check token limit after cleanup
+    if (token_count >= MAX_TOKENS)
+    {
+        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
+                 token_count, MAX_TOKENS);
+        return ESP_ERR_NO_MEM;
     }
 
     token_info_t new_token;
@@ -1650,6 +1695,78 @@ static esp_err_t save_static_ip_config(bool use_static, const char *ip,
     return err;
 }
 
+// Save AP SSID to NVS
+static esp_err_t save_ap_ssid(const char *ssid)
+{
+    if (!is_valid_ssid(ssid))
+    {
+        ESP_LOGE(TAG, "Cannot save invalid SSID");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error opening NVS for AP SSID: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(nvs_handle, AP_SSID_KEY, ssid);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Error saving AP SSID: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "✓ AP SSID saved to NVS: \"%s\"", ssid);
+        strncpy(ap_ssid, ssid, sizeof(ap_ssid) - 1);
+        ap_ssid[sizeof(ap_ssid) - 1] = '\0'; // Ensure null termination
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Error committing AP SSID to NVS: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+// Load AP SSID from NVS
+static esp_err_t load_ap_ssid(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "NVS not available for AP SSID (using default): %s", esp_err_to_name(err));
+        return err;
+    }
+
+    size_t ssid_len = sizeof(ap_ssid);
+    err = nvs_get_str(nvs_handle, AP_SSID_KEY, ap_ssid, &ssid_len);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "✓ Loaded AP SSID from NVS: \"%s\"", ap_ssid);
+    }
+    else if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(TAG, "No AP SSID in NVS, using default: \"%s\"", ap_ssid);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Error loading AP SSID: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
 // WiFi connection tracking
 static int wifi_retry_num = 0;
 #define MAX_WIFI_RETRY 5
@@ -1718,6 +1835,92 @@ static void reconnect_wifi(void)
     {
         ESP_LOGI(TAG, "WiFi reconnection initiated");
     }
+}
+
+// Reconfigure AP SSID dynamically (without restarting device)
+static esp_err_t reconfigure_ap_ssid(const char *new_ssid)
+{
+    if (!is_valid_ssid(new_ssid))
+    {
+        ESP_LOGE(TAG, "Cannot reconfigure with invalid SSID");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Reconfiguring AP SSID from \"%s\" to \"%s\"...", ap_ssid, new_ssid);
+
+    // Step 1: Save new SSID to NVS first (so it persists across reboot)
+    esp_err_t err = save_ap_ssid(new_ssid);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to save new SSID to NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Step 2: Stop WiFi
+    ESP_LOGI(TAG, "Stopping WiFi...");
+    err = esp_wifi_stop();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to stop WiFi: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Give brief delay for WiFi to stop cleanly
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Step 3: Reconfigure AP with new SSID
+    wifi_config_t ap_config = {0};
+    strncpy((char *)ap_config.ap.ssid, new_ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(new_ssid);
+    ap_config.ap.channel = MESH_CHANNEL;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ap_config.ap.pmf_cfg.required = false;
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to set AP config: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "✓ AP config updated with new SSID");
+
+    // Step 4: Reconfigure STA (preserve existing router connection)
+    wifi_config_t sta_config = {0};
+    strncpy((char *)sta_config.sta.ssid, current_wifi_ssid, sizeof(sta_config.sta.ssid));
+    strncpy((char *)sta_config.sta.password, current_wifi_pass, sizeof(sta_config.sta.password));
+    sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_config.sta.pmf_cfg.capable = true;
+    sta_config.sta.pmf_cfg.required = false;
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to set STA config: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "✓ STA config preserved");
+
+    // Step 5: Restart WiFi
+    ESP_LOGI(TAG, "Restarting WiFi...");
+    err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to restart WiFi: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Step 6: Reconnect STA to router
+    err = esp_wifi_connect();
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "WiFi reconnection may take a moment: %s", esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "✓ AP SSID reconfigured successfully to \"%s\"", new_ssid);
+    ESP_LOGI(TAG, "✓ Guests can now connect to: \"%s\"", new_ssid);
+
+    return ESP_OK;
 }
 
 // Enable NAT for internet routing
@@ -2041,6 +2244,7 @@ static void http_server_task(void *pvParameters)
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
             bool is_admin_regen_key = (strstr(rx_buffer, "POST /admin/regenerate_key") != NULL);
             bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
+            bool is_admin_set_ap_ssid = (strstr(rx_buffer, "POST /admin/set_ap_ssid") != NULL);
 
             // Handle Token API endpoint
             if (is_api_token)
@@ -2155,14 +2359,43 @@ static void http_server_task(void *pvParameters)
                                 send(sock, error_response, strlen(error_response), 0);
                                 ESP_LOGW(TAG, "API: Token creation denied - time not synced");
                             }
+                            else if (err == ESP_ERR_NO_MEM)
+                            {
+                                // Token limit reached (after cleanup attempt)
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 507 Insufficient Storage\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Token limit reached (max %d active tokens)\",\"error_code\":\"TOKEN_LIMIT_REACHED\",\"max_tokens\":%d,\"current_tokens\":%d}",
+                                         MAX_TOKENS, MAX_TOKENS, token_count);
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Token creation denied - limit reached (%d/%d)", token_count, MAX_TOKENS);
+                            }
+                            else if (err == ESP_ERR_INVALID_ARG)
+                            {
+                                // Invalid duration
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 400 Bad Request\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Duration must be between %d and %d minutes\",\"error_code\":\"INVALID_DURATION\"}",
+                                         TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Token creation denied - invalid duration %lu", duration);
+                            }
                             else
                             {
-                                const char *error_response =
-                                    "HTTP/1.1 400 Bad Request\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Connection: close\r\n\r\n"
-                                    "{\"success\":false,\"error\":\"Invalid parameters or token limit reached\"}";
+                                // Other errors (NVS issues, etc.)
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 500 Internal Server Error\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Internal error creating token\",\"error_code\":\"INTERNAL_ERROR\"}");
                                 send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGE(TAG, "API: Token creation failed with error: %s", esp_err_to_name(err));
                             }
                         }
                         else
@@ -3489,6 +3722,173 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle AP SSID configuration
+            if (is_admin_set_ap_ssid)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char new_ssid[33] = {0};
+                    char admin_pass[64] = {0};
+
+                    // Parse admin_password=XXX&ssid=XXX from POST body
+                    char *admin_pass_start = strstr(body, "admin_password=");
+                    char *ssid_start = strstr(body, "ssid=");
+
+                    if (admin_pass_start && ssid_start)
+                    {
+                        // Parse admin password
+                        admin_pass_start += 15; // skip "admin_password="
+                        int i = 0;
+                        int j = 0;
+                        while (admin_pass_start[i] && admin_pass_start[i] != '&' &&
+                               admin_pass_start[i] != '\r' && admin_pass_start[i] != '\n' && j < 63)
+                        {
+                            if (admin_pass_start[i] == '%' && admin_pass_start[i + 1] && admin_pass_start[i + 2])
+                            {
+                                char hex[3] = {admin_pass_start[i + 1], admin_pass_start[i + 2], 0};
+                                admin_pass[j++] = (char)strtol(hex, NULL, 16);
+                                i += 3; // Skip %XX
+                            }
+                            else if (admin_pass_start[i] == '+')
+                            {
+                                admin_pass[j++] = ' ';
+                                i++;
+                            }
+                            else
+                            {
+                                admin_pass[j++] = admin_pass_start[i++];
+                            }
+                        }
+                        admin_pass[j] = '\0';
+                        ESP_LOGW(TAG, "Admin: Parsed password (length=%d)", j);
+
+                        // Verify admin password
+                        if (strcmp(admin_pass, admin_password) != 0)
+                        {
+                            const char *error =
+                                "HTTP/1.1 401 Unauthorized\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Incorrect admin password\"}";
+                            send(sock, error, strlen(error), 0);
+                            ESP_LOGW(TAG, "Admin: Failed AP SSID change attempt - incorrect password");
+                            close(sock);
+                            continue;
+                        }
+
+                        // Parse SSID
+                        ssid_start = strstr(body, "ssid=");
+                        if (ssid_start)
+                        {
+                            ssid_start += 5; // skip "ssid="
+                            i = 0;
+                            j = 0;
+                            while (ssid_start[i] && ssid_start[i] != '&' &&
+                                   ssid_start[i] != '\r' && ssid_start[i] != '\n' && j < 32)
+                            {
+                                // URL decode if needed (basic %20 -> space, %2B -> +, etc.)
+                                if (ssid_start[i] == '%' && ssid_start[i + 1] && ssid_start[i + 2])
+                                {
+                                    char hex[3] = {ssid_start[i + 1], ssid_start[i + 2], 0};
+                                    new_ssid[j++] = (char)strtol(hex, NULL, 16);
+                                    i += 3; // Skip %XX
+                                }
+                                else if (ssid_start[i] == '+')
+                                {
+                                    new_ssid[j++] = ' '; // + is space in URL encoding
+                                    i++;
+                                }
+                                else
+                                {
+                                    new_ssid[j++] = ssid_start[i++];
+                                }
+                            }
+                            new_ssid[j] = '\0';
+                            ESP_LOGW(TAG, "Admin: Parsed new SSID: \"%s\" (length=%d)", new_ssid, j);
+
+                            // Validate SSID
+                            if (!is_valid_ssid(new_ssid))
+                            {
+                                const char *error =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Invalid SSID (must be 1-32 printable ASCII characters)\"}";
+                                send(sock, error, strlen(error), 0);
+                                ESP_LOGW(TAG, "Admin: Invalid SSID rejected: \"%s\"", new_ssid);
+                                close(sock);
+                                continue;
+                            }
+
+                            // Save new SSID to NVS
+                            ESP_LOGW(TAG, "Admin: Attempting to save new AP SSID: \"%s\"", new_ssid);
+                            esp_err_t err = save_ap_ssid(new_ssid);
+                            ESP_LOGW(TAG, "Admin: save_ap_ssid returned: %s", esp_err_to_name(err));
+
+                            if (err == ESP_OK)
+                            {
+                                update_admin_activity();
+                                const char *response =
+                                    "HTTP/1.1 200 OK\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":true,\"message\":\"AP SSID will be updated after reboot\",\"reboot\":true}";
+                                send(sock, response, strlen(response), 0);
+                                ESP_LOGW(TAG, "▶▶▶ Admin: Response sent - AP SSID will change to \"%s\" after reboot", new_ssid);
+
+                                // Close socket and delay before reboot
+                                close(sock);
+                                ESP_LOGW(TAG, "▶▶▶ Socket closed, waiting 1 second before reboot...");
+                                vTaskDelay(pdMS_TO_TICKS(1000)); // Give time for response to send
+
+                                ESP_LOGE(TAG, "⚠️⚠️⚠️  REBOOTING ESP32 NOW TO APPLY NEW AP SSID...");
+                                fflush(stdout); // Ensure log is written
+                                esp_restart();  // THIS SHOULD REBOOT THE DEVICE
+
+                                // Should never reach here
+                                ESP_LOGE(TAG, "❌ ERROR: esp_restart() did not reboot! This should never happen!");
+                            }
+                            else
+                            {
+                                const char *error =
+                                    "HTTP/1.1 500 Internal Server Error\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Failed to save AP SSID\"}";
+                                send(sock, error, strlen(error), 0);
+                                ESP_LOGE(TAG, "Admin: Failed to save AP SSID: %s", esp_err_to_name(err));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const char *error =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing admin_password or ssid parameter\"}";
+                        send(sock, error, strlen(error), 0);
+                        ESP_LOGW(TAG, "Admin: Missing parameters for AP SSID change");
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
             // Handle admin configuration
             if (is_admin_config)
             {
@@ -3836,6 +4236,26 @@ static void http_server_task(void *pvParameters)
                              static_dns);
                     send(sock, wifi_card, strlen(wifi_card), 0);
 
+                    // AP Settings card
+                    char ap_ssid_card[896];
+                    snprintf(ap_ssid_card, sizeof(ap_ssid_card),
+                             "<div class='card'><h2>📡 Access Point Settings</h2>"
+                             "<p style='color:#666;margin-bottom:15px'>Customize your captive portal SSID</p>"
+                             "<form id='apSsidForm'>"
+                             "<label>Admin Password:</label>"
+                             "<input type='password' id='apSsidAdminPass' required>"
+                             "<label>AP SSID Name:</label>"
+                             "<input type='text' id='apSsid' value='%s' maxlength='32' required "
+                             "pattern='[\\x20-\\x7E]{1,32}' title='1-32 printable ASCII characters'>"
+                             "<p style='font-size:12px;color:#666;margin:5px 0'>1-32 characters (letters, numbers, spaces, symbols)</p>"
+                             "<button type='submit' class='danger'>Update AP SSID</button>"
+                             "<div class='info-box' style='margin-top:15px'>"
+                             "<strong>⚠️ Warning:</strong> Changing the SSID will <strong>reboot the ESP32</strong>. "
+                             "All guests and admin connections will be dropped.</div>"
+                             "</form></div>",
+                             ap_ssid);
+                    send(sock, ap_ssid_card, strlen(ap_ssid_card), 0);
+
                     // Password change card
                     const char *pass_card =
                         "<div class='card'><h2>🔐 Change Password</h2>"
@@ -3872,7 +4292,17 @@ static void http_server_task(void *pvParameters)
                         "'&static_gw='+encodeURIComponent(document.getElementById('staticGw').value)+"
                         "'&static_nm='+encodeURIComponent(document.getElementById('staticNm').value)+"
                         "'&static_dns='+encodeURIComponent(document.getElementById('staticDns').value)}"
-                        "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})});";
+                        "fetch('/admin/configure',{method:'POST',body:data}).then(r=>r.text()).then(()=>{alert('WiFi updated! Reconnecting...');setTimeout(updateStatus,5000)})});"
+                        "document.getElementById('apSsidForm').addEventListener('submit',function(e){"
+                        "e.preventDefault();var adminPass=document.getElementById('apSsidAdminPass').value;"
+                        "var newSsid=document.getElementById('apSsid').value;"
+                        "if(!adminPass){alert('Admin password is required');return}"
+                        "if(newSsid.length<1||newSsid.length>32){alert('SSID must be 1-32 characters');return}"
+                        "if(!confirm('⚠️ REBOOT WARNING ⚠️\\n\\nChanging AP SSID to \"'+newSsid+'\" will:\\n• Reboot the ESP32\\n• Disconnect all users (including you)\\n• Take 30-60 seconds\\n\\nContinue?')){return}"
+                        "var data='admin_password='+encodeURIComponent(adminPass)+'&ssid='+encodeURIComponent(newSsid);"
+                        "fetch('/admin/set_ap_ssid',{method:'POST',body:data}).then(r=>r.json()).then(d=>{"
+                        "if(d.success){alert('AP SSID saved! ESP32 is rebooting now...\\n\\nWait 30-60 seconds, then reconnect to: '+newSsid);document.getElementById('apSsidAdminPass').value=''}"
+                        "else{alert('Error: '+d.error);document.getElementById('apSsidAdminPass').value=''}}).catch(()=>{alert('ESP32 is rebooting. Wait 30-60 seconds then reconnect to: '+newSsid)})});";
                     send(sock, script1, strlen(script1), 0);
 
                     // JavaScript part 2
@@ -4212,6 +4642,9 @@ void app_main(void)
     // Load WiFi credentials from NVS (or use defaults)
     load_wifi_credentials();
 
+    // Load AP SSID from NVS (or use default)
+    load_ap_ssid();
+
     // Tokens will be created via admin panel after time sync
     ESP_LOGI(TAG, "Loaded %d tokens from storage", token_count);
 
@@ -4285,14 +4718,17 @@ void app_main(void)
     // Configure the guest AP (separate from mesh)
     wifi_config_t wifi_config_ap = {
         .ap = {
-            .ssid = "ESP32-Guest-Portal",
-            .ssid_len = strlen("ESP32-Guest-Portal"),
+            .ssid_len = 0, // Will be set below
             .channel = MESH_CHANNEL,
             .password = "",
             .max_connection = 4,
             .authmode = WIFI_AUTH_OPEN,
         },
     };
+    // Copy AP SSID from loaded/default value
+    strncpy((char *)wifi_config_ap.ap.ssid, ap_ssid, sizeof(wifi_config_ap.ap.ssid));
+    wifi_config_ap.ap.ssid_len = strlen(ap_ssid);
+    ESP_LOGI(TAG, "Configuring AP with SSID: \"%s\"", ap_ssid);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config_ap));
 
     // Start WiFi and Mesh
@@ -4337,8 +4773,7 @@ void app_main(void)
     // Configure the AP
     wifi_config_t ap_config = {
         .ap = {
-            .ssid = "ESP32-Guest-Portal",
-            .ssid_len = strlen("ESP32-Guest-Portal"),
+            .ssid_len = 0, // Will be set below
             .channel = MESH_CHANNEL,
             .password = "",
             .max_connection = 4,
@@ -4348,6 +4783,10 @@ void app_main(void)
             },
         },
     };
+    // Copy AP SSID from loaded/default value
+    strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(ap_ssid);
+    ESP_LOGI(TAG, "Configuring AP with SSID: \"%s\"", ap_ssid);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 
     // Configure the STA (for router connection)

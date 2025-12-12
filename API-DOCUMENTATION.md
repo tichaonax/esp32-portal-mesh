@@ -1750,6 +1750,108 @@ The admin dashboard provides a simplified token generation form:
 - **Verification:** Must enter old password
 - **Storage:** Securely stored in NVS flash
 
+### Access Point (AP) SSID Customization
+The admin dashboard allows you to customize the WiFi network name (SSID) that guests connect to.
+
+#### Features
+- **Custom SSID:** Change the captive portal WiFi network name from default "ESP32-Guest-Portal" to your preferred name
+- **Persistent Storage:** SSID is saved to NVS flash and persists across device reboots
+- **Secure Change:** Requires admin password verification before changing
+- **Device Reboot:** ESP32 reboots automatically to apply new SSID (takes 30-60 seconds)
+- **Validation:** Enforces WiFi standard (1-32 printable ASCII characters)
+- **Location:** http://192.168.4.1/admin → "Access Point Settings" card
+
+#### Usage
+1. Log in to admin dashboard at http://192.168.4.1/admin
+2. Scroll to the "Access Point Settings" card
+3. **Enter your admin password** (required for security)
+4. Enter your desired SSID (1-32 characters)
+5. Click "Update AP SSID" (red button indicates critical action)
+6. Confirm the reboot warning
+7. **Wait 30-60 seconds** for ESP32 to reboot
+8. Reconnect to the new SSID and access admin dashboard again
+
+#### SSID Requirements
+- **Length:** 1-32 characters
+- **Characters:** Printable ASCII only (letters, numbers, spaces, symbols)
+- **Examples:** 
+  - ✅ `"Hotel WiFi"`
+  - ✅ `"Cafe-Guest-2024"`
+  - ✅ `"Welcome @ Our Store!"`
+  - ❌ `""` (empty)
+  - ❌ `"ThisSSIDIsWayTooLongAndExceedsTheMaximum"` (>32 chars)
+
+#### Behavior
+- **Password Required:** Must enter admin password to authorize the change
+- **Device Reboot:** ESP32 performs full restart to apply new SSID (30-60 seconds)
+- **All Users Disconnected:** Admin and all guests will be dropped during reboot
+- **Router Reconnection:** STA uplink automatically reconnects to router after reboot
+- **Admin Dashboard:** Accessible again at http://192.168.4.1/admin after reconnecting to new SSID
+- **Captive Portal:** Fully functional with new SSID after reboot completes
+
+#### Use Cases
+**Hotel/Venue Branding:**
+```
+SSID: "Grand Hotel WiFi"
+- Provides professional branding
+- Easy for guests to identify
+```
+
+**Multi-Location Deployments:**
+```
+Location 1: "Cafe Downtown"
+Location 2: "Cafe Uptown"
+Location 3: "Cafe Airport"
+- Helps identify which location's WiFi
+```
+
+**Event-Specific Networks:**
+```
+SSID: "Conference 2024"
+- Temporary event branding
+- Easy to change after event
+```
+
+**Language Localization:**
+```
+SSID: "WiFi Gratuit" (French for "Free WiFi")
+SSID: "WiFi Gratis" (Spanish)
+- Localize for your region
+```
+
+#### Technical Details
+- **Default SSID:** `"ESP32-Guest-Portal"`
+- **NVS Key:** `ap_ssid`
+- **Storage:** 33 bytes (32 chars + null terminator)
+- **Endpoint:** `POST /admin/set_ap_ssid` (requires session + password)
+- **Parameters:** `admin_password` (required), `ssid` (required, 1-32 chars)
+- **Validation Function:** `is_valid_ssid()`
+- **Action:** Saves to NVS → Sends response → Delays 500ms → Reboots ESP32
+- **Reboot Time:** ~30-60 seconds to fully restart and reconnect to router
+
+#### Troubleshooting
+
+**Problem: "Incorrect admin password" error**
+- **Solution:** Verify you're entering the correct admin password
+- **Check:** Admin password is case-sensitive
+
+**Problem: Can't connect after changing SSID**
+- **Solution:** Wait full 60 seconds for reboot to complete
+- **Check:** Look for the new network name in your WiFi list
+- **Verify:** ESP32 may take 30-45 seconds to reconnect to router after reboot
+
+**Problem: Admin dashboard not accessible after reboot**
+- **Solution:** Connect to the new SSID first, then navigate to http://192.168.4.1/admin
+- **Wait:** Give ESP32 time to fully boot and establish network
+
+**Problem: SSID change rejected**
+- **Solution:** Check SSID length (1-32 chars) and use only printable ASCII
+- **Avoid:** Control characters, extended Unicode, emoji
+
+**Problem: Guests can't find the network**
+- **Solution:** Ensure SSID is memorable and clearly communicated
+- **Tip:** Display the SSID prominently (signs, receipts, staff training)
+
 ## Network Requirements
 
 ### API Access Rules
@@ -1919,6 +2021,22 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.2** (2025-12-11): AP SSID Customization & MAC Filtering
+  - **NEW:** AP SSID Customization - Change captive portal WiFi network name via admin dashboard
+  - **NEW:** MAC Address Filtering - Blacklist/whitelist device access control
+  - **NEW:** `POST /api/mac/blacklist` - Block specific devices from network access
+  - **NEW:** `POST /api/mac/whitelist` - Grant VIP bypass access (no token needed)
+  - **NEW:** `GET /api/mac/list` - List all MAC filtering entries
+  - **NEW:** `POST /api/mac/remove` - Remove MAC from blacklist/whitelist
+  - **NEW:** `POST /api/mac/clear` - Clear all MAC filtering entries
+  - **NEW:** Custom "Access Denied" page for blacklisted devices
+  - SSID validation (1-32 printable ASCII characters)
+  - NVS persistence for custom SSID (survives reboots)
+  - Dynamic WiFi reconfiguration without device restart
+  - MAC filtering with mutual exclusivity (50 entries each list)
+  - VIP bypass for whitelisted MACs (no token redemption required)
+  - Binary size: 912KB (41% free flash space remaining)
+
 - **v3.1** (2025-12-10): Bulk Token Management & Analytics
   - **NEW:** `GET /api/tokens/list` - List all active tokens with full metadata
   - Bulk token operations support (disable all, cleanup expired)
