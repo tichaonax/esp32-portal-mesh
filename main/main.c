@@ -745,6 +745,9 @@ static bool is_valid_ssid(const char *ssid)
     return true;
 }
 
+// Forward declaration for cleanup function (needed by create_new_token_with_params)
+static void cleanup_expired_tokens(void);
+
 // Create new access token with parameters
 static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
@@ -756,19 +759,28 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (token_count >= MAX_TOKENS)
-    {
-        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
-                 token_count, MAX_TOKENS);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Validate duration
+    // Validate duration first (before checking token count)
     if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
     {
         ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)",
                  duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
         return ESP_ERR_INVALID_ARG;
+    }
+
+    // If at or near token limit, run cleanup first to free expired slots
+    if (token_count >= MAX_TOKENS - 5)
+    {
+        ESP_LOGI(TAG, "Token count (%d) near limit (%d), running cleanup first...",
+                 token_count, MAX_TOKENS);
+        cleanup_expired_tokens();
+    }
+
+    // Check token limit after cleanup
+    if (token_count >= MAX_TOKENS)
+    {
+        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
+                 token_count, MAX_TOKENS);
+        return ESP_ERR_NO_MEM;
     }
 
     token_info_t new_token;
@@ -2347,14 +2359,43 @@ static void http_server_task(void *pvParameters)
                                 send(sock, error_response, strlen(error_response), 0);
                                 ESP_LOGW(TAG, "API: Token creation denied - time not synced");
                             }
+                            else if (err == ESP_ERR_NO_MEM)
+                            {
+                                // Token limit reached (after cleanup attempt)
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 507 Insufficient Storage\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Token limit reached (max %d active tokens)\",\"error_code\":\"TOKEN_LIMIT_REACHED\",\"max_tokens\":%d,\"current_tokens\":%d}",
+                                         MAX_TOKENS, MAX_TOKENS, token_count);
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Token creation denied - limit reached (%d/%d)", token_count, MAX_TOKENS);
+                            }
+                            else if (err == ESP_ERR_INVALID_ARG)
+                            {
+                                // Invalid duration
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 400 Bad Request\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Duration must be between %d and %d minutes\",\"error_code\":\"INVALID_DURATION\"}",
+                                         TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Token creation denied - invalid duration %lu", duration);
+                            }
                             else
                             {
-                                const char *error_response =
-                                    "HTTP/1.1 400 Bad Request\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Connection: close\r\n\r\n"
-                                    "{\"success\":false,\"error\":\"Invalid parameters or token limit reached\"}";
+                                // Other errors (NVS issues, etc.)
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 500 Internal Server Error\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Internal error creating token\",\"error_code\":\"INTERNAL_ERROR\"}");
                                 send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGE(TAG, "API: Token creation failed with error: %s", esp_err_to_name(err));
                             }
                         }
                         else
@@ -3797,7 +3838,7 @@ static void http_server_task(void *pvParameters)
                             ESP_LOGW(TAG, "Admin: Attempting to save new AP SSID: \"%s\"", new_ssid);
                             esp_err_t err = save_ap_ssid(new_ssid);
                             ESP_LOGW(TAG, "Admin: save_ap_ssid returned: %s", esp_err_to_name(err));
-                            
+
                             if (err == ESP_OK)
                             {
                                 update_admin_activity();
@@ -3808,16 +3849,16 @@ static void http_server_task(void *pvParameters)
                                     "{\"success\":true,\"message\":\"AP SSID will be updated after reboot\",\"reboot\":true}";
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGW(TAG, "▶▶▶ Admin: Response sent - AP SSID will change to \"%s\" after reboot", new_ssid);
-                                
+
                                 // Close socket and delay before reboot
                                 close(sock);
                                 ESP_LOGW(TAG, "▶▶▶ Socket closed, waiting 1 second before reboot...");
                                 vTaskDelay(pdMS_TO_TICKS(1000)); // Give time for response to send
-                                
+
                                 ESP_LOGE(TAG, "⚠️⚠️⚠️  REBOOTING ESP32 NOW TO APPLY NEW AP SSID...");
                                 fflush(stdout); // Ensure log is written
-                                esp_restart(); // THIS SHOULD REBOOT THE DEVICE
-                                
+                                esp_restart();  // THIS SHOULD REBOOT THE DEVICE
+
                                 // Should never reach here
                                 ESP_LOGE(TAG, "❌ ERROR: esp_restart() did not reboot! This should never happen!");
                             }
