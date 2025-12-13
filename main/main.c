@@ -132,7 +132,7 @@ static esp_netif_t *ap_netif = NULL;
 // Token management
 #define TOKEN_LENGTH 8
 #define TOKEN_EXPIRY_HOURS 24
-#define MAX_TOKENS 230 // Increased from 50 to match NVS capacity (~231 max)
+#define MAX_TOKENS 500 // Increased from 230 to 500 for expanded capacity
 #define TOKEN_MIN_DURATION_MINUTES 30
 #define TOKEN_MAX_DURATION_MINUTES (30 * 24 * 60) // 30 days
 #define MAX_DEVICES_PER_TOKEN 2
@@ -161,11 +161,11 @@ typedef struct
     int token_count;
 } token_blob_t;
 
-static token_info_t active_tokens[MAX_TOKENS];
-static int token_count = 0;
-
-// Global token blob for NVS storage
 static token_blob_t token_blob;
+
+// Remove redundant active_tokens array - work directly with token_blob.tokens
+// static token_info_t active_tokens[MAX_TOKENS]; // REMOVED - saves 36KB RAM
+// static int token_count = 0; // REMOVED - use token_blob.token_count instead
 
 // Authenticated clients tracking
 #define MAX_AUTHENTICATED_CLIENTS 50
@@ -181,8 +181,8 @@ static authenticated_client_t authenticated_clients[MAX_AUTHENTICATED_CLIENTS];
 static int authenticated_count = 0;
 
 // ==================== MAC Filtering (Blacklist/Whitelist) ====================
-#define MAX_BLACKLIST_ENTRIES 50
-#define MAX_WHITELIST_ENTRIES 50
+#define MAX_BLACKLIST_ENTRIES 200
+#define MAX_WHITELIST_ENTRIES 200
 #define MAC_FILTER_REASON_LENGTH 32
 #define MAC_FILTER_NOTE_LENGTH 32
 
@@ -206,11 +206,29 @@ typedef struct
     bool active;                       // Entry is in use
 } whitelist_entry_t;
 
-static blacklist_entry_t blacklist[MAX_BLACKLIST_ENTRIES];
-static int blacklist_count = 0;
+// Blob structure for storing all blacklist entries in a single NVS entry
+typedef struct
+{
+    blacklist_entry_t entries[MAX_BLACKLIST_ENTRIES];
+    int entry_count;
+} blacklist_blob_t;
 
-static whitelist_entry_t whitelist[MAX_WHITELIST_ENTRIES];
-static int whitelist_count = 0;
+static blacklist_blob_t blacklist_blob;
+
+// Blob structure for storing all whitelist entries in a single NVS entry
+typedef struct
+{
+    whitelist_entry_t entries[MAX_WHITELIST_ENTRIES];
+    int entry_count;
+} whitelist_blob_t;
+
+static whitelist_blob_t whitelist_blob;
+
+// Remove redundant arrays - work directly with blob structures
+// static blacklist_entry_t blacklist[MAX_BLACKLIST_ENTRIES]; // REMOVED - use blacklist_blob.entries
+// static int blacklist_count = 0; // REMOVED - use blacklist_blob.entry_count
+// static whitelist_entry_t whitelist[MAX_WHITELIST_ENTRIES]; // REMOVED - use whitelist_blob.entries
+// static int whitelist_count = 0; // REMOVED - use whitelist_blob.entry_count
 
 // NVS keys for MAC filtering
 #define NVS_BLACKLIST_COUNT "bl_count"
@@ -279,15 +297,7 @@ static int get_authenticated_count(void)
 // Helper function to count active tokens
 static int get_active_token_count(void)
 {
-    int count = 0;
-    for (int i = 0; i < MAX_TOKENS; i++)
-    {
-        if (active_tokens[i].active)
-        {
-            count++;
-        }
-    }
-    return count;
+    return token_blob.token_count;
 }
 
 #if MESH_ENABLED
@@ -429,9 +439,8 @@ static esp_err_t save_tokens_blob_to_nvs(void)
         return err;
     }
 
-    // Copy current active_tokens to token_blob
-    memcpy(token_blob.tokens, active_tokens, sizeof(active_tokens));
-    token_blob.token_count = token_count;
+    // Copy current token_blob.tokens to token_blob (already in sync)
+    // memcpy(token_blob.tokens, active_tokens, sizeof(active_tokens)); // REMOVED
 
     // Save entire token blob
     err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, sizeof(token_blob_t));
@@ -446,7 +455,8 @@ static esp_err_t save_tokens_blob_to_nvs(void)
             // Get stats before erase
             nvs_stats_t nvs_stats;
             err = nvs_get_stats("nvs_tokens", &nvs_stats);
-            if (err == ESP_OK) {
+            if (err == ESP_OK)
+            {
                 ESP_LOGI(TAG, "DEBUG: NVS stats before erase - used: %d, free: %d, total: %d",
                          nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
             }
@@ -461,7 +471,8 @@ static esp_err_t save_tokens_blob_to_nvs(void)
 
             // Get stats after erase
             err = nvs_get_stats("nvs_tokens", &nvs_stats);
-            if (err == ESP_OK) {
+            if (err == ESP_OK)
+            {
                 ESP_LOGI(TAG, "DEBUG: NVS stats after erase - used: %d, free: %d, total: %d",
                          nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
             }
@@ -470,14 +481,16 @@ static esp_err_t save_tokens_blob_to_nvs(void)
 
             ESP_LOGI(TAG, "Erased tokens namespace, retrying save...");
             err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &nvs_handle);
-            if (err != ESP_OK) {
+            if (err != ESP_OK)
+            {
                 ESP_LOGE(TAG, "DEBUG: Failed to reopen tokens partition after erase: %s", esp_err_to_name(err));
                 return err;
             }
 
             // Get stats after reopen
             err = nvs_get_stats("nvs_tokens", &nvs_stats);
-            if (err == ESP_OK) {
+            if (err == ESP_OK)
+            {
                 ESP_LOGI(TAG, "DEBUG: NVS stats after reopen - used: %d, free: %d, total: %d",
                          nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
             }
@@ -497,7 +510,8 @@ static esp_err_t save_tokens_blob_to_nvs(void)
                 esp_err_t test_err = nvs_set_str(nvs_handle, "test_key", test_data);
                 ESP_LOGI(TAG, "DEBUG: Test save result: %s", esp_err_to_name(test_err));
 
-                if (test_err == ESP_OK) {
+                if (test_err == ESP_OK)
+                {
                     test_err = nvs_commit(nvs_handle);
                     ESP_LOGI(TAG, "DEBUG: Test commit result: %s", esp_err_to_name(test_err));
                 }
@@ -505,10 +519,13 @@ static esp_err_t save_tokens_blob_to_nvs(void)
                 // Check global NVS stats
                 nvs_stats_t global_stats;
                 esp_err_t global_err = nvs_get_stats(NULL, &global_stats);
-                if (global_err == ESP_OK) {
+                if (global_err == ESP_OK)
+                {
                     ESP_LOGI(TAG, "DEBUG: Global NVS stats - used: %d, free: %d, total: %d",
                              global_stats.used_entries, global_stats.free_entries, global_stats.total_entries);
-                } else {
+                }
+                else
+                {
                     ESP_LOGI(TAG, "DEBUG: Failed to get global NVS stats: %s", esp_err_to_name(global_err));
                 }
             }
@@ -517,7 +534,7 @@ static esp_err_t save_tokens_blob_to_nvs(void)
     else
     {
         err = nvs_commit(nvs_handle);
-        ESP_LOGI(TAG, "Token blob saved to NVS (%d tokens)", token_count);
+        ESP_LOGI(TAG, "Token blob saved to NVS (%d tokens)", token_blob.token_count);
     }
 
     nvs_close(nvs_handle);
@@ -545,60 +562,63 @@ static void load_tokens_blob_from_nvs(void)
         return;
     }
 
-    // Copy loaded blob to active_tokens and validate
-    memcpy(active_tokens, token_blob.tokens, sizeof(active_tokens));
-    token_count = 0; // Will be incremented for each valid token
+    // Validate tokens directly in token_blob and update count
+    // memcpy(active_tokens, token_blob.tokens, sizeof(active_tokens)); // REMOVED
+    int valid_count = 0; // Will replace token_count
 
     time_t now = time(NULL);
-    for (int i = 0; i < token_blob.token_count && token_count < MAX_TOKENS; i++)
+    for (int i = 0; i < token_blob.token_count && valid_count < MAX_TOKENS; i++)
     {
-        if (active_tokens[i].active)
+        if (token_blob.tokens[i].active)
         {
             bool expired = false;
 
             // Check time expiration
-            if (active_tokens[i].first_use > 0)
+            if (token_blob.tokens[i].first_use > 0)
             {
-                time_t token_expires = active_tokens[i].first_use +
-                                       (active_tokens[i].duration_minutes * 60);
+                time_t token_expires = token_blob.tokens[i].first_use +
+                                       (token_blob.tokens[i].duration_minutes * 60);
                 if (now > token_expires)
                 {
-                    ESP_LOGI(TAG, "Token %s expired (time), removing", active_tokens[i].token);
+                    ESP_LOGI(TAG, "Token %s expired (time), removing", token_blob.tokens[i].token);
                     expired = true;
                 }
             }
 
             // Check bandwidth limits
-            if (active_tokens[i].bandwidth_down_mb > 0 &&
-                active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
+            if (token_blob.tokens[i].bandwidth_down_mb > 0 &&
+                token_blob.tokens[i].bandwidth_used_down >= token_blob.tokens[i].bandwidth_down_mb)
             {
-                ESP_LOGI(TAG, "Token %s expired (bandwidth down), removing", active_tokens[i].token);
+                ESP_LOGI(TAG, "Token %s expired (bandwidth down), removing", token_blob.tokens[i].token);
                 expired = true;
             }
-            if (active_tokens[i].bandwidth_up_mb > 0 &&
-                active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
+            if (token_blob.tokens[i].bandwidth_up_mb > 0 &&
+                token_blob.tokens[i].bandwidth_used_up >= token_blob.tokens[i].bandwidth_up_mb)
             {
-                ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", active_tokens[i].token);
+                ESP_LOGI(TAG, "Token %s expired (bandwidth up), removing", token_blob.tokens[i].token);
                 expired = true;
             }
 
             if (expired)
             {
-                active_tokens[i].active = false;
+                token_blob.tokens[i].active = false;
             }
             else
             {
                 ESP_LOGI(TAG, "Loaded token %s (used %lu times, %d devices)",
-                         active_tokens[i].token,
-                         active_tokens[i].usage_count,
-                         active_tokens[i].device_count);
-                token_count++;
+                         token_blob.tokens[i].token,
+                         token_blob.tokens[i].usage_count,
+                         token_blob.tokens[i].device_count);
+                valid_count++;
             }
         }
     }
 
+    // Update token count after validation
+    token_blob.token_count = valid_count;
+
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Loaded %d active tokens from NVS blob", token_count);
+    ESP_LOGI(TAG, "Loaded %d active tokens from NVS blob", token_blob.token_count);
 }
 
 // ==================== MAC Filtering NVS Functions ====================
@@ -607,43 +627,26 @@ static void load_tokens_blob_from_nvs(void)
 static esp_err_t save_blacklist_to_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mac_filter", NVS_READWRITE, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_blacklist", "mac_filter", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error opening NVS for blacklist: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error opening NVS blacklist partition: %s", esp_err_to_name(err));
         return err;
     }
 
-    // Save blacklist count
-    err = nvs_set_i32(nvs_handle, NVS_BLACKLIST_COUNT, blacklist_count);
+    // Save entire blacklist blob
+    err = nvs_set_blob(nvs_handle, "blacklist_blob", &blacklist_blob, sizeof(blacklist_blob_t));
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error saving blacklist count: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error saving blacklist blob: %s", esp_err_to_name(err));
         nvs_close(nvs_handle);
         return err;
-    }
-
-    // Save each blacklist entry
-    int saved_count = 0;
-    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
-    {
-        if (blacklist[i].active)
-        {
-            char key[16];
-            snprintf(key, sizeof(key), "%s%d", NVS_BLACKLIST_PREFIX, saved_count);
-            err = nvs_set_blob(nvs_handle, key, &blacklist[i], sizeof(blacklist_entry_t));
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Error saving blacklist entry %d: %s", i, esp_err_to_name(err));
-            }
-            saved_count++;
-        }
     }
 
     err = nvs_commit(nvs_handle);
     nvs_close(nvs_handle);
 
-    ESP_LOGI(TAG, "✓ Saved %d blacklist entries to NVS", saved_count);
+    ESP_LOGI(TAG, "✓ Saved %d blacklist entries to NVS blob", blacklist_blob.entry_count);
     return err;
 }
 
@@ -651,88 +654,54 @@ static esp_err_t save_blacklist_to_nvs(void)
 static void load_blacklist_from_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mac_filter", NVS_READONLY, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_blacklist", "mac_filter", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK)
     {
         ESP_LOGI(TAG, "No existing blacklist found in NVS");
         return;
     }
 
-    // Load blacklist count
-    int32_t count = 0;
-    err = nvs_get_i32(nvs_handle, NVS_BLACKLIST_COUNT, &count);
-    if (err != ESP_OK || count <= 0)
+    // Load entire blacklist blob
+    size_t required_size = sizeof(blacklist_blob_t);
+    err = nvs_get_blob(nvs_handle, "blacklist_blob", &blacklist_blob, &required_size);
+
+    if (err == ESP_OK)
     {
-        nvs_close(nvs_handle);
-        return;
+        ESP_LOGI(TAG, "✓ Loaded %d blacklist entries from NVS blob", blacklist_blob.entry_count);
     }
-
-    // Load each blacklist entry
-    blacklist_count = 0;
-    for (int i = 0; i < count && i < MAX_BLACKLIST_ENTRIES; i++)
+    else
     {
-        char key[16];
-        snprintf(key, sizeof(key), "%s%d", NVS_BLACKLIST_PREFIX, i);
-
-        size_t required_size = sizeof(blacklist_entry_t);
-        err = nvs_get_blob(nvs_handle, key, &blacklist[blacklist_count], &required_size);
-
-        if (err == ESP_OK && blacklist[blacklist_count].active)
-        {
-            ESP_LOGI(TAG, "Loaded blacklist entry: %02X:%02X:%02X:%02X:%02X:%02X (token: %s)",
-                     blacklist[blacklist_count].mac[0], blacklist[blacklist_count].mac[1],
-                     blacklist[blacklist_count].mac[2], blacklist[blacklist_count].mac[3],
-                     blacklist[blacklist_count].mac[4], blacklist[blacklist_count].mac[5],
-                     blacklist[blacklist_count].token);
-            blacklist_count++;
-        }
+        ESP_LOGI(TAG, "No blacklist blob found, starting with empty blacklist");
+        memset(&blacklist_blob, 0, sizeof(blacklist_blob_t));
     }
 
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "✓ Loaded %d blacklist entries from NVS", blacklist_count);
 }
 
 // Save whitelist to NVS
 static esp_err_t save_whitelist_to_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mac_filter", NVS_READWRITE, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_whitelist", "mac_filter", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error opening NVS for whitelist: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error opening NVS whitelist partition: %s", esp_err_to_name(err));
         return err;
     }
 
-    // Save whitelist count
-    err = nvs_set_i32(nvs_handle, NVS_WHITELIST_COUNT, whitelist_count);
+    // Save entire whitelist blob
+    err = nvs_set_blob(nvs_handle, "whitelist_blob", &whitelist_blob, sizeof(whitelist_blob_t));
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error saving whitelist count: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Error saving whitelist blob: %s", esp_err_to_name(err));
         nvs_close(nvs_handle);
         return err;
-    }
-
-    // Save each whitelist entry
-    int saved_count = 0;
-    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
-    {
-        if (whitelist[i].active)
-        {
-            char key[16];
-            snprintf(key, sizeof(key), "%s%d", NVS_WHITELIST_PREFIX, saved_count);
-            err = nvs_set_blob(nvs_handle, key, &whitelist[i], sizeof(whitelist_entry_t));
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Error saving whitelist entry %d: %s", i, esp_err_to_name(err));
-            }
-            saved_count++;
-        }
     }
 
     err = nvs_commit(nvs_handle);
     nvs_close(nvs_handle);
 
-    ESP_LOGI(TAG, "✓ Saved %d whitelist entries to NVS", saved_count);
+    ESP_LOGI(TAG, "✓ Saved %d whitelist entries to NVS blob", whitelist_blob.entry_count);
     return err;
 }
 
@@ -740,45 +709,28 @@ static esp_err_t save_whitelist_to_nvs(void)
 static void load_whitelist_from_nvs(void)
 {
     nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mac_filter", NVS_READONLY, &nvs_handle);
+    esp_err_t err = nvs_open_from_partition("nvs_whitelist", "mac_filter", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK)
     {
         ESP_LOGI(TAG, "No existing whitelist found in NVS");
         return;
     }
 
-    // Load whitelist count
-    int32_t count = 0;
-    err = nvs_get_i32(nvs_handle, NVS_WHITELIST_COUNT, &count);
-    if (err != ESP_OK || count <= 0)
+    // Load entire whitelist blob
+    size_t required_size = sizeof(whitelist_blob_t);
+    err = nvs_get_blob(nvs_handle, "whitelist_blob", &whitelist_blob, &required_size);
+
+    if (err == ESP_OK)
     {
-        nvs_close(nvs_handle);
-        return;
+        ESP_LOGI(TAG, "✓ Loaded %d whitelist entries from NVS blob", whitelist_blob.entry_count);
     }
-
-    // Load each whitelist entry
-    whitelist_count = 0;
-    for (int i = 0; i < count && i < MAX_WHITELIST_ENTRIES; i++)
+    else
     {
-        char key[16];
-        snprintf(key, sizeof(key), "%s%d", NVS_WHITELIST_PREFIX, i);
-
-        size_t required_size = sizeof(whitelist_entry_t);
-        err = nvs_get_blob(nvs_handle, key, &whitelist[whitelist_count], &required_size);
-
-        if (err == ESP_OK && whitelist[whitelist_count].active)
-        {
-            ESP_LOGI(TAG, "Loaded whitelist entry: %02X:%02X:%02X:%02X:%02X:%02X (token: %s)",
-                     whitelist[whitelist_count].mac[0], whitelist[whitelist_count].mac[1],
-                     whitelist[whitelist_count].mac[2], whitelist[whitelist_count].mac[3],
-                     whitelist[whitelist_count].mac[4], whitelist[whitelist_count].mac[5],
-                     whitelist[whitelist_count].token);
-            whitelist_count++;
-        }
+        ESP_LOGI(TAG, "No whitelist blob found, starting with empty whitelist");
+        memset(&whitelist_blob, 0, sizeof(whitelist_blob_t));
     }
 
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "✓ Loaded %d whitelist entries from NVS", whitelist_count);
 }
 
 // Check if system time is synced and valid
@@ -854,18 +806,18 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     }
 
     // If at or near token limit, run cleanup first to free expired slots
-    if (token_count >= MAX_TOKENS - 5)
+    if (token_blob.token_count >= MAX_TOKENS - 5)
     {
         ESP_LOGI(TAG, "Token count (%d) near limit (%d), running cleanup first...",
-                 token_count, MAX_TOKENS);
+                 token_blob.token_count, MAX_TOKENS);
         cleanup_expired_tokens();
     }
 
     // Check token limit after cleanup
-    if (token_count >= MAX_TOKENS)
+    if (token_blob.token_count >= MAX_TOKENS)
     {
         ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
-                 token_count, MAX_TOKENS);
+                 token_blob.token_count, MAX_TOKENS);
         return ESP_ERR_NO_MEM;
     }
 
@@ -886,9 +838,9 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     new_token.device_count = 0;
     new_token.active = true;
 
-    // Add to active tokens first
-    memcpy(&active_tokens[token_count], &new_token, sizeof(token_info_t));
-    token_count++;
+    // Add to token blob
+    memcpy(&token_blob.tokens[token_blob.token_count], &new_token, sizeof(token_info_t));
+    token_blob.token_count++;
 
     // Save all tokens to NVS blob
     esp_err_t err = save_tokens_blob_to_nvs();
@@ -897,7 +849,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
         ESP_LOGE(TAG, "Failed to create token - NVS save error: %s (0x%x)",
                  esp_err_to_name(err), err);
         // Rollback the addition
-        token_count--;
+        token_blob.token_count--;
         return err;
     }
 
@@ -952,56 +904,56 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
     time_t now = time(NULL);
     ESP_LOGI(TAG, "DEBUG: validate_token - now=%lld, time_synced=%d", (long long)now, time_synced);
 
-    for (int i = 0; i < token_count; i++)
+    for (int i = 0; i < token_blob.token_count; i++)
     {
-        if (!active_tokens[i].active)
+        if (!token_blob.tokens[i].active)
             continue;
 
-        if (strcmp(active_tokens[i].token, token) == 0)
+        if (strcmp(token_blob.tokens[i].token, token) == 0)
         {
             // Set first use time if not set
-            if (active_tokens[i].first_use == 0)
+            if (token_blob.tokens[i].first_use == 0)
             {
-                active_tokens[i].first_use = now;
-                ESP_LOGI(TAG, "Token %s first use at %lld (now=%lld)", token, (long long)active_tokens[i].first_use, (long long)now);
+                token_blob.tokens[i].first_use = now;
+                ESP_LOGI(TAG, "Token %s first use at %lld (now=%lld)", token, (long long)token_blob.tokens[i].first_use, (long long)now);
             }
 
             // Update last use time on every validation (for multi-token handling)
-            active_tokens[i].last_use = now;
+            token_blob.tokens[i].last_use = now;
 
             // Check time-based expiration (from first use)
-            time_t token_expires = active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60);
+            time_t token_expires = token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60);
             if (now > token_expires)
             {
                 ESP_LOGW(TAG, "Token %s has expired (time limit)", token);
-                active_tokens[i].active = false;
+                token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
                 return false;
             }
 
             // Check bandwidth expiration
-            if (active_tokens[i].bandwidth_down_mb > 0 &&
-                active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
+            if (token_blob.tokens[i].bandwidth_down_mb > 0 &&
+                token_blob.tokens[i].bandwidth_used_down >= token_blob.tokens[i].bandwidth_down_mb)
             {
                 ESP_LOGW(TAG, "Token %s exceeded download limit", token);
-                active_tokens[i].active = false;
+                token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
                 return false;
             }
-            if (active_tokens[i].bandwidth_up_mb > 0 &&
-                active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
+            if (token_blob.tokens[i].bandwidth_up_mb > 0 &&
+                token_blob.tokens[i].bandwidth_used_up >= token_blob.tokens[i].bandwidth_up_mb)
             {
                 ESP_LOGW(TAG, "Token %s exceeded upload limit", token);
-                active_tokens[i].active = false;
+                token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
                 return false;
             }
 
             // Check if this MAC is already registered
             int mac_index = -1;
-            for (int j = 0; j < active_tokens[i].device_count; j++)
+            for (int j = 0; j < token_blob.tokens[i].device_count; j++)
             {
-                if (memcmp(active_tokens[i].client_macs[j], client_mac, 6) == 0)
+                if (memcmp(token_blob.tokens[i].client_macs[j], client_mac, 6) == 0)
                 {
                     mac_index = j;
                     break;
@@ -1011,7 +963,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             if (mac_index == -1)
             {
                 // New device - check if we can add it
-                if (active_tokens[i].device_count >= MAX_DEVICES_PER_TOKEN)
+                if (token_blob.tokens[i].device_count >= MAX_DEVICES_PER_TOKEN)
                 {
                     ESP_LOGW(TAG, "Token %s already has %d devices (max allowed)",
                              token, MAX_DEVICES_PER_TOKEN);
@@ -1019,19 +971,19 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 }
 
                 // Add this MAC
-                memcpy(active_tokens[i].client_macs[active_tokens[i].device_count], client_mac, 6);
-                active_tokens[i].device_count++;
+                memcpy(token_blob.tokens[i].client_macs[token_blob.tokens[i].device_count], client_mac, 6);
+                token_blob.tokens[i].device_count++;
                 ESP_LOGI(TAG, "Token %s bound to device %d: %02X:%02X:%02X:%02X:%02X:%02X",
-                         token, active_tokens[i].device_count,
+                         token, token_blob.tokens[i].device_count,
                          client_mac[0], client_mac[1], client_mac[2],
                          client_mac[3], client_mac[4], client_mac[5]);
             }
 
             // Increment usage count
-            active_tokens[i].usage_count++;
+            token_blob.tokens[i].usage_count++;
             save_tokens_blob_to_nvs();
 
-            ESP_LOGI(TAG, "✓ Token %s validated (usage: %lu)", token, active_tokens[i].usage_count);
+            ESP_LOGI(TAG, "✓ Token %s validated (usage: %lu)", token, token_blob.tokens[i].usage_count);
             return true;
         }
     }
@@ -1043,11 +995,11 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
 // Get token info by token string (helper function)
 static token_info_t *get_token_info_by_string(const char *token)
 {
-    for (int i = 0; i < token_count; i++)
+    for (int i = 0; i < token_blob.token_count; i++)
     {
-        if (active_tokens[i].active && strcmp(active_tokens[i].token, token) == 0)
+        if (token_blob.tokens[i].active && strcmp(token_blob.tokens[i].token, token) == 0)
         {
-            return &active_tokens[i];
+            return &token_blob.tokens[i];
         }
     }
     return NULL;
@@ -1065,9 +1017,9 @@ static void cleanup_expired_tokens(void)
     time_t now = time(NULL);
     int cleaned = 0;
 
-    for (int i = 0; i < token_count; i++)
+    for (int i = 0; i < token_blob.token_count; i++)
     {
-        if (!active_tokens[i].active)
+        if (!token_blob.tokens[i].active)
         {
             continue;
         }
@@ -1076,10 +1028,10 @@ static void cleanup_expired_tokens(void)
         const char *reason = NULL;
 
         // Check time-based expiration
-        if (active_tokens[i].first_use > 0)
+        if (token_blob.tokens[i].first_use > 0)
         {
-            time_t token_expires = active_tokens[i].first_use +
-                                   (active_tokens[i].duration_minutes * 60);
+            time_t token_expires = token_blob.tokens[i].first_use +
+                                   (token_blob.tokens[i].duration_minutes * 60);
             if (now > token_expires)
             {
                 expired = true;
@@ -1088,15 +1040,15 @@ static void cleanup_expired_tokens(void)
         }
 
         // Check bandwidth limits
-        if (!expired && active_tokens[i].bandwidth_down_mb > 0 &&
-            active_tokens[i].bandwidth_used_down >= active_tokens[i].bandwidth_down_mb)
+        if (!expired && token_blob.tokens[i].bandwidth_down_mb > 0 &&
+            token_blob.tokens[i].bandwidth_used_down >= token_blob.tokens[i].bandwidth_down_mb)
         {
             expired = true;
             reason = "bandwidth down limit";
         }
 
-        if (!expired && active_tokens[i].bandwidth_up_mb > 0 &&
-            active_tokens[i].bandwidth_used_up >= active_tokens[i].bandwidth_up_mb)
+        if (!expired && token_blob.tokens[i].bandwidth_up_mb > 0 &&
+            token_blob.tokens[i].bandwidth_used_up >= token_blob.tokens[i].bandwidth_up_mb)
         {
             expired = true;
             reason = "bandwidth up limit";
@@ -1105,10 +1057,10 @@ static void cleanup_expired_tokens(void)
         if (expired)
         {
             ESP_LOGI(TAG, "🧹 Cleaning up expired token %s (%s)",
-                     active_tokens[i].token, reason);
+                     token_blob.tokens[i].token, reason);
 
             // Mark as inactive in memory
-            active_tokens[i].active = false;
+            token_blob.tokens[i].active = false;
 
             cleaned++;
         }
@@ -1118,21 +1070,21 @@ static void cleanup_expired_tokens(void)
     if (cleaned > 0)
     {
         int write_idx = 0;
-        for (int read_idx = 0; read_idx < token_count; read_idx++)
+        for (int read_idx = 0; read_idx < token_blob.token_count; read_idx++)
         {
-            if (active_tokens[read_idx].active)
+            if (token_blob.tokens[read_idx].active)
             {
                 if (write_idx != read_idx)
                 {
-                    active_tokens[write_idx] = active_tokens[read_idx];
+                    token_blob.tokens[write_idx] = token_blob.tokens[read_idx];
                 }
                 write_idx++;
             }
         }
-        token_count = write_idx;
+        token_blob.token_count = write_idx;
 
         ESP_LOGI(TAG, "🧹 Cleanup complete: %d token(s) removed, %d active token(s) remaining",
-                 cleaned, token_count);
+                 cleaned, token_blob.token_count);
 
         // Persist the cleaned state to NVS blob
         save_tokens_blob_to_nvs();
@@ -1144,9 +1096,9 @@ static void cleanup_expired_tokens(void)
 // Check if a MAC address is blacklisted
 static bool is_mac_blacklisted(const uint8_t *mac)
 {
-    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    for (int i = 0; i < blacklist_blob.entry_count && i < MAX_BLACKLIST_ENTRIES; i++)
     {
-        if (blacklist[i].active && memcmp(blacklist[i].mac, mac, 6) == 0)
+        if (blacklist_blob.entries[i].active && memcmp(blacklist_blob.entries[i].mac, mac, 6) == 0)
         {
             ESP_LOGD(TAG, "MAC %02X:%02X:%02X:%02X:%02X:%02X is blacklisted",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -1159,9 +1111,9 @@ static bool is_mac_blacklisted(const uint8_t *mac)
 // Check if a MAC address is whitelisted
 static bool is_mac_whitelisted(const uint8_t *mac)
 {
-    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    for (int i = 0; i < whitelist_blob.entry_count && i < MAX_WHITELIST_ENTRIES; i++)
     {
-        if (whitelist[i].active && memcmp(whitelist[i].mac, mac, 6) == 0)
+        if (whitelist_blob.entries[i].active && memcmp(whitelist_blob.entries[i].mac, mac, 6) == 0)
         {
             ESP_LOGD(TAG, "MAC %02X:%02X:%02X:%02X:%02X:%02X is whitelisted (VIP bypass)",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -1174,12 +1126,12 @@ static bool is_mac_whitelisted(const uint8_t *mac)
 // Remove MAC from whitelist (used when adding to blacklist)
 static esp_err_t remove_from_whitelist(const uint8_t *mac)
 {
-    for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
+    for (int i = 0; i < whitelist_blob.entry_count && i < MAX_WHITELIST_ENTRIES; i++)
     {
-        if (whitelist[i].active && memcmp(whitelist[i].mac, mac, 6) == 0)
+        if (whitelist_blob.entries[i].active && memcmp(whitelist_blob.entries[i].mac, mac, 6) == 0)
         {
-            whitelist[i].active = false;
-            whitelist_count--;
+            whitelist_blob.entries[i].active = false;
+            whitelist_blob.entry_count--;
             ESP_LOGI(TAG, "Removed MAC %02X:%02X:%02X:%02X:%02X:%02X from whitelist",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             return ESP_OK;
@@ -1191,12 +1143,12 @@ static esp_err_t remove_from_whitelist(const uint8_t *mac)
 // Remove MAC from blacklist (used when adding to whitelist)
 static esp_err_t remove_from_blacklist(const uint8_t *mac)
 {
-    for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
+    for (int i = 0; i < blacklist_blob.entry_count && i < MAX_BLACKLIST_ENTRIES; i++)
     {
-        if (blacklist[i].active && memcmp(blacklist[i].mac, mac, 6) == 0)
+        if (blacklist_blob.entries[i].active && memcmp(blacklist_blob.entries[i].mac, mac, 6) == 0)
         {
-            blacklist[i].active = false;
-            blacklist_count--;
+            blacklist_blob.entries[i].active = false;
+            blacklist_blob.entry_count--;
             ESP_LOGI(TAG, "Removed MAC %02X:%02X:%02X:%02X:%02X:%02X from blacklist",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             return ESP_OK;
@@ -1221,23 +1173,23 @@ static esp_err_t add_to_blacklist(const uint8_t *mac, const char *token, const c
     // Find empty slot
     for (int i = 0; i < MAX_BLACKLIST_ENTRIES; i++)
     {
-        if (!blacklist[i].active)
+        if (!blacklist_blob.entries[i].active)
         {
-            memcpy(blacklist[i].mac, mac, 6);
-            strncpy(blacklist[i].token, token, TOKEN_LENGTH);
-            blacklist[i].token[TOKEN_LENGTH] = '\0';
-            blacklist[i].added = time(NULL);
+            memcpy(blacklist_blob.entries[i].mac, mac, 6);
+            strncpy(blacklist_blob.entries[i].token, token, TOKEN_LENGTH);
+            blacklist_blob.entries[i].token[TOKEN_LENGTH] = '\0';
+            blacklist_blob.entries[i].added = time(NULL);
             if (reason)
             {
-                strncpy(blacklist[i].reason, reason, MAC_FILTER_REASON_LENGTH - 1);
-                blacklist[i].reason[MAC_FILTER_REASON_LENGTH - 1] = '\0';
+                strncpy(blacklist_blob.entries[i].reason, reason, MAC_FILTER_REASON_LENGTH - 1);
+                blacklist_blob.entries[i].reason[MAC_FILTER_REASON_LENGTH - 1] = '\0';
             }
             else
             {
-                blacklist[i].reason[0] = '\0';
+                blacklist_blob.entries[i].reason[0] = '\0';
             }
-            blacklist[i].active = true;
-            blacklist_count++;
+            blacklist_blob.entries[i].active = true;
+            blacklist_blob.entry_count++;
 
             ESP_LOGI(TAG, "✓ Added MAC %02X:%02X:%02X:%02X:%02X:%02X to blacklist (token: %s)",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], token);
@@ -1265,23 +1217,23 @@ static esp_err_t add_to_whitelist(const uint8_t *mac, const char *token, const c
     // Find empty slot
     for (int i = 0; i < MAX_WHITELIST_ENTRIES; i++)
     {
-        if (!whitelist[i].active)
+        if (!whitelist_blob.entries[i].active)
         {
-            memcpy(whitelist[i].mac, mac, 6);
-            strncpy(whitelist[i].token, token, TOKEN_LENGTH);
-            whitelist[i].token[TOKEN_LENGTH] = '\0';
-            whitelist[i].added = time(NULL);
+            memcpy(whitelist_blob.entries[i].mac, mac, 6);
+            strncpy(whitelist_blob.entries[i].token, token, TOKEN_LENGTH);
+            whitelist_blob.entries[i].token[TOKEN_LENGTH] = '\0';
+            whitelist_blob.entries[i].added = time(NULL);
             if (note)
             {
-                strncpy(whitelist[i].note, note, MAC_FILTER_NOTE_LENGTH - 1);
-                whitelist[i].note[MAC_FILTER_NOTE_LENGTH - 1] = '\0';
+                strncpy(whitelist_blob.entries[i].note, note, MAC_FILTER_NOTE_LENGTH - 1);
+                whitelist_blob.entries[i].note[MAC_FILTER_NOTE_LENGTH - 1] = '\0';
             }
             else
             {
-                whitelist[i].note[0] = '\0';
+                whitelist_blob.entries[i].note[0] = '\0';
             }
-            whitelist[i].active = true;
-            whitelist_count++;
+            whitelist_blob.entries[i].active = true;
+            whitelist_blob.entry_count++;
 
             ESP_LOGI(TAG, "✓ Added MAC %02X:%02X:%02X:%02X:%02X:%02X to whitelist (VIP bypass, token: %s)",
                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], token);
@@ -1356,21 +1308,21 @@ static token_info_t *get_token_info_by_mac(const uint8_t *mac)
     time_t most_recent_use = 0;
 
     // Find all tokens with this MAC and return the one used most recently
-    for (int i = 0; i < token_count; i++)
+    for (int i = 0; i < token_blob.token_count; i++)
     {
-        if (!active_tokens[i].active)
+        if (!token_blob.tokens[i].active)
             continue;
 
         // Check if this MAC is registered with the token
-        for (int j = 0; j < active_tokens[i].device_count; j++)
+        for (int j = 0; j < token_blob.tokens[i].device_count; j++)
         {
-            if (memcmp(active_tokens[i].client_macs[j], mac, 6) == 0)
+            if (memcmp(token_blob.tokens[i].client_macs[j], mac, 6) == 0)
             {
                 // Found a token with this MAC - check if it's the most recent
-                if (active_tokens[i].last_use > most_recent_use)
+                if (token_blob.tokens[i].last_use > most_recent_use)
                 {
-                    most_recent_use = active_tokens[i].last_use;
-                    most_recent_token = &active_tokens[i];
+                    most_recent_use = token_blob.tokens[i].last_use;
+                    most_recent_token = &token_blob.tokens[i];
                 }
                 break; // Move to next token
             }
@@ -2311,6 +2263,7 @@ static void http_server_task(void *pvParameters)
             bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL && strstr(rx_buffer, "POST /api/token/") == NULL);
             bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
             bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
+            bool is_api_token_batch_info = (strstr(rx_buffer, "GET /api/token/batch_info") != NULL);
             bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
             bool is_api_tokens_list = (strstr(rx_buffer, "GET /api/tokens/list") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
@@ -2325,8 +2278,9 @@ static void http_server_task(void *pvParameters)
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
             bool is_admin_regen_key = (strstr(rx_buffer, "POST /admin/regenerate_key") != NULL);
             bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
+            bool is_admin_reset_tokens = (strstr(rx_buffer, "POST /admin/reset_tokens") != NULL);
             bool is_admin_set_ap_ssid = (strstr(rx_buffer, "POST /admin/set_ap_ssid") != NULL);
-            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_set_ap_ssid);
+            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_reset_tokens && !is_admin_set_ap_ssid);
 
             // Handle Token API endpoint
             if (is_api_token)
@@ -2450,9 +2404,9 @@ static void http_server_task(void *pvParameters)
                                          "Content-Type: application/json\r\n"
                                          "Connection: close\r\n\r\n"
                                          "{\"success\":false,\"error\":\"Token limit reached (max %d active tokens)\",\"error_code\":\"TOKEN_LIMIT_REACHED\",\"max_tokens\":%d,\"current_tokens\":%d}",
-                                         MAX_TOKENS, MAX_TOKENS, token_count);
+                                         MAX_TOKENS, MAX_TOKENS, token_blob.token_count);
                                 send(sock, error_response, strlen(error_response), 0);
-                                ESP_LOGW(TAG, "API: Token creation denied - limit reached (%d/%d)", token_count, MAX_TOKENS);
+                                ESP_LOGW(TAG, "API: Token creation denied - limit reached (%d/%d)", token_blob.token_count, MAX_TOKENS);
                             }
                             else if (err == ESP_ERR_INVALID_ARG)
                             {
@@ -2531,45 +2485,23 @@ static void http_server_task(void *pvParameters)
                         {
                             // Find and disable token
                             bool found = false;
-                            for (int i = 0; i < token_count; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active &&
-                                    strcmp(active_tokens[i].token, token_to_disable) == 0)
+                                if (token_blob.tokens[i].active &&
+                                    strcmp(token_blob.tokens[i].token, token_to_disable) == 0)
                                 {
-                                    active_tokens[i].active = false;
-
-                                    // Remove from NVS
-                                    nvs_handle_t nvs_handle;
-                                    if (nvs_open("tokens", NVS_READWRITE, &nvs_handle) == ESP_OK)
-                                    {
-                                        esp_err_t erase_err = nvs_erase_key(nvs_handle, token_to_disable);
-                                        if (erase_err != ESP_OK)
-                                        {
-                                            ESP_LOGE(TAG, "Failed to erase token %s from NVS: %s (0x%x)",
-                                                     token_to_disable, esp_err_to_name(erase_err), erase_err);
-                                        }
-                                        esp_err_t commit_err = nvs_commit(nvs_handle);
-                                        if (commit_err != ESP_OK)
-                                        {
-                                            ESP_LOGE(TAG, "Failed to commit NVS after erasing token %s: %s (0x%x)",
-                                                     token_to_disable, esp_err_to_name(commit_err), commit_err);
-                                        }
-                                        nvs_close(nvs_handle);
-                                        ESP_LOGI(TAG, "Erased token %s from NVS (erase=%s, commit=%s)",
-                                                 token_to_disable, esp_err_to_name(erase_err), esp_err_to_name(commit_err));
-                                    }
-                                    else
-                                    {
-                                        ESP_LOGE(TAG, "Failed to open NVS for erasing token %s", token_to_disable);
-                                    }
+                                    token_blob.tokens[i].active = false;
 
                                     // Compact array immediately by shifting remaining tokens
-                                    for (int j = i; j < token_count - 1; j++)
+                                    for (int j = i; j < token_blob.token_count - 1; j++)
                                     {
-                                        active_tokens[j] = active_tokens[j + 1];
+                                        token_blob.tokens[j] = token_blob.tokens[j + 1];
                                     }
-                                    token_count--;
+                                    token_blob.token_count--;
                                     found = true;
+
+                                    // Save updated blob to NVS
+                                    save_tokens_blob_to_nvs();
 
                                     const char *success_response =
                                         "HTTP/1.1 200 OK\r\n"
@@ -2578,7 +2510,7 @@ static void http_server_task(void *pvParameters)
                                         "{\"success\":true,\"message\":\"Token disabled successfully\"}";
                                     send(sock, success_response, strlen(success_response), 0);
                                     ESP_LOGI(TAG, "API: Token %s disabled via API (count now: %d)",
-                                             token_to_disable, token_count);
+                                             token_to_disable, token_blob.token_count);
                                     break;
                                 }
                             }
@@ -2641,20 +2573,20 @@ static void http_server_task(void *pvParameters)
                         {
                             // Find token (only search through active token_count, not MAX_TOKENS)
                             bool found = false;
-                            for (int i = 0; i < token_count; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active &&
-                                    strcmp(active_tokens[i].token, token_to_query) == 0)
+                                if (token_blob.tokens[i].active &&
+                                    strcmp(token_blob.tokens[i].token, token_to_query) == 0)
                                 {
                                     found = true;
                                     time_t now = time(NULL);
                                     // For unused tokens, expires_at is creation + duration
                                     // For used tokens, expires_at is first_use + duration
-                                    time_t expires_at = active_tokens[i].first_use > 0
-                                                            ? active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60)
-                                                            : active_tokens[i].created + (active_tokens[i].duration_minutes * 60);
-                                    bool is_expired = (active_tokens[i].first_use > 0 && now > expires_at);
-                                    bool is_used = (active_tokens[i].first_use > 0);
+                                    time_t expires_at = token_blob.tokens[i].first_use > 0
+                                                            ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
+                                                            : token_blob.tokens[i].created + (token_blob.tokens[i].duration_minutes * 60);
+                                    bool is_expired = (token_blob.tokens[i].first_use > 0 && now > expires_at);
+                                    bool is_used = (token_blob.tokens[i].first_use > 0);
                                     int64_t remaining_seconds = is_used && !is_expired
                                                                     ? (expires_at - now)
                                                                     : 0;
@@ -2679,23 +2611,23 @@ static void http_server_task(void *pvParameters)
                                                           "\"device_count\":%u,"
                                                           "\"max_devices\":%d,"
                                                           "\"client_macs\":[",
-                                                          active_tokens[i].token,
+                                                          token_blob.tokens[i].token,
                                                           is_expired ? "expired" : (is_used ? "active" : "unused"),
-                                                          (long long)active_tokens[i].created,
-                                                          (long long)active_tokens[i].first_use,
-                                                          active_tokens[i].duration_minutes,
+                                                          (long long)token_blob.tokens[i].created,
+                                                          (long long)token_blob.tokens[i].first_use,
+                                                          token_blob.tokens[i].duration_minutes,
                                                           (long long)expires_at,
                                                           remaining_seconds,
-                                                          active_tokens[i].bandwidth_down_mb,
-                                                          active_tokens[i].bandwidth_up_mb,
-                                                          active_tokens[i].bandwidth_used_down,
-                                                          active_tokens[i].bandwidth_used_up,
-                                                          active_tokens[i].usage_count,
-                                                          active_tokens[i].device_count,
+                                                          token_blob.tokens[i].bandwidth_down_mb,
+                                                          token_blob.tokens[i].bandwidth_up_mb,
+                                                          token_blob.tokens[i].bandwidth_used_down,
+                                                          token_blob.tokens[i].bandwidth_used_up,
+                                                          token_blob.tokens[i].usage_count,
+                                                          token_blob.tokens[i].device_count,
                                                           MAX_DEVICES_PER_TOKEN);
 
                                     // Add MAC addresses
-                                    for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                    for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                     {
                                         if (mac_idx > 0)
                                         {
@@ -2703,12 +2635,12 @@ static void http_server_task(void *pvParameters)
                                         }
                                         offset += snprintf(response + offset, sizeof(response) - offset,
                                                            "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                                                           active_tokens[i].client_macs[mac_idx][0],
-                                                           active_tokens[i].client_macs[mac_idx][1],
-                                                           active_tokens[i].client_macs[mac_idx][2],
-                                                           active_tokens[i].client_macs[mac_idx][3],
-                                                           active_tokens[i].client_macs[mac_idx][4],
-                                                           active_tokens[i].client_macs[mac_idx][5]);
+                                                           token_blob.tokens[i].client_macs[mac_idx][0],
+                                                           token_blob.tokens[i].client_macs[mac_idx][1],
+                                                           token_blob.tokens[i].client_macs[mac_idx][2],
+                                                           token_blob.tokens[i].client_macs[mac_idx][3],
+                                                           token_blob.tokens[i].client_macs[mac_idx][4],
+                                                           token_blob.tokens[i].client_macs[mac_idx][5]);
                                     }
 
                                     offset += snprintf(response + offset, sizeof(response) - offset, "]}");
@@ -2746,6 +2678,184 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle Token Batch Info API endpoint
+            if (is_api_token_batch_info)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Parse query string: /api/token/batch_info?api_key=XXX&tokens=token1,token2,token3
+                char received_key[API_KEY_LENGTH + 1] = {0};
+                char tokens_param[4096] = {0}; // Large buffer for multiple tokens
+
+                char *query_start = strstr(rx_buffer, "GET /api/token/batch_info?");
+                if (query_start)
+                {
+                    query_start += 26; // skip "GET /api/token/batch_info?"
+                    char *key_start = strstr(query_start, "api_key=");
+                    char *tokens_start = strstr(query_start, "tokens=");
+
+                    if (key_start && tokens_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n ]", received_key);
+
+                        tokens_start += 7;
+                        sscanf(tokens_start, "%4095[^&\r\n ]", tokens_param);
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+// Parse tokens from comma-separated list
+#define MAX_BATCH_TOKENS 50
+                            char *token_list[MAX_BATCH_TOKENS];
+                            int token_count = 0;
+
+                            char *token_ptr = tokens_param;
+                            char *comma_pos;
+
+                            while ((comma_pos = strchr(token_ptr, ',')) != NULL && token_count < MAX_BATCH_TOKENS)
+                            {
+                                *comma_pos = '\0';
+                                token_list[token_count++] = token_ptr;
+                                token_ptr = comma_pos + 1;
+                            }
+
+                            // Add the last token (or only token if no commas)
+                            if (token_count < MAX_BATCH_TOKENS && *token_ptr != '\0')
+                            {
+                                token_list[token_count++] = token_ptr;
+                            }
+
+                            if (token_count == 0)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"No tokens specified\",\"error_code\":\"NO_TOKENS_SPECIFIED\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
+                            if (token_count > MAX_BATCH_TOKENS)
+                            {
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 400 Bad Request\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Too many tokens requested (max %d)\",\"error_code\":\"TOO_MANY_TOKENS\",\"max_tokens\":%d,\"requested\":%d}",
+                                         MAX_BATCH_TOKENS, MAX_BATCH_TOKENS, token_count);
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
+                            // Build response with token info array
+                            char response[8192]; // Large buffer for multiple tokens
+                            int offset = snprintf(response, sizeof(response),
+                                                  "HTTP/1.1 200 OK\r\n"
+                                                  "Content-Type: application/json\r\n"
+                                                  "Connection: close\r\n\r\n"
+                                                  "{\"success\":true,\"tokens\":[");
+
+                            int tokens_found = 0;
+                            time_t now = time(NULL);
+
+                            for (int req_idx = 0; req_idx < token_count; req_idx++)
+                            {
+                                char *requested_token = token_list[req_idx];
+
+                                // Find token in blob
+                                bool found = false;
+                                for (int i = 0; i < token_blob.token_count && !found; i++)
+                                {
+                                    if (token_blob.tokens[i].active &&
+                                        strcmp(token_blob.tokens[i].token, requested_token) == 0)
+                                    {
+                                        found = true;
+
+                                        if (tokens_found > 0)
+                                        {
+                                            offset += snprintf(response + offset, sizeof(response) - offset, ",");
+                                        }
+                                        tokens_found++;
+
+                                        // Calculate expiration info
+                                        time_t expires_at = token_blob.tokens[i].first_use > 0
+                                                                ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
+                                                                : token_blob.tokens[i].created + (token_blob.tokens[i].duration_minutes * 60);
+                                        bool is_expired = (token_blob.tokens[i].first_use > 0 && now > expires_at);
+                                        bool is_used = (token_blob.tokens[i].first_use > 0);
+                                        int64_t remaining_seconds = is_used && !is_expired ? (expires_at - now) : 0;
+
+                                        offset += snprintf(response + offset, sizeof(response) - offset,
+                                                           "{\"token\":\"%s\",\"status\":\"%s\",\"created\":%lld,\"first_use\":%lld,"
+                                                           "\"duration_minutes\":%lu,\"expires_at\":%lld,\"remaining_seconds\":%lld,"
+                                                           "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,"
+                                                           "\"bandwidth_used_down_mb\":%lu,\"bandwidth_used_up_mb\":%lu,"
+                                                           "\"usage_count\":%lu,\"device_count\":%u,\"max_devices\":%d,\"client_macs\":[",
+                                                           token_blob.tokens[i].token,
+                                                           is_expired ? "expired" : (is_used ? "active" : "unused"),
+                                                           (long long)token_blob.tokens[i].created,
+                                                           (long long)token_blob.tokens[i].first_use,
+                                                           token_blob.tokens[i].duration_minutes,
+                                                           (long long)expires_at,
+                                                           remaining_seconds,
+                                                           token_blob.tokens[i].bandwidth_down_mb,
+                                                           token_blob.tokens[i].bandwidth_up_mb,
+                                                           token_blob.tokens[i].bandwidth_used_down,
+                                                           token_blob.tokens[i].bandwidth_used_up,
+                                                           token_blob.tokens[i].usage_count,
+                                                           token_blob.tokens[i].device_count,
+                                                           MAX_DEVICES_PER_TOKEN);
+
+                                        // Add MAC addresses
+                                        for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                        {
+                                            if (mac_idx > 0)
+                                            {
+                                                offset += snprintf(response + offset, sizeof(response) - offset, ",");
+                                            }
+                                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                                               "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                               token_blob.tokens[i].client_macs[mac_idx][0],
+                                                               token_blob.tokens[i].client_macs[mac_idx][1],
+                                                               token_blob.tokens[i].client_macs[mac_idx][2],
+                                                               token_blob.tokens[i].client_macs[mac_idx][3],
+                                                               token_blob.tokens[i].client_macs[mac_idx][4],
+                                                               token_blob.tokens[i].client_macs[mac_idx][5]);
+                                        }
+
+                                        offset += snprintf(response + offset, sizeof(response) - offset, "]}");
+                                    }
+                                }
+                            }
+
+                            offset += snprintf(response + offset, sizeof(response) - offset, "],\"total_requested\":%d,\"total_found\":%d}", token_count, tokens_found);
+                            send(sock, response, strlen(response), 0);
+                            ESP_LOGI(TAG, "API: Batch token info requested %d tokens, found %d", token_count, tokens_found);
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, tokens)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
             // Handle Token Extend API endpoint
             if (is_api_token_extend)
             {
@@ -2775,27 +2885,27 @@ static void http_server_task(void *pvParameters)
                         {
                             // Find token
                             bool found = false;
-                            for (int i = 0; i < MAX_TOKENS; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active &&
-                                    strcmp(active_tokens[i].token, token_to_extend) == 0)
+                                if (token_blob.tokens[i].active &&
+                                    strcmp(token_blob.tokens[i].token, token_to_extend) == 0)
                                 {
                                     found = true;
 
                                     // Reset data usage counters
-                                    active_tokens[i].bandwidth_used_down = 0;
-                                    active_tokens[i].bandwidth_used_up = 0;
+                                    token_blob.tokens[i].bandwidth_used_down = 0;
+                                    token_blob.tokens[i].bandwidth_used_up = 0;
 
                                     // Reset time - set first_use to now to restart the duration
-                                    active_tokens[i].first_use = time(NULL);
+                                    token_blob.tokens[i].first_use = time(NULL);
 
                                     // Reset usage count
-                                    active_tokens[i].usage_count = 0;
+                                    token_blob.tokens[i].usage_count = 0;
 
                                     save_tokens_blob_to_nvs(); // Persist to NVS
 
-                                    time_t new_expires = active_tokens[i].first_use +
-                                                         (active_tokens[i].duration_minutes * 60);
+                                    time_t new_expires = token_blob.tokens[i].first_use +
+                                                         (token_blob.tokens[i].duration_minutes * 60);
 
                                     char response[512];
                                     snprintf(response, sizeof(response),
@@ -2810,12 +2920,12 @@ static void http_server_task(void *pvParameters)
                                              "\"new_expires_at\":%lld,"
                                              "\"bandwidth_down_mb\":%lu,"
                                              "\"bandwidth_up_mb\":%lu}",
-                                             active_tokens[i].token,
-                                             active_tokens[i].duration_minutes,
-                                             active_tokens[i].duration_minutes,
+                                             token_blob.tokens[i].token,
+                                             token_blob.tokens[i].duration_minutes,
+                                             token_blob.tokens[i].duration_minutes,
                                              (long long)new_expires,
-                                             active_tokens[i].bandwidth_down_mb,
-                                             active_tokens[i].bandwidth_up_mb);
+                                             token_blob.tokens[i].bandwidth_down_mb,
+                                             token_blob.tokens[i].bandwidth_up_mb);
                                     send(sock, response, strlen(response), 0);
                                     ESP_LOGI(TAG, "API: Token %s extended via API", token_to_extend);
                                     break;
@@ -2883,12 +2993,7 @@ static void http_server_task(void *pvParameters)
                 time_t now = time(NULL);
 
                 // Count active tokens
-                int active_count = 0;
-                for (int i = 0; i < token_count; i++)
-                {
-                    if (active_tokens[i].active)
-                        active_count++;
-                }
+                int active_count = token_blob.token_count;
 
                 char response[1024];
                 snprintf(response, sizeof(response),
@@ -2951,21 +3056,21 @@ static void http_server_task(void *pvParameters)
                             int offset = snprintf(response, 8192,
                                                   "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
                                                   "{\"success\":true,\"count\":%d,\"tokens\":[",
-                                                  token_count);
+                                                  token_blob.token_count);
 
                             time_t now = time(NULL);
-                            for (int i = 0; i < token_count; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active)
+                                if (token_blob.tokens[i].active)
                                 {
-                                    time_t expires_at = active_tokens[i].first_use > 0
-                                                            ? active_tokens[i].first_use + (active_tokens[i].duration_minutes * 60)
-                                                            : now + (active_tokens[i].duration_minutes * 60);
+                                    time_t expires_at = token_blob.tokens[i].first_use > 0
+                                                            ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
+                                                            : now + (token_blob.tokens[i].duration_minutes * 60);
 
                                     int remaining_sec = (int)difftime(expires_at, now);
-                                    const char *status = (active_tokens[i].first_use == 0) ? "unused"
-                                                         : (remaining_sec > 0)             ? "active"
-                                                                                           : "expired";
+                                    const char *status = (token_blob.tokens[i].first_use == 0) ? "unused"
+                                                         : (remaining_sec > 0)                 ? "active"
+                                                                                               : "expired";
 
                                     offset += snprintf(response + offset, 8192 - offset,
                                                        "%s{\"token\":\"%s\","
@@ -2982,21 +3087,21 @@ static void http_server_task(void *pvParameters)
                                                        "\"device_count\":%u,"
                                                        "\"client_macs\":[",
                                                        (i > 0) ? "," : "",
-                                                       active_tokens[i].token,
+                                                       token_blob.tokens[i].token,
                                                        status,
-                                                       active_tokens[i].duration_minutes,
-                                                       (long long)active_tokens[i].first_use,
+                                                       token_blob.tokens[i].duration_minutes,
+                                                       (long long)token_blob.tokens[i].first_use,
                                                        (long long)expires_at,
                                                        remaining_sec > 0 ? remaining_sec : 0,
-                                                       active_tokens[i].bandwidth_down_mb,
-                                                       active_tokens[i].bandwidth_up_mb,
-                                                       active_tokens[i].bandwidth_used_down,
-                                                       active_tokens[i].bandwidth_used_up,
-                                                       active_tokens[i].usage_count,
-                                                       active_tokens[i].device_count);
+                                                       token_blob.tokens[i].bandwidth_down_mb,
+                                                       token_blob.tokens[i].bandwidth_up_mb,
+                                                       token_blob.tokens[i].bandwidth_used_down,
+                                                       token_blob.tokens[i].bandwidth_used_up,
+                                                       token_blob.tokens[i].usage_count,
+                                                       token_blob.tokens[i].device_count);
 
                                     // Add MAC addresses for this token
-                                    for (int mac_idx = 0; mac_idx < active_tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                    for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                     {
                                         if (mac_idx > 0)
                                         {
@@ -3004,12 +3109,12 @@ static void http_server_task(void *pvParameters)
                                         }
                                         offset += snprintf(response + offset, 8192 - offset,
                                                            "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                                                           active_tokens[i].client_macs[mac_idx][0],
-                                                           active_tokens[i].client_macs[mac_idx][1],
-                                                           active_tokens[i].client_macs[mac_idx][2],
-                                                           active_tokens[i].client_macs[mac_idx][3],
-                                                           active_tokens[i].client_macs[mac_idx][4],
-                                                           active_tokens[i].client_macs[mac_idx][5]);
+                                                           token_blob.tokens[i].client_macs[mac_idx][0],
+                                                           token_blob.tokens[i].client_macs[mac_idx][1],
+                                                           token_blob.tokens[i].client_macs[mac_idx][2],
+                                                           token_blob.tokens[i].client_macs[mac_idx][3],
+                                                           token_blob.tokens[i].client_macs[mac_idx][4],
+                                                           token_blob.tokens[i].client_macs[mac_idx][5]);
                                     }
 
                                     offset += snprintf(response + offset, 8192 - offset, "]}");
@@ -3024,7 +3129,7 @@ static void http_server_task(void *pvParameters)
                             snprintf(response + offset, 8192 - offset, "]}");
                             send(sock, response, strlen(response), 0);
                             free(response);
-                            ESP_LOGI(TAG, "API: Listed %d tokens via API", token_count);
+                            ESP_LOGI(TAG, "API: Listed %d tokens via API", token_blob.token_count);
                         }
                         else
                         {
@@ -3083,16 +3188,16 @@ static void http_server_task(void *pvParameters)
                             bool found = false;
                             int macs_added = 0;
 
-                            for (int i = 0; i < token_count; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active && strcmp(active_tokens[i].token, token_str) == 0)
+                                if (token_blob.tokens[i].active && strcmp(token_blob.tokens[i].token, token_str) == 0)
                                 {
                                     found = true;
 
                                     // Add all client MACs from this token to blacklist
-                                    for (int j = 0; j < active_tokens[i].device_count; j++)
+                                    for (int j = 0; j < token_blob.tokens[i].device_count; j++)
                                     {
-                                        if (add_to_blacklist(active_tokens[i].client_macs[j], token_str, reason) == ESP_OK)
+                                        if (add_to_blacklist(token_blob.tokens[i].client_macs[j], token_str, reason) == ESP_OK)
                                         {
                                             macs_added++;
                                         }
@@ -3192,16 +3297,16 @@ static void http_server_task(void *pvParameters)
                             bool found = false;
                             int macs_added = 0;
 
-                            for (int i = 0; i < token_count; i++)
+                            for (int i = 0; i < token_blob.token_count; i++)
                             {
-                                if (active_tokens[i].active && strcmp(active_tokens[i].token, token_str) == 0)
+                                if (token_blob.tokens[i].active && strcmp(token_blob.tokens[i].token, token_str) == 0)
                                 {
                                     found = true;
 
                                     // Add all client MACs from this token to whitelist
-                                    for (int j = 0; j < active_tokens[i].device_count; j++)
+                                    for (int j = 0; j < token_blob.tokens[i].device_count; j++)
                                     {
-                                        if (add_to_whitelist(active_tokens[i].client_macs[j], token_str, note) == ESP_OK)
+                                        if (add_to_whitelist(token_blob.tokens[i].client_macs[j], token_str, note) == ESP_OK)
                                         {
                                             macs_added++;
                                         }
@@ -3263,28 +3368,52 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
-            // Handle GET /api/mac/list - List all blacklist and whitelist entries
+            // Handle GET /api/mac/list - List blacklist and/or whitelist entries
             if (is_api_mac_list)
             {
                 REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
-                // Parse query string for API key
+                // Parse query string for API key and optional list parameter
                 char received_key[API_KEY_LENGTH + 1] = {0};
+                char list_param[16] = "both"; // Default: return both lists
                 char *query_start = strstr(rx_buffer, "GET /api/mac/list?");
 
                 if (query_start)
                 {
                     query_start += 18; // skip "GET /api/mac/list?"
                     char *key_start = strstr(query_start, "api_key=");
+                    char *list_start = strstr(query_start, "list=");
 
                     if (key_start)
                     {
                         key_start += 8;
                         sscanf(key_start, "%32[^&\r\n ]", received_key);
 
+                        if (list_start)
+                        {
+                            list_start += 5;
+                            sscanf(list_start, "%15[^&\r\n ]", list_param);
+                        }
+
                         if (strcmp(received_key, api_key) == 0)
                         {
-                            // Build JSON response with both lists
+                            // Validate list parameter
+                            bool return_blacklist = (strcmp(list_param, "blacklist") == 0 || strcmp(list_param, "both") == 0);
+                            bool return_whitelist = (strcmp(list_param, "whitelist") == 0 || strcmp(list_param, "both") == 0);
+
+                            if (!return_blacklist && !return_whitelist)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Invalid list parameter. Use 'blacklist', 'whitelist', or 'both'\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
+                            // Build JSON response
                             char *response_buffer = (char *)malloc(8192);
                             if (response_buffer)
                             {
@@ -3292,59 +3421,72 @@ static void http_server_task(void *pvParameters)
                                                    "HTTP/1.1 200 OK\r\n"
                                                    "Content-Type: application/json\r\n"
                                                    "Connection: close\r\n\r\n"
-                                                   "{\"success\":true,\"blacklist\":[");
+                                                   "{\"success\":true");
 
-                                // Add blacklist entries
-                                bool first = true;
-                                for (int i = 0; i < blacklist_count; i++)
+                                // Add blacklist entries if requested
+                                if (return_blacklist)
                                 {
-                                    if (blacklist[i].active)
+                                    len += snprintf(response_buffer + len, 8192 - len, ",\"blacklist\":[");
+
+                                    bool first = true;
+                                    for (int i = 0; i < blacklist_blob.entry_count && i < MAX_BLACKLIST_ENTRIES; i++)
                                     {
-                                        if (!first)
-                                            len += snprintf(response_buffer + len, 8192 - len, ",");
-                                        first = false;
+                                        if (blacklist_blob.entries[i].active)
+                                        {
+                                            if (!first)
+                                                len += snprintf(response_buffer + len, 8192 - len, ",");
+                                            first = false;
 
-                                        char mac_str[18];
-                                        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                                                 blacklist[i].mac[0], blacklist[i].mac[1], blacklist[i].mac[2],
-                                                 blacklist[i].mac[3], blacklist[i].mac[4], blacklist[i].mac[5]);
+                                            char mac_str[18];
+                                            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                                     blacklist_blob.entries[i].mac[0], blacklist_blob.entries[i].mac[1], blacklist_blob.entries[i].mac[2],
+                                                     blacklist_blob.entries[i].mac[3], blacklist_blob.entries[i].mac[4], blacklist_blob.entries[i].mac[5]);
 
-                                        len += snprintf(response_buffer + len, 8192 - len,
-                                                        "{\"mac\":\"%s\",\"token\":\"%s\",\"reason\":\"%s\",\"added\":%ld}",
-                                                        mac_str, blacklist[i].token, blacklist[i].reason, (long)blacklist[i].added);
+                                            len += snprintf(response_buffer + len, 8192 - len,
+                                                            "{\"mac\":\"%s\",\"token\":\"%s\",\"reason\":\"%s\",\"added\":%ld}",
+                                                            mac_str, blacklist_blob.entries[i].token, blacklist_blob.entries[i].reason, (long)blacklist_blob.entries[i].added);
+                                        }
                                     }
+
+                                    len += snprintf(response_buffer + len, 8192 - len, "]");
                                 }
 
-                                len += snprintf(response_buffer + len, 8192 - len, "],\"whitelist\":[");
-
-                                // Add whitelist entries
-                                first = true;
-                                for (int i = 0; i < whitelist_count; i++)
+                                // Add whitelist entries if requested
+                                if (return_whitelist)
                                 {
-                                    if (whitelist[i].active)
+                                    len += snprintf(response_buffer + len, 8192 - len, ",\"whitelist\":[");
+
+                                    bool first = true;
+                                    for (int i = 0; i < whitelist_blob.entry_count && i < MAX_WHITELIST_ENTRIES; i++)
                                     {
-                                        if (!first)
-                                            len += snprintf(response_buffer + len, 8192 - len, ",");
-                                        first = false;
+                                        if (whitelist_blob.entries[i].active)
+                                        {
+                                            if (!first)
+                                                len += snprintf(response_buffer + len, 8192 - len, ",");
+                                            first = false;
 
-                                        char mac_str[18];
-                                        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                                                 whitelist[i].mac[0], whitelist[i].mac[1], whitelist[i].mac[2],
-                                                 whitelist[i].mac[3], whitelist[i].mac[4], whitelist[i].mac[5]);
+                                            char mac_str[18];
+                                            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                                     whitelist_blob.entries[i].mac[0], whitelist_blob.entries[i].mac[1], whitelist_blob.entries[i].mac[2],
+                                                     whitelist_blob.entries[i].mac[3], whitelist_blob.entries[i].mac[4], whitelist_blob.entries[i].mac[5]);
 
-                                        len += snprintf(response_buffer + len, 8192 - len,
-                                                        "{\"mac\":\"%s\",\"token\":\"%s\",\"note\":\"%s\",\"added\":%ld}",
-                                                        mac_str, whitelist[i].token, whitelist[i].note, (long)whitelist[i].added);
+                                            len += snprintf(response_buffer + len, 8192 - len,
+                                                            "{\"mac\":\"%s\",\"token\":\"%s\",\"note\":\"%s\",\"added\":%ld}",
+                                                            mac_str, whitelist_blob.entries[i].token, whitelist_blob.entries[i].note, (long)whitelist_blob.entries[i].added);
+                                        }
                                     }
+
+                                    len += snprintf(response_buffer + len, 8192 - len, "]");
                                 }
 
+                                // Add counts
                                 len += snprintf(response_buffer + len, 8192 - len,
-                                                "],\"blacklist_count\":%d,\"whitelist_count\":%d}",
-                                                blacklist_count, whitelist_count);
+                                                ",\"blacklist_count\":%d,\"whitelist_count\":%d,\"requested_list\":\"%s\"}",
+                                                blacklist_blob.entry_count, whitelist_blob.entry_count, list_param);
 
                                 send(sock, response_buffer, len, 0);
                                 free(response_buffer);
-                                ESP_LOGI(TAG, "API: Listed MAC filters (BL:%d, WL:%d)", blacklist_count, whitelist_count);
+                                ESP_LOGI(TAG, "API: Listed MAC filters (list:%s, BL:%d, WL:%d)", list_param, blacklist_blob.entry_count, whitelist_blob.entry_count);
                             }
                         }
                         else
@@ -3514,18 +3656,16 @@ static void http_server_task(void *pvParameters)
                             // Clear blacklist if requested
                             if (strcmp(list_type, "blacklist") == 0 || strcmp(list_type, "both") == 0)
                             {
-                                cleared += blacklist_count;
-                                blacklist_count = 0;
-                                memset(blacklist, 0, sizeof(blacklist));
+                                cleared += blacklist_blob.entry_count;
+                                memset(&blacklist_blob, 0, sizeof(blacklist_blob_t));
                                 save_blacklist_to_nvs();
                             }
 
                             // Clear whitelist if requested
                             if (strcmp(list_type, "whitelist") == 0 || strcmp(list_type, "both") == 0)
                             {
-                                cleared += whitelist_count;
-                                whitelist_count = 0;
-                                memset(whitelist, 0, sizeof(whitelist));
+                                cleared += whitelist_blob.entry_count;
+                                memset(&whitelist_blob, 0, sizeof(whitelist_blob_t));
                                 save_whitelist_to_nvs();
                             }
 
@@ -3800,6 +3940,40 @@ static void http_server_task(void *pvParameters)
                         }
                     }
                 }
+                close(sock);
+                continue;
+            }
+
+            // Handle admin token reset
+            if (is_admin_reset_tokens)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Reset all tokens
+                int tokens_removed = token_blob.token_count;
+                memset(&token_blob, 0, sizeof(token_blob_t));
+                save_tokens_blob_to_nvs();
+
+                update_admin_activity();
+                char response[256];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Connection: close\r\n\r\n"
+                         "{\"success\":true,\"message\":\"All tokens reset\",\"tokens_removed\":%d}",
+                         tokens_removed);
+                send(sock, response, strlen(response), 0);
+                ESP_LOGI(TAG, "Admin: Reset all tokens (%d removed)", tokens_removed);
                 close(sock);
                 continue;
             }
@@ -4443,8 +4617,10 @@ static void http_server_task(void *pvParameters)
 
             // If authenticated and NOT accessing portal pages, close connection to let traffic through to internet
             bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status ||
+                                  is_admin_login || is_admin_logout || is_admin_change_pass || is_admin_regen_key ||
+                                  is_admin_generate_token || is_admin_reset_tokens || is_admin_set_ap_ssid ||
                                   is_customer_status || is_api_token || is_api_token_disable ||
-                                  is_api_token_info || is_api_token_extend ||
+                                  is_api_token_info || is_api_token_batch_info || is_api_token_extend ||
                                   (strstr(rx_buffer, "GET / HTTP") != NULL) || // Main portal page
                                   (strstr(rx_buffer, "GET /favicon.ico") != NULL);
 
@@ -4592,13 +4768,13 @@ static void http_server_task(void *pvParameters)
                     {
                         // Find blacklist entry to get reason
                         const char *reason = "Access blocked by administrator";
-                        for (int i = 0; i < blacklist_count; i++)
+                        for (int i = 0; i < blacklist_blob.entry_count && i < MAX_BLACKLIST_ENTRIES; i++)
                         {
-                            if (blacklist[i].active && memcmp(blacklist[i].mac, client_mac, 6) == 0)
+                            if (blacklist_blob.entries[i].active && memcmp(blacklist_blob.entries[i].mac, client_mac, 6) == 0)
                             {
-                                if (strlen(blacklist[i].reason) > 0)
+                                if (strlen(blacklist_blob.entries[i].reason) > 0)
                                 {
-                                    reason = blacklist[i].reason;
+                                    reason = blacklist_blob.entries[i].reason;
                                 }
                                 break;
                             }
@@ -4737,7 +4913,9 @@ void app_main(void)
     // Load existing tokens from NVS
     load_tokens_blob_from_nvs();
 
-    // Load MAC filtering lists from NVS
+    // Initialize MAC filtering blobs and load from NVS
+    memset(&blacklist_blob, 0, sizeof(blacklist_blob_t));
+    memset(&whitelist_blob, 0, sizeof(whitelist_blob_t));
     load_blacklist_from_nvs();
     load_whitelist_from_nvs();
 
@@ -4748,7 +4926,7 @@ void app_main(void)
     load_ap_ssid();
 
     // Tokens will be created via admin panel after time sync
-    ESP_LOGI(TAG, "Loaded %d tokens from storage", token_count);
+    ESP_LOGI(TAG, "Loaded %d tokens from storage", token_blob.token_count);
 
     // Initialize TCP/IP and WiFi
     ESP_ERROR_CHECK(esp_netif_init());
@@ -4980,7 +5158,7 @@ void app_main(void)
     enable_nat_routing();
 #endif
 
-    ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_count);
+    ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_blob.token_count);
     ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
 
     // Start DNS server for captive portal redirect
@@ -5009,7 +5187,7 @@ void app_main(void)
                  routing_table_size);
 #else
         ESP_LOGI(TAG, "Status: Role=CHILD, Layer=-1, Connected=0, Tokens=%d, Auth=%d, Routing=0",
-                 token_count,
+                 token_blob.token_count,
                  authenticated_count);
 #endif
     }

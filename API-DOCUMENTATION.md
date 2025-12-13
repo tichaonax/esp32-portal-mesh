@@ -452,6 +452,149 @@ This error occurs when:
 
 ---
 
+### GET /api/token/batch_info
+Retrieve detailed information for multiple tokens in a single request. This endpoint is optimized for third-party applications that need to update token usage data efficiently. Returns the same information as `/api/token/info` but for up to 50 tokens at once.
+
+#### Request
+
+**Method:** GET
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `tokens` | string | Yes | Comma-separated list of 8-character tokens (max 50 tokens) |
+
+**Token Limits:**
+- Maximum: 50 tokens per request
+- Format: Comma-separated, no spaces (e.g., `token1,token2,token3`)
+- Invalid tokens are silently skipped (not included in response)
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/token/batch_info?api_key=abcd1234efgh5678ijkl9012mnop3456&tokens=A3K9M7P2,B7X2K9L4,C1D5E8F3"
+```
+
+**Python:**
+```python
+import requests
+
+url = "http://192.168.0.100/api/token/batch_info"
+params = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "tokens": "A3K9M7P2,B7X2K9L4,C1D5E8F3"
+}
+
+response = requests.get(url, params=params)
+print(response.json())
+```
+
+**JavaScript:**
+```javascript
+const axios = require('axios');
+
+axios.get('http://192.168.0.100/api/token/batch_info', {
+    params: {
+        api_key: 'abcd1234efgh5678ijkl9012mnop3456',
+        tokens: 'A3K9M7P2,B7X2K9L4,C1D5E8F3'
+    }
+})
+.then(response => console.log(response.data))
+.catch(error => console.error(error.response.data));
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+**Example Response:**
+```json
+{
+    "success": true,
+    "tokens": [
+        {
+            "token": "A3K9M7P2",
+            "status": "active",
+            "created": 1702123456,
+            "first_use": 1702124000,
+            "duration_minutes": 120,
+            "expires_at": 1702131200,
+            "remaining_seconds": 3600,
+            "bandwidth_down_mb": 500,
+            "bandwidth_up_mb": 100,
+            "bandwidth_used_down_mb": 150,
+            "bandwidth_used_up_mb": 25,
+            "usage_count": 12,
+            "device_count": 1,
+            "max_devices": 2,
+            "client_macs": ["AA:BB:CC:DD:EE:FF"]
+        },
+        {
+            "token": "B7X2K9L4",
+            "status": "unused",
+            "created": 1702123456,
+            "first_use": 0,
+            "duration_minutes": 60,
+            "expires_at": 1702127056,
+            "remaining_seconds": 0,
+            "bandwidth_down_mb": 0,
+            "bandwidth_up_mb": 0,
+            "bandwidth_used_down_mb": 0,
+            "bandwidth_used_up_mb": 0,
+            "usage_count": 0,
+            "device_count": 0,
+            "max_devices": 2,
+            "client_macs": []
+        }
+    ],
+    "total_requested": 3,
+    "total_found": 2
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tokens` | array | Array of token objects (same format as `/api/token/info`) |
+| `total_requested` | integer | Number of tokens requested in the query |
+| `total_found` | integer | Number of tokens that were found and included in response |
+
+**Individual Token Fields:** Same as `/api/token/info` response (see above).
+
+#### Error Responses
+
+**Too Many Tokens Requested**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Too many tokens requested (max 50)",
+    "error_code": "TOO_MANY_TOKENS",
+    "max_tokens": 50,
+    "requested": 75
+}
+```
+
+**No Tokens Specified**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "No tokens specified",
+    "error_code": "NO_TOKENS_SPECIFIED"
+}
+```
+
+**Other Errors:** Same as `/api/token` endpoint (401, 403, 400)
+
+---
+
 ### POST /api/token/extend
 Extend/renew an existing token by resetting its timer and usage counters back to zero. This gives the token a complete "fresh start" as if it was just created, using the same duration and bandwidth limits as the original token.
 
@@ -1276,7 +1419,7 @@ Same as `/api/mac/blacklist` endpoint.
 ---
 
 ### GET /api/mac/list
-Retrieve all blacklist and whitelist entries with their associated metadata.
+Retrieve blacklist and/or whitelist entries with their associated metadata. You can request both lists, or filter to show only blacklist or whitelist entries.
 
 #### Request
 
@@ -1289,35 +1432,53 @@ Retrieve all blacklist and whitelist entries with their associated metadata.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
+| `list` | string | No | Filter results: `blacklist`, `whitelist`, or `both` (default: `both`) |
 
 #### Example Requests
 
-**cURL:**
+**Get both lists (default behavior):**
 ```bash
 curl -X GET "http://192.168.0.100/api/mac/list?api_key=abcd1234efgh5678ijkl9012mnop3456"
+```
+
+**Get only blacklist:**
+```bash
+curl -X GET "http://192.168.0.100/api/mac/list?api_key=abcd1234efgh5678ijkl9012mnop3456&list=blacklist"
+```
+
+**Get only whitelist:**
+```bash
+curl -X GET "http://192.168.0.100/api/mac/list?api_key=abcd1234efgh5678ijkl9012mnop3456&list=whitelist"
 ```
 
 **Python:**
 ```python
 import requests
 
+# Get both lists
 params = {"api_key": "abcd1234efgh5678ijkl9012mnop3456"}
 response = requests.get('http://192.168.0.100/api/mac/list', params=params)
 data = response.json()
 
-print(f"Blacklist: {data['blacklist_count']} entries")
-for entry in data['blacklist']:
-    print(f"  {entry['mac']}: {entry['reason']}")
+if 'blacklist' in data:
+    print(f"Blacklist: {data['blacklist_count']} entries")
+    for entry in data['blacklist']:
+        print(f"  {entry['mac']}: {entry['reason']}")
 
-print(f"\nWhitelist: {data['whitelist_count']} entries")
-for entry in data['whitelist']:
-    print(f"  {entry['mac']}: {entry['note']}")
+if 'whitelist' in data:
+    print(f"\nWhitelist: {data['whitelist_count']} entries")
+    for entry in data['whitelist']:
+        print(f"  {entry['mac']}: {entry['note']}")
+
+# Get only blacklist
+params = {"api_key": "abcd1234efgh5678ijkl9012mnop3456", "list": "blacklist"}
+response = requests.get('http://192.168.0.100/api/mac/list', params=params)
+blacklist_data = response.json()
 ```
 
 #### Success Response
 
-**Code:** `200 OK`
-
+**Both lists (default):**
 ```json
 {
     "success": true,
@@ -1338,7 +1499,44 @@ for entry in data['whitelist']:
         }
     ],
     "blacklist_count": 1,
-    "whitelist_count": 1
+    "whitelist_count": 1,
+    "requested_list": "both"
+}
+```
+
+**Blacklist only:**
+```json
+{
+    "success": true,
+    "blacklist": [
+        {
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "token": "A3K9M7P2",
+            "reason": "Policy violation",
+            "added": 1702234567
+        }
+    ],
+    "blacklist_count": 1,
+    "whitelist_count": 1,
+    "requested_list": "blacklist"
+}
+```
+
+**Whitelist only:**
+```json
+{
+    "success": true,
+    "whitelist": [
+        {
+            "mac": "11:22:33:44:55:66",
+            "token": "B7X2K9F1",
+            "note": "Premium customer",
+            "added": 1702234890
+        }
+    ],
+    "blacklist_count": 1,
+    "whitelist_count": 1,
+    "requested_list": "whitelist"
 }
 ```
 
@@ -1346,15 +1544,28 @@ for entry in data['whitelist']:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `blacklist` | array | Array of blacklist entries |
-| `whitelist` | array | Array of whitelist entries |
+| `blacklist` | array | Array of blacklist entries (only present if requested) |
+| `whitelist` | array | Array of whitelist entries (only present if requested) |
 | `blacklist_count` | integer | Total number of blacklisted MACs |
 | `whitelist_count` | integer | Total number of whitelisted MACs |
+| `requested_list` | string | Which list was requested (`both`, `blacklist`, or `whitelist`) |
 | `mac` | string | MAC address (format: XX:XX:XX:XX:XX:XX) |
 | `token` | string | Token that was used to add this MAC |
 | `reason` | string | Blacklist reason |
 | `note` | string | Whitelist note |
 | `added` | integer | Unix timestamp when entry was added |
+
+#### Error Responses
+
+**Invalid list parameter:**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Invalid list parameter. Use 'blacklist', 'whitelist', or 'both'"
+}
+```
 
 ---
 
@@ -1649,7 +1860,8 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 **Valid API Endpoints:**
 - `POST /api/token` - Create new token
 - `POST /api/token/extend` - Reset/extend token
-- `GET /api/token/info` - Query token information
+- `GET /api/token/info` - Query single token information
+- `GET /api/token/batch_info` - Query multiple tokens information
 - `POST /api/token/disable` - Disable token
 - `GET /api/tokens/list` - List all tokens
 - `POST /api/mac/blacklist` - Block devices
@@ -1659,6 +1871,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `POST /api/mac/clear` - Clear MAC filters
 - `GET /api/uptime` - Device uptime
 - `GET /api/health` - System health metrics
+- `POST /admin/reset_tokens` - Reset all tokens (admin only)
 
 ### Handling TOKEN_NOT_FOUND
 
@@ -1859,6 +2072,81 @@ SSID: "WiFi Gratis" (Spanish)
 - **Blocked:** Requests from AP network (192.168.4.x)
 - **Reason:** Security - prevents guests from creating their own tokens
 
+---
+
+## Admin API Endpoints
+
+Admin API endpoints require an active admin session (login to dashboard) and are used for system management operations. These endpoints are not accessible via the public API key system.
+
+### POST /admin/reset_tokens
+
+**Reset all tokens in the system.** This endpoint completely clears all active tokens, resetting the token database to an empty state. Use with extreme caution as this action cannot be undone.
+
+#### Request
+
+**Method:** POST
+
+**Authentication:** Requires active admin session (login to dashboard)
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:** None required (confirmation via session authentication)
+
+#### Example Request
+
+**cURL:**
+```bash
+curl -X POST http://192.168.4.1/admin/reset_tokens \
+  -H "Cookie: session_id=your_session_cookie"
+```
+
+**Note:** This endpoint is only accessible through the admin dashboard interface, not directly via HTTP requests. The admin dashboard provides a confirmation dialog before executing this destructive operation.
+
+#### Success Response
+
+**Code:** `200 OK`
+
+**Content-Type:** `application/json`
+
+```json
+{
+    "success": true,
+    "message": "All tokens reset",
+    "tokens_removed": 42
+}
+```
+
+#### Error Responses
+
+**Session Expired**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Session expired"
+}
+```
+
+#### Security Considerations
+
+- **Destructive Operation:** Completely removes all tokens
+- **No Undo:** Cannot be reversed
+- **Admin Only:** Requires active dashboard session
+- **Confirmation Required:** Admin dashboard shows confirmation dialog
+- **Audit Logging:** Action is logged with timestamp
+
+#### Use Cases
+
+- **System Reset:** Clear all tokens during system maintenance
+- **Security Incident:** Emergency token revocation
+- **Testing:** Reset system to clean state for testing
+- **Migration:** Clear tokens before major system changes
+
+**Warning:** This operation immediately disconnects all users and invalidates all active tokens. Users will need new tokens to regain access.
+
+---
+
 ### Admin Access Rules
 - **Admin Dashboard:** Only accessible from AP network (192.168.4.x)
 - **WiFi Config:** Requires admin password
@@ -2021,20 +2309,24 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
-- **v3.2** (2025-12-11): AP SSID Customization & MAC Filtering
+- **v3.2** (2025-12-12): System Management & Bulk Operations
   - **NEW:** AP SSID Customization - Change captive portal WiFi network name via admin dashboard
   - **NEW:** MAC Address Filtering - Blacklist/whitelist device access control
   - **NEW:** `POST /api/mac/blacklist` - Block specific devices from network access
   - **NEW:** `POST /api/mac/whitelist` - Grant VIP bypass access (no token needed)
-  - **NEW:** `GET /api/mac/list` - List all MAC filtering entries
+  - **NEW:** `GET /api/mac/list` - List all MAC filtering entries (enhanced with list filtering)
   - **NEW:** `POST /api/mac/remove` - Remove MAC from blacklist/whitelist
   - **NEW:** `POST /api/mac/clear` - Clear all MAC filtering entries
+  - **NEW:** `GET /api/token/batch_info` - Query multiple tokens information (up to 50 tokens)
+  - **NEW:** `POST /admin/reset_tokens` - Admin endpoint to reset all tokens in system
   - **NEW:** Custom "Access Denied" page for blacklisted devices
   - SSID validation (1-32 printable ASCII characters)
   - NVS persistence for custom SSID (survives reboots)
   - Dynamic WiFi reconfiguration without device restart
-  - MAC filtering with mutual exclusivity (50 entries each list)
+  - MAC filtering with mutual exclusivity (200 entries each list)
   - VIP bypass for whitelisted MACs (no token redemption required)
+  - Token capacity expanded to 500 tokens (from 230)
+  - RAM optimization: Eliminated redundant active_tokens array (36KB savings)
   - Binary size: 912KB (41% free flash space remaining)
 
 - **v3.1** (2025-12-10): Bulk Token Management & Analytics
