@@ -1463,7 +1463,7 @@ data = response.json()
 if 'blacklist' in data:
     print(f"Blacklist: {data['blacklist_count']} entries")
     for entry in data['blacklist']:
-        print(f"  {entry['mac']}: {entry['reason']}")
+        print(f"  {entry['mac']}: {entry['note']}")
 
 if 'whitelist' in data:
     print(f"\nWhitelist: {data['whitelist_count']} entries")
@@ -1486,7 +1486,7 @@ blacklist_data = response.json()
         {
             "mac": "AA:BB:CC:DD:EE:FF",
             "token": "A3K9M7P2",
-            "reason": "Policy violation",
+            "note": "Policy violation - John Doe",
             "added": 1702234567
         }
     ],
@@ -1512,7 +1512,7 @@ blacklist_data = response.json()
         {
             "mac": "AA:BB:CC:DD:EE:FF",
             "token": "A3K9M7P2",
-            "reason": "Policy violation",
+            "note": "Policy violation - John Doe",
             "added": 1702234567
         }
     ],
@@ -1549,10 +1549,23 @@ blacklist_data = response.json()
 | `blacklist_count` | integer | Total number of blacklisted MACs |
 | `whitelist_count` | integer | Total number of whitelisted MACs |
 | `requested_list` | string | Which list was requested (`both`, `blacklist`, or `whitelist`) |
+
+**Blacklist Entry Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
 | `mac` | string | MAC address (format: XX:XX:XX:XX:XX:XX) |
 | `token` | string | Token that was used to add this MAC |
-| `reason` | string | Blacklist reason |
-| `note` | string | Whitelist note |
+| `reason` | string | Reason for blocking (max 31 chars) |
+| `added` | integer | Unix timestamp when entry was added |
+
+**Whitelist Entry Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mac` | string | MAC address (format: XX:XX:XX:XX:XX:XX) |
+| `token` | string | Token that was used to add this MAC |
+| `note` | string | Note about the whitelist entry (max 31 chars) |
 | `added` | integer | Unix timestamp when entry was added |
 
 #### Error Responses
@@ -1872,6 +1885,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `GET /api/uptime` - Device uptime
 - `GET /api/health` - System health metrics
 - `POST /admin/reset_tokens` - Reset all tokens (admin only)
+- `POST /admin/ota` - Upload firmware for OTA update (admin only)
 
 ### Handling TOKEN_NOT_FOUND
 
@@ -2147,6 +2161,321 @@ curl -X POST http://192.168.4.1/admin/reset_tokens \
 
 ---
 
+### POST /admin/ota
+
+**Upload and install firmware via Over-The-Air (OTA) update.** This endpoint allows administrators to update the ESP32 firmware remotely through the web interface. The update process includes validation, flashing, and automatic reboot.
+
+#### Request
+
+**Method:** POST
+
+**Authentication:** Requires active admin session (login to dashboard)
+
+**Content-Type:** `multipart/form-data`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `firmware` | file | Yes | Firmware binary file (.bin format, max 1MB) |
+
+#### File Requirements
+
+- **Format:** Must be a valid ESP32 firmware binary (.bin file) with correct magic bytes (0xE9)
+- **Size Limit:** Maximum 1MB, must fit in OTA partition with at least 64KB free space
+- **Compatibility:** Must be built for the same ESP32 model and partition layout
+- **Validation:** Automatic validation of binary format, size, and partition compatibility
+- **Integrity:** Basic binary structure validation (segment count, headers)
+
+#### Firmware Validation Process
+
+Before accepting the firmware, the system performs several validation checks:
+
+1. **Size Validation:** Ensures firmware fits in available OTA partition space
+2. **Format Validation:** Verifies ESP32 binary magic bytes and structure
+3. **Partition Compatibility:** Confirms sufficient space in target partition
+4. **Basic Integrity:** Checks for reasonable binary structure and segment counts
+
+#### Example Request
+
+**Admin Dashboard:** Use the "Firmware Update" card in the admin dashboard to upload and install firmware. The interface provides:
+- File selection with .bin validation
+- Progress bar during upload
+- Firmware validation feedback
+- Confirmation dialog before proceeding
+- Automatic reboot notification
+
+#### Success Response
+
+**Code:** `200 OK`
+
+**Content-Type:** `application/json`
+
+```json
+{
+    "success": true,
+    "message": "Firmware updated successfully. Rebooting in 5 seconds...",
+    "partition": "ota_1",
+    "size": 917504
+}
+```
+
+#### Error Responses
+
+**Firmware Validation Failed**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Firmware validation failed. Invalid or incompatible binary."
+}
+```
+
+**Invalid Firmware Size**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Invalid firmware size"
+}
+```
+
+**Session Expired**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Session expired"
+}
+```
+
+**OTA Already in Progress**
+
+**Code:** `409 Conflict`
+```json
+{
+    "success": false,
+    "error": "OTA update already in progress"
+}
+```
+
+**Invalid File Format**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "No firmware file found"
+}
+```
+
+**No OTA Partition Available**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "No OTA partition available"
+}
+```
+
+**OTA Begin Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to begin OTA: ESP_ERR_INVALID_SIZE"
+}
+```
+
+**OTA Write Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to write firmware: ESP_ERR_OTA_VALIDATE_FAILED"
+}
+```
+
+**OTA End Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to end OTA: ESP_ERR_OTA_SELECT_PARTITION"
+}
+```
+
+**Boot Partition Set Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to set boot partition: ESP_ERR_OTA_SET_BOOT_PARTITION"
+}
+```
+
+#### Process Flow
+
+1. **File Upload:** Firmware file is uploaded via multipart form data
+2. **Pre-Validation:** File size, format, and partition compatibility are validated
+3. **OTA Begin:** ESP32 OTA subsystem is initialized
+4. **Write Firmware:** Firmware data is written to the inactive OTA partition
+5. **OTA End:** Firmware integrity is validated
+6. **Set Boot Partition:** Next boot partition is set to the updated firmware
+7. **Reboot:** Device automatically reboots after 5 seconds
+
+#### Security Considerations
+
+- **Admin Only:** Requires active dashboard session
+- **File Validation:** Strict validation of file format, size, and binary structure
+- **Progress Tracking:** Real-time progress updates in admin interface
+- **Automatic Reboot:** Device reboots immediately after successful update
+- **Rollback:** Failed updates do not affect running firmware
+- **Network Dependency:** Requires stable connection during upload
+
+#### Use Cases
+
+- **Remote Updates:** Update firmware without physical access
+- **Bug Fixes:** Deploy security patches and bug fixes
+- **Feature Updates:** Add new functionality remotely
+- **Maintenance:** Regular firmware maintenance and improvements
+
+#### Important Notes
+
+- **Backup First:** Always backup current configuration before updating
+- **Stable Connection:** Ensure reliable network connection during upload
+- **Validation:** Firmware is validated before flashing to prevent bricking
+- **Automatic Recovery:** Failed updates preserve current working firmware
+- **Test Environment:** Test firmware updates in development first
+- **Version Compatibility:** Ensure firmware is compatible with current hardware
+- **Downtime:** Device will be unavailable for ~30-60 seconds during reboot
+- **Dual OTA:** System uses dual OTA partitions for safe updates
+
+---
+
+### POST /admin/ota
+
+**Upload and install firmware via Over-The-Air (OTA) update.** This endpoint accepts a firmware binary file and performs an OTA update, automatically rebooting the device upon successful installation.
+
+#### Request
+
+**Method:** POST
+
+**Authentication:** Requires active admin session (login to dashboard)
+
+**Content-Type:** `multipart/form-data`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `firmware` | file | Yes | ESP32 firmware binary (.bin file, max 1MB) |
+
+#### Example Request
+
+**HTML Form (Admin Dashboard):**
+```html
+<form enctype="multipart/form-data" method="post" action="/admin/ota">
+  <input type="file" name="firmware" accept=".bin" required>
+  <button type="submit">Upload & Update Firmware</button>
+</form>
+```
+
+**Note:** This endpoint is only accessible through the admin dashboard interface. The dashboard provides file validation, progress indication, and confirmation dialogs.
+
+#### Success Response
+
+**Code:** `200 OK`
+
+**Content-Type:** `application/json`
+
+```json
+{
+    "success": true,
+    "message": "Firmware updated successfully. Rebooting in 5 seconds...",
+    "partition": "ota_0",
+    "size": 917504
+}
+```
+
+#### Error Responses
+
+**Session Expired**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Session expired"
+}
+```
+
+**OTA Already In Progress**
+
+**Code:** `409 Conflict`
+```json
+{
+    "success": false,
+    "error": "OTA update already in progress"
+}
+```
+
+**Invalid Firmware File**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Invalid firmware size"
+}
+```
+
+**OTA Write Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to write firmware: ESP_ERR_OTA_INVALID_BOOT_PARTITION"
+}
+```
+
+#### Security Considerations
+
+- **Admin Only:** Requires active dashboard session
+- **File Validation:** Validates file size (max 1MB) and format
+- **Confirmation Required:** Admin dashboard shows warning dialog
+- **Automatic Reboot:** Device reboots immediately after successful update
+- **Audit Logging:** Action is logged with firmware size and partition info
+
+#### Use Cases
+
+- **Firmware Updates:** Deploy new features and bug fixes
+- **Security Patches:** Apply critical security updates
+- **Feature Deployment:** Roll out new capabilities
+- **Bug Fixes:** Address issues without physical access
+
+#### Important Notes
+
+- **Device Reboot:** ESP32 automatically reboots 5 seconds after successful update
+- **Network Disruption:** All connections are dropped during reboot
+- **Recovery:** If update fails, device rolls back to previous firmware
+- **File Format:** Must be valid ESP32 firmware binary (.bin)
+- **Size Limit:** Maximum 1MB firmware size
+- **Dual OTA:** Uses dual OTA partitions for safe updates
+
+---
+
+````
+
 ### Admin Access Rules
 - **Admin Dashboard:** Only accessible from AP network (192.168.4.x)
 - **WiFi Config:** Requires admin password
@@ -2309,6 +2638,29 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.4** (2025-12-13): Device Information Capture & Enhanced Abuse Tracking
+  - **NEW:** Device hostname and device type detection on token authentication
+  - **NEW:** Real-time device online status checking via DHCP lease monitoring
+  - **NEW:** Enhanced `/api/token/info` endpoint with comprehensive device details
+  - **NEW:** Expanded token partition (128KB → 160KB) to accommodate device data storage
+  - Automatic device type classification (Apple iOS, Android, Windows PC, Linux, etc.)
+  - On-demand device information retrieval with current IP and connection status
+  - Improved abuse prevention through device identification and tracking
+  - Hybrid approach: stored device info + real-time status updates
+  - Binary size: 924KB (38% free flash space remaining)
+
+- **v3.3** (2025-12-13): Over-The-Air Updates & 4MB Flash Support
+  - **NEW:** `POST /admin/ota` - Firmware upload and OTA update via admin dashboard
+  - **NEW:** Dual OTA partitions for safe firmware updates
+  - **NEW:** Firmware update UI in admin dashboard with progress indication
+  - **NEW:** 4MB flash configuration upgrade (from 2MB) for future development
+  - Automatic device reboot after successful OTA update
+  - Firmware validation (size limits, format checking)
+  - OTA progress feedback and error handling
+  - Enhanced partition table with ota_0/ota_1 partitions
+  - NVS_OTA partition for OTA metadata storage
+  - Binary size: 918KB (39% free flash space remaining)
+
 - **v3.2** (2025-12-12): System Management & Bulk Operations
   - **NEW:** AP SSID Customization - Change captive portal WiFi network name via admin dashboard
   - **NEW:** MAC Address Filtering - Blacklist/whitelist device access control

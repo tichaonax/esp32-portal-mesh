@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <inttypes.h>
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -24,7 +25,11 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_sntp.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "heartbeat.h"
 
 static const char *TAG = "esp32-mesh-portal";
@@ -32,6 +37,11 @@ static const char *TAG = "esp32-mesh-portal";
 // Time sync state
 static bool time_synced = false;
 static time_t time_sync_timestamp = 0;
+
+// OTA update state
+static bool ota_in_progress = false;
+static esp_ota_handle_t ota_handle = 0;
+static const esp_partition_t *ota_partition = NULL;
 
 // ==================== HTTP Response Constants ====================
 // Common HTTP headers
@@ -152,6 +162,12 @@ typedef struct
     uint8_t client_macs[MAX_DEVICES_PER_TOKEN][6]; // Multiple devices allowed
     uint8_t device_count;                          // Number of devices using this token
     bool active;
+
+    // Device information (hybrid approach - stored on authentication, enhanced on-demand)
+    char hostname[64];    // Device hostname from DHCP
+    char device_type[32]; // Device type (iPhone, Windows PC, etc.)
+    time_t first_seen;    // When device was first seen
+    time_t last_seen;     // When device was last seen online
 } token_info_t;
 
 // Blob structure for storing all tokens in a single NVS entry
@@ -872,6 +888,224 @@ static bool is_mac_blacklisted(const uint8_t *mac);
 static bool is_mac_whitelisted(const uint8_t *mac);
 
 // Validate token and bind to client MAC
+// Device information capture functions
+static void detect_device_type(const char *hostname, char *device_type, size_t max_len)
+{
+    if (!hostname || strlen(hostname) == 0)
+    {
+        strncpy(device_type, "Unknown", max_len);
+        return;
+    }
+
+    // iOS devices
+    if (strstr(hostname, "iPhone") || strstr(hostname, "iPad") || strstr(hostname, "iPod"))
+    {
+        strncpy(device_type, "Apple iOS", max_len);
+    }
+    // macOS devices
+    else if (strstr(hostname, "MacBook") || strstr(hostname, "iMac") || strstr(hostname, "Mac-mini"))
+    {
+        strncpy(device_type, "Apple macOS", max_len);
+    }
+    // Android devices
+    else if (strstr(hostname, "android-") || strstr(hostname, "Android") || strstr(hostname, "SM-") || strstr(hostname, "Pixel"))
+    {
+        strncpy(device_type, "Android", max_len);
+    }
+    // Windows devices
+    else if (strstr(hostname, "DESKTOP-") || strstr(hostname, "LAPTOP-") || strstr(hostname, "WIN-"))
+    {
+        strncpy(device_type, "Windows PC", max_len);
+    }
+    // Linux devices
+    else if (strstr(hostname, "ubuntu") || strstr(hostname, "linux") || strstr(hostname, "debian"))
+    {
+        strncpy(device_type, "Linux", max_len);
+    }
+    // Generic patterns
+    else if (strstr(hostname, "phone") || strstr(hostname, "mobile"))
+    {
+        strncpy(device_type, "Mobile Device", max_len);
+    }
+    else if (strstr(hostname, "laptop") || strstr(hostname, "notebook"))
+    {
+        strncpy(device_type, "Laptop", max_len);
+    }
+    else if (strstr(hostname, "desktop") || strstr(hostname, "pc"))
+    {
+        strncpy(device_type, "Desktop PC", max_len);
+    }
+    // Default to generic device
+    else
+    {
+        strncpy(device_type, "Network Device", max_len);
+    }
+}
+
+static void capture_device_info(token_info_t *token, const uint8_t *client_mac)
+{
+    time_t now = time(NULL);
+
+    // Try to get DHCP client info for hostname
+    esp_netif_pair_mac_ip_t pair;
+
+    if (ap_netif && esp_netif_dhcps_get_clients_by_mac(ap_netif, 1, &pair) == ESP_OK)
+    {
+        // Check if this MAC matches our client
+        if (memcmp(pair.mac, client_mac, 6) == 0)
+        {
+            // Get hostname from DHCP lease (if available)
+            // Note: ESP-IDF DHCP server doesn't directly expose hostname,
+            // but we can infer from common patterns or store when available
+
+            // For now, use a placeholder hostname based on MAC
+            char default_hostname[64];
+            snprintf(default_hostname, sizeof(default_hostname),
+                     "device-%02x%02x%02x",
+                     client_mac[3], client_mac[4], client_mac[5]);
+
+            // Only set hostname if not already set
+            if (strlen(token->hostname) == 0)
+            {
+                strncpy(token->hostname, default_hostname, sizeof(token->hostname) - 1);
+                detect_device_type(token->hostname, token->device_type, sizeof(token->device_type));
+            }
+
+            // Update last seen time
+            token->last_seen = now;
+
+            // Set first seen time if not set
+            if (token->first_seen == 0)
+            {
+                token->first_seen = now;
+            }
+
+            ESP_LOGI(TAG, "Device info captured: MAC=%02X:%02X:%02X:%02X:%02X:%02X, Hostname=%s, Type=%s",
+                     client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
+                     token->hostname, token->device_type);
+        }
+    }
+    else
+    {
+        // Fallback: set basic device info without DHCP data
+        if (strlen(token->hostname) == 0)
+        {
+            char fallback_hostname[64];
+            snprintf(fallback_hostname, sizeof(fallback_hostname),
+                     "device-%02x%02x%02x",
+                     client_mac[3], client_mac[4], client_mac[5]);
+            strncpy(token->hostname, fallback_hostname, sizeof(token->hostname) - 1);
+            detect_device_type(token->hostname, token->device_type, sizeof(token->device_type));
+        }
+
+        token->last_seen = now;
+        if (token->first_seen == 0)
+        {
+            token->first_seen = now;
+        }
+    }
+}
+
+static bool check_device_online(const uint8_t *client_mac, uint32_t *current_ip)
+{
+    esp_netif_pair_mac_ip_t pair;
+
+    if (!ap_netif)
+    {
+        return false;
+    }
+
+    // Get DHCP client list
+    esp_netif_dhcps_get_clients_by_mac(ap_netif, 1, &pair);
+
+    // Check if MAC is in DHCP leases (indicates device is online)
+    if (memcmp(pair.mac, client_mac, 6) == 0)
+    {
+        if (current_ip)
+        {
+            *current_ip = pair.ip.addr;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// OTA firmware validation functions
+static bool validate_esp32_binary(const uint8_t *data, size_t size)
+{
+    if (size < 4)
+    {
+        return false;
+    }
+
+    // Check ESP32 binary magic bytes (0xE9)
+    if (data[0] != 0xE9)
+    {
+        ESP_LOGW(TAG, "Invalid ESP32 binary: wrong magic byte 0x%02X (expected 0xE9)", data[0]);
+        return false;
+    }
+
+    // Basic size validation - should be reasonable for ESP32 firmware
+    if (size < 1024 || size > 2 * 1024 * 1024)
+    { // 1KB to 2MB
+        ESP_LOGW(TAG, "Invalid ESP32 binary size: %d bytes", size);
+        return false;
+    }
+
+    // Check for basic binary structure (segment count should be reasonable)
+    if (size >= 8)
+    {
+        uint8_t segment_count = data[4];
+        if (segment_count == 0 || segment_count > 16)
+        {
+            ESP_LOGW(TAG, "Invalid ESP32 binary: suspicious segment count %d", segment_count);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool validate_firmware_for_ota(const uint8_t *data, size_t size)
+{
+    // Get OTA partition info
+    const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
+    if (!ota_partition)
+    {
+        ESP_LOGE(TAG, "No OTA partition available for validation");
+        return false;
+    }
+
+    // Check if firmware fits in partition
+    if (size > ota_partition->size)
+    {
+        ESP_LOGW(TAG, "Firmware too large: %" PRIu32 " bytes > partition size %" PRIu32 " bytes", (uint32_t)size, ota_partition->size);
+        return false;
+    }
+
+    // Leave some buffer space (at least 64KB free)
+    size_t min_free_space = 64 * 1024;
+    if (size > ota_partition->size - min_free_space)
+    {
+        ESP_LOGW(TAG, "Firmware leaves insufficient space: %" PRIu32 " bytes free < %" PRIu32 " bytes minimum",
+                 (uint32_t)(ota_partition->size - size), (uint32_t)min_free_space);
+        return false;
+    }
+
+    // Validate ESP32 binary format
+    if (!validate_esp32_binary(data, size))
+    {
+        ESP_LOGW(TAG, "Firmware failed ESP32 binary validation");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Firmware validation passed: size=%" PRIu32 " bytes, partition=%s (%" PRIu32 " bytes free)",
+             (uint32_t)size, ota_partition->label, (uint32_t)(ota_partition->size - size));
+
+    return true;
+}
+
 static bool validate_token(const char *token, const uint8_t *client_mac)
 {
     // ===== MAC FILTERING CHECKS =====
@@ -973,10 +1207,15 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 // Add this MAC
                 memcpy(token_blob.tokens[i].client_macs[token_blob.tokens[i].device_count], client_mac, 6);
                 token_blob.tokens[i].device_count++;
-                ESP_LOGI(TAG, "Token %s bound to device %d: %02X:%02X:%02X:%02X:%02X:%02X",
+
+                // Capture device information for the new device
+                capture_device_info(&token_blob.tokens[i], client_mac);
+
+                ESP_LOGI(TAG, "Token %s bound to device %d: %02X:%02X:%02X:%02X:%02X:%02X (%s)",
                          token, token_blob.tokens[i].device_count,
                          client_mac[0], client_mac[1], client_mac[2],
-                         client_mac[3], client_mac[4], client_mac[5]);
+                         client_mac[3], client_mac[4], client_mac[5],
+                         token_blob.tokens[i].device_type);
             }
 
             // Increment usage count
@@ -2280,7 +2519,8 @@ static void http_server_task(void *pvParameters)
             bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
             bool is_admin_reset_tokens = (strstr(rx_buffer, "POST /admin/reset_tokens") != NULL);
             bool is_admin_set_ap_ssid = (strstr(rx_buffer, "POST /admin/set_ap_ssid") != NULL);
-            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_reset_tokens && !is_admin_set_ap_ssid);
+            bool is_admin_ota = (strstr(rx_buffer, "POST /admin/ota") != NULL);
+            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_reset_tokens && !is_admin_set_ap_ssid && !is_admin_ota);
 
             // Handle Token API endpoint
             if (is_api_token)
@@ -2591,7 +2831,7 @@ static void http_server_task(void *pvParameters)
                                                                     ? (expires_at - now)
                                                                     : 0;
 
-                                    char response[1024];
+                                    char response[2048]; // Increased buffer for device info
                                     int offset = snprintf(response, sizeof(response),
                                                           "HTTP/1.1 200 OK\r\n"
                                                           "Content-Type: application/json\r\n"
@@ -2610,7 +2850,11 @@ static void http_server_task(void *pvParameters)
                                                           "\"usage_count\":%lu,"
                                                           "\"device_count\":%u,"
                                                           "\"max_devices\":%d,"
-                                                          "\"client_macs\":[",
+                                                          "\"hostname\":\"%s\","
+                                                          "\"device_type\":\"%s\","
+                                                          "\"first_seen\":%lld,"
+                                                          "\"last_seen\":%lld,"
+                                                          "\"devices\":[",
                                                           token_blob.tokens[i].token,
                                                           is_expired ? "expired" : (is_used ? "active" : "unused"),
                                                           (long long)token_blob.tokens[i].created,
@@ -2624,23 +2868,43 @@ static void http_server_task(void *pvParameters)
                                                           token_blob.tokens[i].bandwidth_used_up,
                                                           token_blob.tokens[i].usage_count,
                                                           token_blob.tokens[i].device_count,
-                                                          MAX_DEVICES_PER_TOKEN);
+                                                          MAX_DEVICES_PER_TOKEN,
+                                                          token_blob.tokens[i].hostname,
+                                                          token_blob.tokens[i].device_type,
+                                                          (long long)token_blob.tokens[i].first_seen,
+                                                          (long long)token_blob.tokens[i].last_seen);
 
-                                    // Add MAC addresses
+                                    // Add device information for each MAC
                                     for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                     {
                                         if (mac_idx > 0)
                                         {
                                             offset += snprintf(response + offset, sizeof(response) - offset, ",");
                                         }
+
+                                        // Check if device is currently online
+                                        uint32_t current_ip = 0;
+                                        bool is_online = check_device_online(token_blob.tokens[i].client_macs[mac_idx], &current_ip);
+
                                         offset += snprintf(response + offset, sizeof(response) - offset,
-                                                           "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                           "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"online\":%s",
                                                            token_blob.tokens[i].client_macs[mac_idx][0],
                                                            token_blob.tokens[i].client_macs[mac_idx][1],
                                                            token_blob.tokens[i].client_macs[mac_idx][2],
                                                            token_blob.tokens[i].client_macs[mac_idx][3],
                                                            token_blob.tokens[i].client_macs[mac_idx][4],
-                                                           token_blob.tokens[i].client_macs[mac_idx][5]);
+                                                           token_blob.tokens[i].client_macs[mac_idx][5],
+                                                           is_online ? "true" : "false");
+
+                                        if (is_online && current_ip != 0)
+                                        {
+                                            char ip_str[16];
+                                            inet_ntop(AF_INET, &current_ip, ip_str, sizeof(ip_str));
+                                            offset += snprintf(response + offset, sizeof(response) - offset,
+                                                               ",\"current_ip\":\"%s\"", ip_str);
+                                        }
+
+                                        offset += snprintf(response + offset, sizeof(response) - offset, "}");
                                     }
 
                                     offset += snprintf(response + offset, sizeof(response) - offset, "]}");
@@ -3978,6 +4242,236 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle OTA firmware update
+            if (is_admin_ota)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                if (ota_in_progress)
+                {
+                    const char *error =
+                        "HTTP/1.1 409 Conflict\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"OTA update already in progress\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Parse multipart form data to extract firmware file
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body == NULL)
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Invalid request format\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+                body += 4; // Skip \r\n\r\n
+
+                // Look for firmware file in multipart data
+                char *firmware_start = strstr(body, "\r\n\r\n"); // End of headers, start of file data
+                if (firmware_start == NULL)
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"No firmware file found\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+                firmware_start += 4; // Skip \r\n\r\n
+
+                // Find end of firmware data (look for boundary)
+                char *boundary = strstr(rx_buffer, "boundary=");
+                if (boundary == NULL)
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"No boundary found\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+                boundary += 9; // Skip "boundary="
+                char boundary_marker[128] = {0};
+                int boundary_len = 0;
+                while (boundary[boundary_len] && boundary[boundary_len] != '\r' && boundary[boundary_len] != '\n' && boundary_len < 127)
+                {
+                    boundary_marker[boundary_len] = boundary[boundary_len];
+                    boundary_len++;
+                }
+                char full_boundary[140];
+                snprintf(full_boundary, sizeof(full_boundary), "\r\n--%s", boundary_marker);
+
+                char *firmware_end = strstr(firmware_start, full_boundary);
+                if (firmware_end == NULL)
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Could not determine firmware size\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                size_t firmware_size = firmware_end - firmware_start;
+                if (firmware_size == 0 || firmware_size > 1024 * 1024) // Max 1MB
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Invalid firmware size\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Validate firmware before proceeding with OTA
+                if (!validate_firmware_for_ota((const uint8_t *)firmware_start, firmware_size))
+                {
+                    const char *error =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Firmware validation failed. Invalid or incompatible binary.\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Start OTA update
+                ota_in_progress = true;
+                esp_err_t err;
+
+                // Get next OTA partition
+                ota_partition = esp_ota_get_next_update_partition(NULL);
+                if (ota_partition == NULL)
+                {
+                    ota_in_progress = false;
+                    const char *error =
+                        "HTTP/1.1 500 Internal Server Error\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"No OTA partition available\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Begin OTA
+                err = esp_ota_begin(ota_partition, firmware_size, &ota_handle);
+                if (err != ESP_OK)
+                {
+                    ota_in_progress = false;
+                    char error_msg[256];
+                    snprintf(error_msg, sizeof(error_msg),
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Connection: close\r\n\r\n"
+                             "{\"success\":false,\"error\":\"Failed to begin OTA: %s\"}",
+                             esp_err_to_name(err));
+                    send(sock, error_msg, strlen(error_msg), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Write firmware data
+                err = esp_ota_write(ota_handle, firmware_start, firmware_size);
+                if (err != ESP_OK)
+                {
+                    esp_ota_abort(ota_handle);
+                    ota_in_progress = false;
+                    char error_msg[256];
+                    snprintf(error_msg, sizeof(error_msg),
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Connection: close\r\n\r\n"
+                             "{\"success\":false,\"error\":\"Failed to write firmware: %s\"}",
+                             esp_err_to_name(err));
+                    send(sock, error_msg, strlen(error_msg), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // End OTA
+                err = esp_ota_end(ota_handle);
+                if (err != ESP_OK)
+                {
+                    ota_in_progress = false;
+                    char error_msg[256];
+                    snprintf(error_msg, sizeof(error_msg),
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Connection: close\r\n\r\n"
+                             "{\"success\":false,\"error\":\"Failed to end OTA: %s\"}",
+                             esp_err_to_name(err));
+                    send(sock, error_msg, strlen(error_msg), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Set boot partition
+                err = esp_ota_set_boot_partition(ota_partition);
+                if (err != ESP_OK)
+                {
+                    ota_in_progress = false;
+                    char error_msg[256];
+                    snprintf(error_msg, sizeof(error_msg),
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Connection: close\r\n\r\n"
+                             "{\"success\":false,\"error\":\"Failed to set boot partition: %s\"}",
+                             esp_err_to_name(err));
+                    send(sock, error_msg, strlen(error_msg), 0);
+                    close(sock);
+                    continue;
+                }
+
+                ota_in_progress = false;
+                update_admin_activity();
+
+                char response[512];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Connection: close\r\n\r\n"
+                         "{\"success\":true,\"message\":\"Firmware updated successfully. Rebooting in 5 seconds...\",\"partition\":\"%s\",\"size\":%d}",
+                         ota_partition->label, firmware_size);
+                send(sock, response, strlen(response), 0);
+
+                ESP_LOGI(TAG, "Admin: OTA update completed, rebooting in 5 seconds");
+
+                // Reboot after 5 seconds
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                esp_restart();
+
+                close(sock);
+                continue;
+            }
+
             // Handle AP SSID configuration
             if (is_admin_set_ap_ssid)
             {
@@ -4519,9 +5013,25 @@ static void http_server_task(void *pvParameters)
                         "<label>Current Password:</label><input type='password' id='oldPass' required>"
                         "<label>New Password:</label><input type='password' id='newPass' required>"
                         "<label>Confirm New Password:</label><input type='password' id='confirmPass' required>"
-                        "<button type='submit' class='danger'>Change Password</button></form></div>"
+                        "<button type='submit' class='danger'>Change Password</button></form></div>";
+
+                    // OTA Firmware Update card
+                    const char *ota_card =
+                        "<div class='card'><h2>🚀 Firmware Update</h2>"
+                        "<p style='color:#666;margin-bottom:15px'>Upload new firmware for over-the-air update</p>"
+                        "<form id='otaForm' enctype='multipart/form-data'>"
+                        "<label>Firmware File (.bin):</label>"
+                        "<input type='file' id='firmwareFile' accept='.bin' required style='margin-bottom:10px'>"
+                        "<div id='otaProgress' style='display:none;margin:10px 0'>"
+                        "<div style='width:100%;background:#e9ecef;border-radius:4px;height:20px'>"
+                        "<div id='progressBar' style='width:0%;height:100%;background:#007bff;border-radius:4px;transition:width 0.3s'></div>"
+                        "</div><div id='progressText' style='text-align:center;margin-top:5px'>Preparing...</div></div>"
+                        "<button type='submit' id='otaBtn'>Update Firmware</button></form>"
+                        "<div class='info-box' style='margin-top:15px'>"
+                        "<strong>⚠️ Warning:</strong> Firmware update will reboot the ESP32. Ensure you have a backup and stable connection.</div></div>"
                         "</div></div>";
                     send(sock, pass_card, strlen(pass_card), 0);
+                    send(sock, ota_card, strlen(ota_card), 0);
 
                     // JavaScript part 1
                     const char *script1 =
@@ -4563,6 +5073,25 @@ static void http_server_task(void *pvParameters)
 
                     // JavaScript part 2
                     const char *script2 =
+                        "document.getElementById('otaForm').addEventListener('submit',function(e){"
+                        "e.preventDefault();var file=document.getElementById('firmwareFile').files[0];"
+                        "if(!file){alert('Please select a firmware file');return}"
+                        "if(!file.name.endsWith('.bin')){alert('Please select a .bin file');return}"
+                        "if(file.size>1024*1024){alert('File too large (max 1MB)');return}"
+                        "if(!confirm('⚠️ FIRMWARE UPDATE WARNING ⚠️\\n\\nThis will:\\n• Upload and flash new firmware\\n• Reboot the ESP32\\n• Disconnect all users\\n\\nContinue?')){return}"
+                        "document.getElementById('otaProgress').style.display='block';"
+                        "document.getElementById('progressText').textContent='Reading file...';"
+                        "document.getElementById('otaBtn').disabled=true;"
+                        "var reader=new FileReader();reader.onload=function(){"
+                        "document.getElementById('progressText').textContent='Uploading firmware...';"
+                        "document.getElementById('progressBar').style.width='50%';"
+                        "var formData=new FormData();formData.append('firmware',file);"
+                        "fetch('/admin/ota',{method:'POST',body:formData}).then(r=>r.json()).then(d=>{"
+                        "if(d.success){document.getElementById('progressBar').style.width='100%';"
+                        "document.getElementById('progressText').textContent='Update successful! Rebooting...';"
+                        "setTimeout(()=>{alert('Firmware updated! ESP32 is rebooting. Wait 30-60 seconds then reconnect.');window.location.reload()},3000)}"
+                        "else{alert('OTA failed: '+d.error);document.getElementById('otaProgress').style.display='none';document.getElementById('otaBtn').disabled=false}}).catch(()=>{"
+                        "alert('OTA failed: Network error');document.getElementById('otaProgress').style.display='none';document.getElementById('otaBtn').disabled=false})};reader.readAsArrayBuffer(file)});"
                         "document.getElementById('passForm').addEventListener('submit',function(e){"
                         "e.preventDefault();var newP=document.getElementById('newPass').value;var confP=document.getElementById('confirmPass').value;"
                         "if(newP!==confP){alert('Passwords do not match!');return}"
@@ -4619,6 +5148,7 @@ static void http_server_task(void *pvParameters)
             bool is_portal_page = is_post_login || is_admin_page || is_admin_config || is_admin_status ||
                                   is_admin_login || is_admin_logout || is_admin_change_pass || is_admin_regen_key ||
                                   is_admin_generate_token || is_admin_reset_tokens || is_admin_set_ap_ssid ||
+                                  is_admin_ota ||
                                   is_customer_status || is_api_token || is_api_token_disable ||
                                   is_api_token_info || is_api_token_batch_info || is_api_token_extend ||
                                   (strstr(rx_buffer, "GET / HTTP") != NULL) || // Main portal page
