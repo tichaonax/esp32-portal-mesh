@@ -3,6 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -444,6 +445,20 @@ static void generate_api_key(char *key_out)
     key_out[API_KEY_LENGTH] = '\0';
 }
 
+// Sanitize string for JSON output by replacing non-printable characters
+static void sanitize_string(const char *input, char *output, size_t max_len)
+{
+    if (!input || !output || max_len == 0)
+        return;
+
+    size_t i = 0;
+    for (; i < max_len - 1 && input[i] != '\0'; i++)
+    {
+        output[i] = isprint((unsigned char)input[i]) ? input[i] : '?';
+    }
+    output[i] = '\0';
+}
+
 // Save all tokens as a single blob to NVS
 static esp_err_t save_tokens_blob_to_nvs(void)
 {
@@ -838,6 +853,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     }
 
     token_info_t new_token;
+    memset(&new_token, 0, sizeof(token_info_t)); // Initialize all fields to 0
     generate_token(new_token.token);
 
     time_t now = time(NULL);
@@ -2821,16 +2837,21 @@ static void http_server_task(void *pvParameters)
                                 {
                                     found = true;
                                     time_t now = time(NULL);
-                                    // For unused tokens, expires_at is creation + duration
-                                    // For used tokens, expires_at is first_use + duration
+                                    // expires_at is only meaningful for used tokens
                                     time_t expires_at = token_blob.tokens[i].first_use > 0
                                                             ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
-                                                            : token_blob.tokens[i].created + (token_blob.tokens[i].duration_minutes * 60);
+                                                            : 0;
                                     bool is_expired = (token_blob.tokens[i].first_use > 0 && now > expires_at);
                                     bool is_used = (token_blob.tokens[i].first_use > 0);
                                     int64_t remaining_seconds = is_used && !is_expired
                                                                     ? (expires_at - now)
                                                                     : 0;
+
+                                    // Sanitize string fields to prevent invalid JSON
+                                    char safe_hostname[64];
+                                    char safe_device_type[32];
+                                    sanitize_string(token_blob.tokens[i].hostname, safe_hostname, sizeof(safe_hostname));
+                                    sanitize_string(token_blob.tokens[i].device_type, safe_device_type, sizeof(safe_device_type));
 
                                     char response[2048]; // Increased buffer for device info
                                     int offset = snprintf(response, sizeof(response),
@@ -2870,8 +2891,8 @@ static void http_server_task(void *pvParameters)
                                                           token_blob.tokens[i].usage_count,
                                                           token_blob.tokens[i].device_count,
                                                           MAX_DEVICES_PER_TOKEN,
-                                                          token_blob.tokens[i].hostname,
-                                                          token_blob.tokens[i].device_type,
+                                                          safe_hostname,
+                                                          safe_device_type,
                                                           (long long)token_blob.tokens[i].first_seen,
                                                           (long long)token_blob.tokens[i].last_seen);
 
@@ -3050,7 +3071,7 @@ static void http_server_task(void *pvParameters)
                                         // Calculate expiration info
                                         time_t expires_at = token_blob.tokens[i].first_use > 0
                                                                 ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
-                                                                : token_blob.tokens[i].created + (token_blob.tokens[i].duration_minutes * 60);
+                                                                : 0;
                                         bool is_expired = (token_blob.tokens[i].first_use > 0 && now > expires_at);
                                         bool is_used = (token_blob.tokens[i].first_use > 0);
                                         int64_t remaining_seconds = is_used && !is_expired ? (expires_at - now) : 0;
@@ -3370,7 +3391,7 @@ static void http_server_task(void *pvParameters)
                                 {
                                     time_t expires_at = token_blob.tokens[i].first_use > 0
                                                             ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
-                                                            : now + (token_blob.tokens[i].duration_minutes * 60);
+                                                            : 0;
 
                                     int remaining_sec = (int)difftime(expires_at, now);
                                     const char *status = (token_blob.tokens[i].first_use == 0) ? "unused"
@@ -3572,13 +3593,14 @@ static void http_server_task(void *pvParameters)
                                 // Check expired tokens
                                 if (expired_only)
                                 {
-                                    time_t expires_at = token_blob.tokens[i].first_use > 0
-                                                            ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
-                                                            : now + (token_blob.tokens[i].duration_minutes * 60);
-                                    if (expires_at <= now)
+                                    if (token_blob.tokens[i].first_use > 0)
                                     {
-                                        should_purge = true;
-                                        reason = "expired";
+                                        time_t expires_at = token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60);
+                                        if (expires_at <= now)
+                                        {
+                                            should_purge = true;
+                                            reason = "expired";
+                                        }
                                     }
                                 }
                                 // Check unused tokens by age
