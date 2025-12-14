@@ -2836,6 +2836,18 @@ static void http_server_task(void *pvParameters)
                                     strcmp(token_blob.tokens[i].token, token_to_query) == 0)
                                 {
                                     found = true;
+
+                                    // Ensure device info has reasonable defaults if not set
+                                    if (strlen(token_blob.tokens[i].device_type) == 0) {
+                                        strcpy(token_blob.tokens[i].device_type, "Unknown");
+                                    }
+                                    if (token_blob.tokens[i].first_seen == 0 && token_blob.tokens[i].first_use > 0) {
+                                        token_blob.tokens[i].first_seen = token_blob.tokens[i].first_use;
+                                    }
+                                    if (token_blob.tokens[i].last_seen == 0 && token_blob.tokens[i].first_use > 0) {
+                                        token_blob.tokens[i].last_seen = token_blob.tokens[i].first_use;
+                                    }
+
                                     time_t now = time(NULL);
                                     // expires_at is only meaningful for used tokens
                                     time_t expires_at = token_blob.tokens[i].first_use > 0
