@@ -2524,6 +2524,7 @@ static void http_server_task(void *pvParameters)
             bool is_api_tokens_purge = (strstr(rx_buffer, "POST /api/tokens/purge") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
             bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
+            bool is_api_ap_info = (strstr(rx_buffer, "GET /api/ap/info") != NULL);
             bool is_api_mac_blacklist = (strstr(rx_buffer, "POST /api/mac/blacklist") != NULL);
             bool is_api_mac_whitelist = (strstr(rx_buffer, "POST /api/mac/whitelist") != NULL);
             bool is_api_mac_remove = (strstr(rx_buffer, "POST /api/mac/remove") != NULL);
@@ -3311,6 +3312,19 @@ static void http_server_task(void *pvParameters)
                          active_count,
                          MAX_TOKENS,
                          free_heap);
+                send(sock, response, strlen(response), 0);
+                close(sock);
+                continue;
+            }
+
+            // Handle AP Info API endpoint (public - no auth required for receipts)
+            if (is_api_ap_info)
+            {
+                char response[512];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
+                         "{\"success\":true,\"ap_ssid\":\"%s\"}",
+                         ap_ssid);
                 send(sock, response, strlen(response), 0);
                 close(sock);
                 continue;

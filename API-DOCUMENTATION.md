@@ -921,6 +921,58 @@ print(response.json())
 
 ---
 
+### GET /api/ap/info
+Get Access Point (AP) information including the current SSID. This endpoint does not require authentication as the AP name is public information needed for guest receipts and connection instructions.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** None required
+
+**Query Parameters:** None
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/ap/info"
+```
+
+**Python:**
+```python
+import requests
+
+response = requests.get('http://192.168.0.100/api/ap/info')
+print(response.json())
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "ap_ssid": "Portal-Guest"
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Always true for successful requests |
+| `ap_ssid` | string | Current Access Point SSID name |
+
+#### Use Cases
+- **Receipt Generation:** Include AP name in guest WiFi receipts
+- **Connection Instructions:** Display network name for guests
+- **Third-party Integration:** Allow external systems to show correct network name
+- **Dynamic Branding:** AP name can be customized per venue/location
+
+---
+
 ### GET /api/tokens/list
 Get a complete list of all active tokens in the system with their full metadata. This endpoint is essential for bulk token management, monitoring dashboards, and system auditing.
 
@@ -2042,6 +2094,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `POST /api/mac/clear` - Clear MAC filters
 - `GET /api/uptime` - Device uptime
 - `GET /api/health` - System health metrics
+- `GET /api/ap/info` - Access Point information (public)
 - `POST /admin/reset_tokens` - Reset all tokens (admin only)
 - `POST /admin/ota` - Upload firmware for OTA update (admin only)
 
@@ -2799,8 +2852,9 @@ For technical issues or feature requests, contact your system administrator or r
 - **v3.5** (2025-12-13): Token Purge API & Enhanced Filtering
   - **NEW:** `POST /api/tokens/purge` - Automated token cleanup with age/usage filtering
   - **ENHANCED:** `GET /api/tokens/list` - Added filtering parameters (status, age, usage)
+  - **NEW:** `GET /api/ap/info` - Public endpoint for AP SSID (no auth required)
   - Support for purging unused tokens, expired tokens, and tokens by age
-  - Third-party integration for automated retention policies
+  - Third-party integration for automated retention policies and receipt generation
   - Enhanced token lifecycle management
 
 - **v3.4** (2025-12-13): Device Information Capture & Enhanced Abuse Tracking
