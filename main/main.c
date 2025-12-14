@@ -2505,6 +2505,7 @@ static void http_server_task(void *pvParameters)
             bool is_api_token_batch_info = (strstr(rx_buffer, "GET /api/token/batch_info") != NULL);
             bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
             bool is_api_tokens_list = (strstr(rx_buffer, "GET /api/tokens/list") != NULL);
+            bool is_api_tokens_purge = (strstr(rx_buffer, "POST /api/tokens/purge") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
             bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
             bool is_api_mac_blacklist = (strstr(rx_buffer, "POST /api/mac/blacklist") != NULL);
@@ -3287,18 +3288,57 @@ static void http_server_task(void *pvParameters)
             {
                 REJECT_LOCAL_AP_REQUEST(sock, source_addr);
 
-                // Parse query string: /api/tokens/list?api_key=XXX
+                // Parse query string: /api/tokens/list?api_key=XXX&status=unused&min_age_minutes=60&...
                 char *query_start = strstr(rx_buffer, "GET /api/tokens/list?");
                 if (query_start != NULL)
                 {
                     query_start += 21; // skip "GET /api/tokens/list?"
                     char received_key[API_KEY_LENGTH + 1] = {0};
+                    char status_filter[16] = "all"; // Default: return all tokens
+                    uint32_t min_age_minutes = 0;
+                    uint32_t max_age_minutes = 0;
+                    bool used_only = false;
+                    bool unused_only = false;
 
+                    // Parse all query parameters
                     char *key_start = strstr(query_start, "api_key=");
+                    char *status_start = strstr(query_start, "status=");
+                    char *min_age_start = strstr(query_start, "min_age_minutes=");
+                    char *max_age_start = strstr(query_start, "max_age_minutes=");
+                    char *used_start = strstr(query_start, "used_only=");
+                    char *unused_start = strstr(query_start, "unused_only=");
+
                     if (key_start)
                     {
                         key_start += 8;
                         sscanf(key_start, "%32[^& \r\n]", received_key);
+
+                        // Parse optional filter parameters
+                        if (status_start)
+                        {
+                            status_start += 7;
+                            sscanf(status_start, "%15[^& \r\n]", status_filter);
+                        }
+                        if (min_age_start)
+                        {
+                            min_age_start += 15;
+                            sscanf(min_age_start, "%lu", &min_age_minutes);
+                        }
+                        if (max_age_start)
+                        {
+                            max_age_start += 15;
+                            sscanf(max_age_start, "%lu", &max_age_minutes);
+                        }
+                        if (used_start)
+                        {
+                            used_start += 10;
+                            used_only = (strstr(used_start, "true") != NULL);
+                        }
+                        if (unused_start)
+                        {
+                            unused_start += 12;
+                            unused_only = (strstr(unused_start, "true") != NULL);
+                        }
 
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
@@ -3320,9 +3360,10 @@ static void http_server_task(void *pvParameters)
                             int offset = snprintf(response, 8192,
                                                   "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
                                                   "{\"success\":true,\"count\":%d,\"tokens\":[",
-                                                  token_blob.token_count);
+                                                  token_blob.token_count); // This will be updated later
 
                             time_t now = time(NULL);
+                            int filtered_count = 0;
                             for (int i = 0; i < token_blob.token_count; i++)
                             {
                                 if (token_blob.tokens[i].active)
@@ -3335,6 +3376,46 @@ static void http_server_task(void *pvParameters)
                                     const char *status = (token_blob.tokens[i].first_use == 0) ? "unused"
                                                          : (remaining_sec > 0)                 ? "active"
                                                                                                : "expired";
+
+                                    // Apply filters
+                                    bool include_token = true;
+
+                                    // Status filter
+                                    if (strcmp(status_filter, "all") != 0 && strcmp(status, status_filter) != 0)
+                                    {
+                                        include_token = false;
+                                    }
+
+                                    // Used/unused filters
+                                    if (used_only && token_blob.tokens[i].first_use == 0)
+                                    {
+                                        include_token = false;
+                                    }
+                                    if (unused_only && token_blob.tokens[i].first_use != 0)
+                                    {
+                                        include_token = false;
+                                    }
+
+                                    // Age filters (based on creation time)
+                                    if (min_age_minutes > 0 || max_age_minutes > 0)
+                                    {
+                                        time_t token_age_minutes = (now - token_blob.tokens[i].created) / 60;
+                                        if (min_age_minutes > 0 && token_age_minutes < min_age_minutes)
+                                        {
+                                            include_token = false;
+                                        }
+                                        if (max_age_minutes > 0 && token_age_minutes > max_age_minutes)
+                                        {
+                                            include_token = false;
+                                        }
+                                    }
+
+                                    if (!include_token)
+                                    {
+                                        continue; // Skip this token
+                                    }
+
+                                    filtered_count++; // Count filtered tokens
 
                                     offset += snprintf(response + offset, 8192 - offset,
                                                        "%s{\"token\":\"%s\","
@@ -3390,10 +3471,183 @@ static void http_server_task(void *pvParameters)
                                 }
                             }
 
+                            // Update the count in the JSON response to reflect filtered count
+                            char count_str[16];
+                            snprintf(count_str, sizeof(count_str), "%d", filtered_count);
+                            char *count_pos = strstr(response, "\"count\":");
+                            if (count_pos)
+                            {
+                                count_pos += 8; // Skip "count":
+                                char *comma_pos = strchr(count_pos, ',');
+                                if (comma_pos)
+                                {
+                                    // Replace the old count with filtered count
+                                    memmove(count_pos, count_str, strlen(count_str));
+                                    memmove(count_pos + strlen(count_str), comma_pos, strlen(comma_pos) + 1);
+                                }
+                            }
+
                             snprintf(response + offset, 8192 - offset, "]}");
                             send(sock, response, strlen(response), 0);
                             free(response);
-                            ESP_LOGI(TAG, "API: Listed %d tokens via API", token_blob.token_count);
+                            ESP_LOGI(TAG, "API: Listed %d filtered tokens via API (from %d total)", filtered_count, token_blob.token_count);
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameter: api_key\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
+            // Handle Tokens Purge API endpoint
+            if (is_api_tokens_purge)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    bool unused_only = false;
+                    uint32_t max_age_minutes = 0;
+                    bool expired_only = false;
+
+                    // Parse: api_key=XXX&unused_only=true&max_age_minutes=XXX&expired_only=true
+                    char *key_start = strstr(body, "api_key=");
+                    char *unused_start = strstr(body, "unused_only=");
+                    char *age_start = strstr(body, "max_age_minutes=");
+                    char *expired_start = strstr(body, "expired_only=");
+
+                    if (key_start)
+                    {
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        // Parse optional parameters
+                        if (unused_start)
+                        {
+                            unused_start += 12;
+                            unused_only = (strstr(unused_start, "true") != NULL);
+                        }
+                        if (age_start)
+                        {
+                            age_start += 15;
+                            sscanf(age_start, "%lu", &max_age_minutes);
+                        }
+                        if (expired_start)
+                        {
+                            expired_start += 13;
+                            expired_only = (strstr(expired_start, "true") != NULL);
+                        }
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            time_t now = time(NULL);
+                            int purged_count = 0;
+                            char purged_tokens[512] = {0}; // Store list of purged tokens
+
+                            // Iterate through all tokens and apply purge criteria
+                            for (int i = token_blob.token_count - 1; i >= 0; i--)
+                            {
+                                if (!token_blob.tokens[i].active)
+                                    continue;
+
+                                bool should_purge = false;
+                                const char *reason = "";
+
+                                // Check expired tokens
+                                if (expired_only)
+                                {
+                                    time_t expires_at = token_blob.tokens[i].first_use > 0
+                                                            ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
+                                                            : now + (token_blob.tokens[i].duration_minutes * 60);
+                                    if (expires_at <= now)
+                                    {
+                                        should_purge = true;
+                                        reason = "expired";
+                                    }
+                                }
+                                // Check unused tokens by age
+                                else if (unused_only && max_age_minutes > 0)
+                                {
+                                    time_t token_age_minutes = (now - token_blob.tokens[i].created) / 60;
+                                    if (token_blob.tokens[i].first_use == 0 && token_age_minutes >= max_age_minutes)
+                                    {
+                                        should_purge = true;
+                                        reason = "unused_old";
+                                    }
+                                }
+                                // Check unused tokens (any age)
+                                else if (unused_only && token_blob.tokens[i].first_use == 0)
+                                {
+                                    should_purge = true;
+                                    reason = "unused";
+                                }
+                                // Check old tokens (used or unused) by age
+                                else if (max_age_minutes > 0)
+                                {
+                                    time_t token_age_minutes = (now - token_blob.tokens[i].created) / 60;
+                                    if (token_age_minutes >= max_age_minutes)
+                                    {
+                                        should_purge = true;
+                                        reason = "old";
+                                    }
+                                }
+
+                                if (should_purge)
+                                {
+                                    // Add to purged list for response
+                                    if (purged_count > 0)
+                                        strncat(purged_tokens, ",", sizeof(purged_tokens) - strlen(purged_tokens) - 1);
+                                    strncat(purged_tokens, token_blob.tokens[i].token, sizeof(purged_tokens) - strlen(purged_tokens) - 1);
+
+                                    // Disable token (same logic as disable endpoint)
+                                    token_blob.tokens[i].active = false;
+
+                                    // Compact array by shifting remaining tokens
+                                    for (int j = i; j < token_blob.token_count - 1; j++)
+                                    {
+                                        token_blob.tokens[j] = token_blob.tokens[j + 1];
+                                    }
+                                    token_blob.token_count--;
+
+                                    purged_count++;
+                                    ESP_LOGI(TAG, "API: Token %s purged (%s)", token_blob.tokens[i].token, reason);
+                                }
+                            }
+
+                            // Save updated blob to NVS if any tokens were purged
+                            if (purged_count > 0)
+                            {
+                                save_tokens_blob_to_nvs();
+                            }
+
+                            // Build response
+                            char response_buffer[1024];
+                            snprintf(response_buffer, sizeof(response_buffer),
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Type: application/json\r\n"
+                                     "Connection: close\r\n\r\n"
+                                     "{\"success\":true,\"purged_count\":%d,\"purged_tokens\":[%s]}",
+                                     purged_count,
+                                     purged_count > 0 ? purged_tokens : "");
+
+                            send(sock, response_buffer, strlen(response_buffer), 0);
+                            ESP_LOGI(TAG, "API: Purged %d tokens via API (count now: %d)", purged_count, token_blob.token_count);
                         }
                         else
                         {

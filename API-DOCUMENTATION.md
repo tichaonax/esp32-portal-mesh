@@ -935,6 +935,20 @@ Get a complete list of all active tokens in the system with their full metadata.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
+| `status` | string | No | Filter by token status: "unused", "active", "expired", or "all" (default: "all") |
+| `min_age_minutes` | integer | No | Only include tokens created at least this many minutes ago |
+| `max_age_minutes` | integer | No | Only include tokens created at most this many minutes ago |
+| `used_only` | boolean | No | If "true", only include tokens that have been used at least once |
+| `unused_only` | boolean | No | If "true", only include tokens that have never been used |
+
+**Filtering Logic:**
+- `status=all` (default): Return all active tokens
+- `status=unused/active/expired`: Return only tokens with specified status
+- `used_only=true`: Only tokens where `first_use > 0`
+- `unused_only=true`: Only tokens where `first_use = 0`
+- `min_age_minutes=N`: Only tokens created more than N minutes ago
+- `max_age_minutes=N`: Only tokens created less than N minutes ago
+- Filters can be combined for precise token selection
 
 #### Example Requests
 
@@ -977,6 +991,28 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
         });
     })
     .catch(error => console.error(error));
+```
+
+**Filtering Examples:**
+
+**Get only unused tokens:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=unused"
+```
+
+**Get tokens older than 24 hours that have never been used:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&unused_only=true&min_age_minutes=1440"
+```
+
+**Get active tokens created in the last hour:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=active&max_age_minutes=60"
+```
+
+**Get all expired tokens:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=expired"
 ```
 
 #### Success Response
@@ -1042,7 +1078,7 @@ axios.get('http://192.168.0.100/api/tokens/list', { params })
 | Field | Type | Description |
 |-------|------|-------------|
 | `success` | boolean | Always true for successful requests |
-| `count` | integer | Total number of active tokens in the system |
+| `count` | integer | Number of tokens returned (after applying filters) |
 | `tokens` | array | Array of token objects with detailed metadata |
 
 **Token Object Fields:**
@@ -1266,6 +1302,128 @@ This error is rare and indicates the device is under extreme memory pressure. If
 - **Maximum Response:** ~58KB for 230 tokens (8KB buffer, may truncate if list is very large)
 - **Response Time:** Typically 50-200ms depending on token count
 - **Rate Limiting:** Recommend 100ms minimum between requests to avoid overwhelming device
+
+---
+
+### POST /api/tokens/purge
+Purge (permanently delete) tokens based on age and usage criteria. This endpoint is designed for automated token cleanup operations, allowing third-party applications to implement retention policies.
+
+#### Request
+
+**Method:** POST
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `unused_only` | boolean | No | If true, only purge unused tokens (never redeemed) |
+| `max_age_minutes` | integer | No | Only purge tokens older than this many minutes |
+| `expired_only` | boolean | No | If true, only purge expired tokens |
+
+**Purge Logic:**
+- `unused_only=true`: Only tokens that have never been used (`first_use = 0`)
+- `max_age_minutes=N`: Only tokens created more than N minutes ago
+- `expired_only=true`: Only tokens that have exceeded their time/bandwidth limits
+- Combine parameters for precise filtering (e.g., unused tokens older than 24 hours)
+
+#### Example Requests
+
+**Purge unused tokens older than 24 hours:**
+```bash
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "unused_only=true" \
+  -d "max_age_minutes=1440"
+```
+
+**Purge all expired tokens:**
+```bash
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "expired_only=true"
+```
+
+**Purge all tokens older than 1 week (used or unused):**
+```bash
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "max_age_minutes=10080"
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "purged_count": 3,
+    "purged_tokens": ["A3K9M7P2", "B7X2K9L4", "C1D5E8F3"]
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `purged_count` | integer | Number of tokens that were purged |
+| `purged_tokens` | array | Array of token strings that were deleted |
+
+#### Use Cases
+
+**1. Daily Cleanup of Unused Short-Term Tokens**
+```bash
+# Purge unused 1-day tokens that are older than 24 hours
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=$API_KEY" \
+  -d "unused_only=true" \
+  -d "max_age_minutes=1440"
+```
+
+**2. Weekly Cleanup of All Old Tokens**
+```bash
+# Purge any token older than 7 days (used or unused)
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=$API_KEY" \
+  -d "max_age_minutes=10080"
+```
+
+**3. Emergency Cleanup of Expired Tokens**
+```bash
+# Remove all expired tokens to free up capacity
+curl -X POST http://192.168.0.100/api/tokens/purge \
+  -d "api_key=$API_KEY" \
+  -d "expired_only=true"
+```
+
+#### Error Responses
+
+**Invalid Parameters**
+
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Invalid parameter combination"
+}
+```
+
+This occurs when:
+- `unused_only=true` and `expired_only=true` (mutually exclusive)
+- `max_age_minutes` is negative or unreasonably large (>1 year)
+
+**Other Errors:** Same as `/api/token` endpoint (401, 403, 400)
+
+#### Security & Performance Notes
+
+- **Permanent Deletion:** Purged tokens cannot be recovered
+- **NVS Persistence:** Changes are immediately saved to flash storage
+- **Rate Limiting:** Recommend 1-second intervals between purge operations
+- **Memory Impact:** Purging many tokens at once may cause temporary memory pressure
+- **Logging:** All purge operations are logged to device console with token details
 
 ---
 
@@ -2638,6 +2796,13 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.5** (2025-12-13): Token Purge API & Enhanced Filtering
+  - **NEW:** `POST /api/tokens/purge` - Automated token cleanup with age/usage filtering
+  - **ENHANCED:** `GET /api/tokens/list` - Added filtering parameters (status, age, usage)
+  - Support for purging unused tokens, expired tokens, and tokens by age
+  - Third-party integration for automated retention policies
+  - Enhanced token lifecycle management
+
 - **v3.4** (2025-12-13): Device Information Capture & Enhanced Abuse Tracking
   - **NEW:** Device hostname and device type detection on token authentication
   - **NEW:** Real-time device online status checking via DHCP lease monitoring
