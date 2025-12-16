@@ -542,3 +542,107 @@ class TestTokenManagementWorkflows:
             )
             
             assert disable_response.status_code == 200
+
+    def test_bulk_token_creation(self, base_url, session, test_config):
+        """Test bulk token creation endpoint"""
+        # Test creating 3 tokens at once
+        bulk_response = session.post(
+            f"{base_url}/api/tokens/bulk_create",
+            data={
+                "api_key": test_config.API_KEY,
+                "count": 3,
+                "duration": 120,  # 2 hours
+                "bandwidth_down": 500,
+                "bandwidth_up": 100,
+                "businessId": "test-bulk-001"
+            }
+        )
+        
+        assert bulk_response.status_code == 200
+        bulk_data = bulk_response.json()
+        
+        # Verify response structure
+        assert bulk_data["success"] is True
+        assert bulk_data["tokens_created"] == 3
+        assert bulk_data["requested"] == 3
+        assert len(bulk_data["tokens"]) == 3
+        assert bulk_data["duration_minutes"] == 120
+        assert bulk_data["bandwidth_down_mb"] == 500
+        assert bulk_data["bandwidth_up_mb"] == 100
+        
+        # Verify each token has correct structure
+        created_tokens = []
+        for token_info in bulk_data["tokens"]:
+            assert "token" in token_info
+            assert "businessId" in token_info
+            assert token_info["businessId"] == "test-bulk-001"
+            assert len(token_info["token"]) == 8  # Token length
+            created_tokens.append(token_info["token"])
+        
+        # Verify tokens are actually created by querying them
+        for token in created_tokens:
+            info_response = session.get(
+                f"{base_url}/api/token/info",
+                params={
+                    "api_key": test_config.API_KEY,
+                    "token": token
+                }
+            )
+            
+            assert info_response.status_code == 200
+            token_data = info_response.json()
+            assert token_data["businessId"] == "test-bulk-001"
+            assert token_data["duration_minutes"] == 120
+            assert token_data["bandwidth_down_mb"] == 500
+            assert token_data["bandwidth_up_mb"] == 100
+
+    def test_bulk_token_creation_slot_limits(self, base_url, session, test_config):
+        """Test bulk creation respects slot limits"""
+        # First fill up most available slots
+        # Create tokens until we have very few slots left
+        created_tokens = []
+        for i in range(10):  # Create 10 tokens to reduce available slots
+            response = session.post(
+                f"{base_url}/api/token",
+                data={
+                    "api_key": test_config.API_KEY,
+                    "duration": 60,
+                    "bandwidth_down": 100,
+                    "bandwidth_up": 50
+                }
+            )
+            if response.status_code == 200:
+                created_tokens.append(response.json()["token"])
+            else:
+                break  # Stop if we hit limits
+        
+        # Now try to create more tokens than available slots
+        bulk_response = session.post(
+            f"{base_url}/api/tokens/bulk_create",
+            data={
+                "api_key": test_config.API_KEY,
+                "count": 50,  # Request many tokens
+                "duration": 30,
+                "bandwidth_down": 10,
+                "bandwidth_up": 5
+            }
+        )
+        
+        assert bulk_response.status_code == 200
+        bulk_data = bulk_response.json()
+        
+        # Should succeed but create fewer than requested
+        assert bulk_data["success"] is True
+        assert bulk_data["tokens_created"] <= bulk_data["requested"]
+        assert bulk_data["requested"] == 50
+        assert len(bulk_data["tokens"]) == bulk_data["tokens_created"]
+        
+        # Clean up created tokens
+        for token in created_tokens[-5:]:  # Clean up some tokens to restore capacity
+            session.post(
+                f"{base_url}/api/token/disable",
+                data={
+                    "api_key": test_config.API_KEY,
+                    "token": token
+                }
+            )

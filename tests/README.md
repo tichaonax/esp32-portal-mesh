@@ -177,6 +177,7 @@ The test suite uses pytest fixtures for automatic resource management:
 
 ### Token Management (Requires API Key + Uplink Network)
 - `POST /api/token` - Create new token
+- `POST /api/tokens/bulk_create` - Create multiple tokens at once
 - `GET /api/token/info` - Query token information
 - `POST /api/token/disable` - Disable/delete token
 - `POST /api/token/extend` - Extend token duration

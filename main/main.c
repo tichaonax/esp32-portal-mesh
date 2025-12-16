@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_netif.h"
@@ -169,6 +170,7 @@ typedef struct
     char device_type[32]; // Device type (iPhone, Windows PC, etc.)
     time_t first_seen;    // When device was first seen
     time_t last_seen;     // When device was last seen online
+    char businessId[37];  // Business identifier (36 chars + null, defaults to UUID)
 } token_info_t;
 
 // Blob structure for storing all tokens in a single NVS entry
@@ -588,7 +590,13 @@ static void load_tokens_blob_from_nvs(void)
 
     if (err != ESP_OK)
     {
-        ESP_LOGI(TAG, "No token blob found in NVS (%s)", esp_err_to_name(err));
+        ESP_LOGW(TAG, "No token blob found in NVS or corrupted data detected (%s)", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Starting with clean token system (all previous tokens cleared)");
+
+        // Initialize clean token blob
+        memset(&token_blob, 0, sizeof(token_blob_t));
+        token_blob.token_count = 0;
+
         nvs_close(nvs_handle);
         return;
     }
@@ -819,7 +827,8 @@ static void cleanup_expired_tokens(void);
 
 // Create new access token with parameters
 static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
-                                              uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb)
+                                              uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb,
+                                              const char *business_id)
 {
     // Check if time is valid before creating token
     if (!is_time_valid())
@@ -870,6 +879,16 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     new_token.device_count = 0;
     new_token.active = true;
 
+    // Set business ID (default if not provided)
+    if (business_id && strlen(business_id) > 0 && strlen(business_id) <= 36)
+    {
+        strcpy(new_token.businessId, business_id);
+    }
+    else
+    {
+        strcpy(new_token.businessId, "ddb03736-2f0f-4fad-8ef6-5ffa997a1454");
+    }
+
     // Add to token blob
     memcpy(&token_blob.tokens[token_blob.token_count], &new_token, sizeof(token_info_t));
     token_blob.token_count++;
@@ -896,7 +915,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
 static esp_err_t create_new_token(char *token_out)
 {
     // Default: 24 hours, unlimited bandwidth
-    return create_new_token_with_params(token_out, TOKEN_EXPIRY_HOURS * 60, 0, 0);
+    return create_new_token_with_params(token_out, TOKEN_EXPIRY_HOURS * 60, 0, 0, NULL);
 }
 
 // Forward declarations for MAC filtering functions
@@ -2310,6 +2329,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         // Note: Slow blink will be set after time sync completes (in callback)
         ESP_LOGI(TAG, "Waiting for time sync before switching to slow blink...");
     }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED)
+    {
+        ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+        ESP_LOGI(TAG, "✓ Client got IP from AP: " IPSTR " (MAC: " MACSTR ")",
+                 IP2STR(&event->ip), MAC2STR(event->mac));
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
+    {
+        wifi_event_ap_staconnected_t *connected = (wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI(TAG, "✓ Client connected to AP: " MACSTR ", AID=%d",
+                 MAC2STR(connected->mac), connected->aid);
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    {
+        wifi_event_ap_stadisconnected_t *disconnected = (wifi_event_ap_stadisconnected_t *)event_data;
+        ESP_LOGW(TAG, "✗ Client disconnected from AP: " MACSTR ", AID=%d, reason=%d",
+                 MAC2STR(disconnected->mac), disconnected->aid, disconnected->reason);
+    }
 }
 
 // Simple DNS server to redirect all queries to our captive portal
@@ -2515,13 +2552,14 @@ static void http_server_task(void *pvParameters)
             bool is_admin_config = (strstr(rx_buffer, "POST /admin/configure") != NULL);
             bool is_admin_status = (strstr(rx_buffer, "GET /admin/status") != NULL);
             bool is_customer_status = (strstr(rx_buffer, "GET /status") != NULL);
-            bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL && strstr(rx_buffer, "POST /api/token/") == NULL);
+            bool is_api_token = (strstr(rx_buffer, "POST /api/token") != NULL && strstr(rx_buffer, "POST /api/token/") == NULL && strstr(rx_buffer, "POST /api/tokens/") == NULL);
             bool is_api_token_disable = (strstr(rx_buffer, "POST /api/token/disable") != NULL);
             bool is_api_token_info = (strstr(rx_buffer, "GET /api/token/info") != NULL);
             bool is_api_token_batch_info = (strstr(rx_buffer, "GET /api/token/batch_info") != NULL);
             bool is_api_token_extend = (strstr(rx_buffer, "POST /api/token/extend") != NULL);
             bool is_api_tokens_list = (strstr(rx_buffer, "GET /api/tokens/list") != NULL);
             bool is_api_tokens_purge = (strstr(rx_buffer, "POST /api/tokens/purge") != NULL);
+            bool is_api_tokens_bulk_create = (strstr(rx_buffer, "POST /api/tokens/bulk_create") != NULL);
             bool is_api_uptime = (strstr(rx_buffer, "GET /api/uptime") != NULL);
             bool is_api_health = (strstr(rx_buffer, "GET /api/health") != NULL);
             bool is_api_ap_info = (strstr(rx_buffer, "GET /api/ap/info") != NULL);
@@ -2557,12 +2595,14 @@ static void http_server_task(void *pvParameters)
                     uint32_t duration = 0;
                     uint32_t bandwidth_down = 0;
                     uint32_t bandwidth_up = 0;
+                    char business_id[37] = {0}; // 36 chars + null
 
-                    // Parse: api_key=XXX&duration=XXX&bandwidth_down=XXX&bandwidth_up=XXX
+                    // Parse: api_key=XXX&duration=XXX&bandwidth_down=XXX&bandwidth_up=XXX&businessId=XXX
                     char *key_start = strstr(body, "api_key=");
                     char *dur_start = strstr(body, "duration=");
                     char *down_start = strstr(body, "bandwidth_down=");
                     char *up_start = strstr(body, "bandwidth_up=");
+                    char *business_start = strstr(body, "businessId=");
 
                     if (key_start && dur_start)
                     {
@@ -2622,24 +2662,45 @@ static void http_server_task(void *pvParameters)
                             sscanf(up_start, "%lu", &bandwidth_up);
                         }
 
+                        // Extract business ID (optional)
+                        if (business_start)
+                        {
+                            business_start += 11; // skip "businessId="
+                            sscanf(business_start, "%36[^&\r\n]", business_id);
+                            // Validate businessId length
+                            if (strlen(business_id) > 36)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"businessId cannot exceed 36 characters\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+                        }
+
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
                             // Create token with parameters
                             char new_token[TOKEN_LENGTH + 1];
                             esp_err_t err = create_new_token_with_params(new_token, duration,
-                                                                         bandwidth_down, bandwidth_up);
+                                                                         bandwidth_down, bandwidth_up,
+                                                                         business_id[0] ? business_id : NULL);
 
                             if (err == ESP_OK)
                             {
                                 char response[512];
+                                const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
                                 snprintf(response, sizeof(response),
                                          "HTTP/1.1 200 OK\r\n"
                                          "Content-Type: application/json\r\n"
                                          "Connection: close\r\n\r\n"
                                          "{\"success\":true,\"token\":\"%s\",\"duration_minutes\":%lu,"
-                                         "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu}",
-                                         new_token, duration, bandwidth_down, bandwidth_up);
+                                         "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,\"businessId\":\"%s\",\"ap_ssid\":\"%s\"}",
+                                         new_token, duration, bandwidth_down, bandwidth_up, used_business_id, ap_ssid);
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGI(TAG, "API: Created token %s via API", new_token);
                             }
@@ -2802,6 +2863,246 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle Bulk Token Create API endpoint
+            if (is_api_tokens_bulk_create)
+            {
+                // This endpoint is for third-party applications
+                // Must check that request comes from uplink IP (not 192.168.4.x)
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Parse POST body for API key and bulk token parameters
+                char *body = strstr(rx_buffer, "\r\n\r\n");
+                if (body != NULL)
+                {
+                    body += 4;
+
+                    char received_key[API_KEY_LENGTH + 1] = {0};
+                    uint32_t count = 0;
+                    uint32_t duration = 0;
+                    uint32_t bandwidth_down = 0;
+                    uint32_t bandwidth_up = 0;
+                    char business_id[37] = {0}; // 36 chars + null
+
+                    // Parse: api_key=XXX&count=XXX&duration=XXX&bandwidth_down=XXX&bandwidth_up=XXX&businessId=XXX
+                    char *key_start = strstr(body, "api_key=");
+                    char *count_start = strstr(body, "count=");
+                    char *dur_start = strstr(body, "duration=");
+                    char *down_start = strstr(body, "bandwidth_down=");
+                    char *up_start = strstr(body, "bandwidth_up=");
+                    char *business_start = strstr(body, "businessId=");
+
+                    if (key_start && count_start && dur_start)
+                    {
+                        // Extract API key
+                        key_start += 8;
+                        sscanf(key_start, "%32[^&\r\n]", received_key);
+
+                        // Extract count
+                        count_start += 6;
+                        if (*count_start == '-')
+                        {
+                            const char *error_response =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Count cannot be negative\"}";
+                            send(sock, error_response, strlen(error_response), 0);
+                            close(sock);
+                            continue;
+                        }
+                        sscanf(count_start, "%lu", &count);
+
+                        // Validate count limits
+                        if (count == 0 || count > 50)
+                        {
+                            const char *error_response =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Count must be between 1 and 50\"}";
+                            send(sock, error_response, strlen(error_response), 0);
+                            close(sock);
+                            continue;
+                        }
+
+                        // Extract duration (in minutes)
+                        dur_start += 9;
+                        if (*dur_start == '-')
+                        {
+                            const char *error_response =
+                                "HTTP/1.1 400 Bad Request\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"success\":false,\"error\":\"Duration cannot be negative\"}";
+                            send(sock, error_response, strlen(error_response), 0);
+                            close(sock);
+                            continue;
+                        }
+                        sscanf(dur_start, "%lu", &duration);
+
+                        // Extract bandwidth limits (optional)
+                        if (down_start)
+                        {
+                            down_start += 15;
+                            if (*down_start == '-')
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+                            sscanf(down_start, "%lu", &bandwidth_down);
+                        }
+                        if (up_start)
+                        {
+                            up_start += 13;
+                            if (*up_start == '-')
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+                            sscanf(up_start, "%lu", &bandwidth_up);
+                        }
+
+                        // Extract business ID (optional)
+                        if (business_start)
+                        {
+                            business_start += 11; // skip "businessId="
+                            sscanf(business_start, "%36[^&\r\n]", business_id);
+                            if (strlen(business_id) > 36)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"businessId cannot exceed 36 characters\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                close(sock);
+                                continue;
+                            }
+                        }
+
+                        // Validate API key
+                        if (strcmp(received_key, api_key) == 0)
+                        {
+                            // Check how many tokens we can actually create
+                            int available_slots = MAX_TOKENS - token_blob.token_count;
+                            int tokens_to_create = (count <= available_slots) ? count : available_slots;
+
+                            if (tokens_to_create == 0)
+                            {
+                                // No slots available
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 507 Insufficient Storage\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"No token slots available\",\"error_code\":\"NO_SLOTS_AVAILABLE\",\"max_tokens\":%d,\"current_tokens\":%d,\"requested\":%lu}",
+                                         MAX_TOKENS, token_blob.token_count, count);
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGW(TAG, "API: Bulk token creation denied - no slots available (%d/%d)", token_blob.token_count, MAX_TOKENS);
+                                close(sock);
+                                continue;
+                            }
+
+                            // Create tokens
+                            char created_tokens[50][TOKEN_LENGTH + 1]; // Max 50 tokens
+                            int created_count = 0;
+                            esp_err_t last_error = ESP_OK;
+
+                            for (int i = 0; i < tokens_to_create; i++)
+                            {
+                                esp_err_t err = create_new_token_with_params(created_tokens[created_count], duration,
+                                                                             bandwidth_down, bandwidth_up,
+                                                                             business_id[0] ? business_id : NULL);
+                                if (err == ESP_OK)
+                                {
+                                    created_count++;
+                                }
+                                else
+                                {
+                                    last_error = err;
+                                    break; // Stop on first error
+                                }
+                            }
+
+                            if (created_count > 0)
+                            {
+                                // Build JSON response with created tokens
+                                char response[4096]; // Large buffer for token list
+                                char *response_ptr = response;
+                                int remaining = sizeof(response);
+
+                                const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
+
+                                response_ptr += snprintf(response_ptr, remaining,
+                                                         "HTTP/1.1 200 OK\r\n"
+                                                         "Content-Type: application/json\r\n"
+                                                         "Connection: close\r\n\r\n"
+                                                         "{\"success\":true,\"tokens_created\":%d,\"requested\":%lu,\"tokens\":[",
+                                                         created_count, count);
+
+                                for (int i = 0; i < created_count; i++)
+                                {
+                                    if (i > 0)
+                                        response_ptr += snprintf(response_ptr, remaining, ",");
+                                    response_ptr += snprintf(response_ptr, remaining,
+                                                             "{\"token\":\"%s\"}",
+                                                             created_tokens[i]);
+                                }
+
+                                response_ptr += snprintf(response_ptr, remaining,
+                                                         "],\"businessId\":\"%s\",\"duration_minutes\":%lu,\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,\"ap_ssid\":\"%s\"}",
+                                                         used_business_id, duration, bandwidth_down, bandwidth_up, ap_ssid);
+
+                                send(sock, response, strlen(response), 0);
+                                ESP_LOGI(TAG, "API: Created %d bulk tokens via API (total now: %d)",
+                                         created_count, token_blob.token_count);
+                            }
+                            else
+                            {
+                                // All token creation failed
+                                const char *error_response =
+                                    "HTTP/1.1 500 Internal Server Error\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Failed to create tokens\",\"error_code\":\"CREATION_FAILED\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                ESP_LOGE(TAG, "API: Bulk token creation failed with error: %s", esp_err_to_name(last_error));
+                            }
+                        }
+                        else
+                        {
+                            send(sock, HTTP_401_INVALID_API_KEY, strlen(HTTP_401_INVALID_API_KEY), 0);
+                            char client_ip_str[16];
+                            inet_ntop(AF_INET, &source_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+                            ESP_LOGW(TAG, "API: Invalid API key attempt from %s", client_ip_str);
+                        }
+                    }
+                    else
+                    {
+                        const char *error_response =
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, count, duration)\"}";
+                        send(sock, error_response, strlen(error_response), 0);
+                    }
+                }
+                close(sock);
+                continue;
+            }
+
             // Handle Token Info API endpoint
             if (is_api_token_info)
             {
@@ -2839,13 +3140,16 @@ static void http_server_task(void *pvParameters)
                                     found = true;
 
                                     // Ensure device info has reasonable defaults if not set
-                                    if (strlen(token_blob.tokens[i].device_type) == 0) {
+                                    if (strlen(token_blob.tokens[i].device_type) == 0)
+                                    {
                                         strcpy(token_blob.tokens[i].device_type, "Unknown");
                                     }
-                                    if (token_blob.tokens[i].first_seen == 0 && token_blob.tokens[i].first_use > 0) {
+                                    if (token_blob.tokens[i].first_seen == 0 && token_blob.tokens[i].first_use > 0)
+                                    {
                                         token_blob.tokens[i].first_seen = token_blob.tokens[i].first_use;
                                     }
-                                    if (token_blob.tokens[i].last_seen == 0 && token_blob.tokens[i].first_use > 0) {
+                                    if (token_blob.tokens[i].last_seen == 0 && token_blob.tokens[i].first_use > 0)
+                                    {
                                         token_blob.tokens[i].last_seen = token_blob.tokens[i].first_use;
                                     }
 
@@ -2885,6 +3189,7 @@ static void http_server_task(void *pvParameters)
                                                           "\"usage_count\":%lu,"
                                                           "\"device_count\":%u,"
                                                           "\"max_devices\":%d,"
+                                                          "\"businessId\":\"%s\","
                                                           "\"hostname\":\"%s\","
                                                           "\"device_type\":\"%s\","
                                                           "\"first_seen\":%lld,"
@@ -2904,6 +3209,7 @@ static void http_server_task(void *pvParameters)
                                                           token_blob.tokens[i].usage_count,
                                                           token_blob.tokens[i].device_count,
                                                           MAX_DEVICES_PER_TOKEN,
+                                                          token_blob.tokens[i].businessId,
                                                           safe_hostname,
                                                           safe_device_type,
                                                           (long long)token_blob.tokens[i].first_seen,
@@ -3346,6 +3652,9 @@ static void http_server_task(void *pvParameters)
                     uint32_t max_age_minutes = 0;
                     bool used_only = false;
                     bool unused_only = false;
+                    uint32_t page_offset = 0;          // Pagination: starting index
+                    uint32_t page_limit = 100;         // Pagination: max tokens to return (default 100, max 200)
+                    char business_id_filter[37] = {0}; // Business ID filter (optional)
 
                     // Parse all query parameters
                     char *key_start = strstr(query_start, "api_key=");
@@ -3354,6 +3663,9 @@ static void http_server_task(void *pvParameters)
                     char *max_age_start = strstr(query_start, "max_age_minutes=");
                     char *used_start = strstr(query_start, "used_only=");
                     char *unused_start = strstr(query_start, "unused_only=");
+                    char *offset_start = strstr(query_start, "offset=");
+                    char *limit_start = strstr(query_start, "limit=");
+                    char *business_id_start = strstr(query_start, "business_id=");
 
                     if (key_start)
                     {
@@ -3386,6 +3698,25 @@ static void http_server_task(void *pvParameters)
                             unused_start += 12;
                             unused_only = (strstr(unused_start, "true") != NULL);
                         }
+                        if (offset_start)
+                        {
+                            offset_start += 7;
+                            sscanf(offset_start, "%lu", &page_offset);
+                        }
+                        if (limit_start)
+                        {
+                            limit_start += 6;
+                            sscanf(limit_start, "%lu", &page_limit);
+                            if (page_limit > 200)
+                                page_limit = 200; // Cap at 200 to prevent buffer overflow
+                            if (page_limit == 0)
+                                page_limit = 100; // Default to 100 if 0
+                        }
+                        if (business_id_start)
+                        {
+                            business_id_start += 12; // skip "business_id="
+                            sscanf(business_id_start, "%36[^& \r\n]", business_id_filter);
+                        }
 
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
@@ -3404,13 +3735,10 @@ static void http_server_task(void *pvParameters)
                                 continue;
                             }
 
-                            int offset = snprintf(response, 8192,
-                                                  "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
-                                                  "{\"success\":true,\"count\":%d,\"tokens\":[",
-                                                  token_blob.token_count); // This will be updated later
-
                             time_t now = time(NULL);
-                            int filtered_count = 0;
+
+                            // First pass: count total filtered tokens
+                            int total_filtered_count = 0;
                             for (int i = 0; i < token_blob.token_count; i++)
                             {
                                 if (token_blob.tokens[i].active)
@@ -3457,87 +3785,172 @@ static void http_server_task(void *pvParameters)
                                         }
                                     }
 
-                                    if (!include_token)
+                                    // Business ID filter
+                                    if (strlen(business_id_filter) > 0 && strcmp(token_blob.tokens[i].businessId, business_id_filter) != 0)
                                     {
-                                        continue; // Skip this token
+                                        include_token = false;
                                     }
 
-                                    filtered_count++; // Count filtered tokens
-
-                                    offset += snprintf(response + offset, 8192 - offset,
-                                                       "%s{\"token\":\"%s\","
-                                                       "\"status\":\"%s\","
-                                                       "\"duration_minutes\":%lu,"
-                                                       "\"first_use\":%lld,"
-                                                       "\"expires_at\":%lld,"
-                                                       "\"remaining_seconds\":%d,"
-                                                       "\"bandwidth_down_mb\":%lu,"
-                                                       "\"bandwidth_up_mb\":%lu,"
-                                                       "\"bandwidth_used_down\":%lu,"
-                                                       "\"bandwidth_used_up\":%lu,"
-                                                       "\"usage_count\":%lu,"
-                                                       "\"device_count\":%u,"
-                                                       "\"client_macs\":[",
-                                                       (i > 0) ? "," : "",
-                                                       token_blob.tokens[i].token,
-                                                       status,
-                                                       token_blob.tokens[i].duration_minutes,
-                                                       (long long)token_blob.tokens[i].first_use,
-                                                       (long long)expires_at,
-                                                       remaining_sec > 0 ? remaining_sec : 0,
-                                                       token_blob.tokens[i].bandwidth_down_mb,
-                                                       token_blob.tokens[i].bandwidth_up_mb,
-                                                       token_blob.tokens[i].bandwidth_used_down,
-                                                       token_blob.tokens[i].bandwidth_used_up,
-                                                       token_blob.tokens[i].usage_count,
-                                                       token_blob.tokens[i].device_count);
-
-                                    // Add MAC addresses for this token
-                                    for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                    if (include_token)
                                     {
-                                        if (mac_idx > 0)
-                                        {
-                                            offset += snprintf(response + offset, 8192 - offset, ",");
-                                        }
-                                        offset += snprintf(response + offset, 8192 - offset,
-                                                           "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                                                           token_blob.tokens[i].client_macs[mac_idx][0],
-                                                           token_blob.tokens[i].client_macs[mac_idx][1],
-                                                           token_blob.tokens[i].client_macs[mac_idx][2],
-                                                           token_blob.tokens[i].client_macs[mac_idx][3],
-                                                           token_blob.tokens[i].client_macs[mac_idx][4],
-                                                           token_blob.tokens[i].client_macs[mac_idx][5]);
-                                    }
-
-                                    offset += snprintf(response + offset, 8192 - offset, "]}");
-
-                                    if (offset >= 7800)
-                                    { // Leave room for closing
-                                        break;
+                                        total_filtered_count++;
                                     }
                                 }
                             }
 
-                            // Update the count in the JSON response to reflect filtered count
-                            char count_str[16];
-                            snprintf(count_str, sizeof(count_str), "%d", filtered_count);
-                            char *count_pos = strstr(response, "\"count\":");
-                            if (count_pos)
+                            // Calculate pagination info
+                            int returned_count = 0;
+                            bool has_more = false;
+                            if (page_offset < total_filtered_count)
                             {
-                                count_pos += 8; // Skip "count":
-                                char *comma_pos = strchr(count_pos, ',');
-                                if (comma_pos)
-                                {
-                                    // Replace the old count with filtered count
-                                    memmove(count_pos, count_str, strlen(count_str));
-                                    memmove(count_pos + strlen(count_str), comma_pos, strlen(comma_pos) + 1);
-                                }
+                                returned_count = (page_offset + page_limit <= total_filtered_count)
+                                                     ? page_limit
+                                                     : (total_filtered_count - page_offset);
+                                has_more = (page_offset + returned_count) < total_filtered_count;
                             }
 
-                            snprintf(response + offset, 8192 - offset, "]}");
+                            // Build response header with pagination info
+                            int response_offset = snprintf(response, 8192,
+                                                           "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
+                                                           "{\"success\":true,\"total_count\":%d,\"returned_count\":%d,"
+                                                           "\"offset\":%lu,\"limit\":%lu,\"has_more\":%s,\"tokens\":[",
+                                                           total_filtered_count, returned_count, page_offset, page_limit,
+                                                           has_more ? "true" : "false");
+
+                            // Second pass: build tokens array with pagination
+                            int current_index = 0; // Index in filtered results
+                            for (int i = 0; i < token_blob.token_count && returned_count > 0; i++)
+                            {
+                                if (!token_blob.tokens[i].active)
+                                    continue;
+
+                                time_t expires_at = token_blob.tokens[i].first_use > 0
+                                                        ? token_blob.tokens[i].first_use + (token_blob.tokens[i].duration_minutes * 60)
+                                                        : 0;
+
+                                int remaining_sec = (int)difftime(expires_at, now);
+                                const char *status = (token_blob.tokens[i].first_use == 0) ? "unused"
+                                                     : (remaining_sec > 0)                 ? "active"
+                                                                                           : "expired";
+
+                                // Apply filters (same as first pass)
+                                bool include_token = true;
+
+                                // Status filter
+                                if (strcmp(status_filter, "all") != 0 && strcmp(status, status_filter) != 0)
+                                {
+                                    include_token = false;
+                                }
+
+                                // Used/unused filters
+                                if (used_only && token_blob.tokens[i].first_use == 0)
+                                {
+                                    include_token = false;
+                                }
+                                if (unused_only && token_blob.tokens[i].first_use != 0)
+                                {
+                                    include_token = false;
+                                }
+
+                                // Age filters (based on creation time)
+                                if (min_age_minutes > 0 || max_age_minutes > 0)
+                                {
+                                    time_t token_age_minutes = (now - token_blob.tokens[i].created) / 60;
+                                    if (min_age_minutes > 0 && token_age_minutes < min_age_minutes)
+                                    {
+                                        include_token = false;
+                                    }
+                                    if (max_age_minutes > 0 && token_age_minutes > max_age_minutes)
+                                    {
+                                        include_token = false;
+                                    }
+                                }
+
+                                // Business ID filter
+                                if (strlen(business_id_filter) > 0 && strcmp(token_blob.tokens[i].businessId, business_id_filter) != 0)
+                                {
+                                    include_token = false;
+                                }
+
+                                if (!include_token)
+                                    continue;
+
+                                // Check if this token is within the pagination range
+                                if (current_index < page_offset)
+                                {
+                                    current_index++;
+                                    continue;
+                                }
+
+                                if (returned_count <= 0)
+                                    break;
+
+                                returned_count--;
+
+                                // Build token JSON
+                                response_offset += snprintf(response + response_offset, 8192 - response_offset,
+                                                            "%s{\"token\":\"%s\","
+                                                            "\"businessId\":\"%s\","
+                                                            "\"status\":\"%s\","
+                                                            "\"duration_minutes\":%lu,"
+                                                            "\"first_use\":%lld,"
+                                                            "\"expires_at\":%lld,"
+                                                            "\"remaining_seconds\":%d,"
+                                                            "\"bandwidth_down_mb\":%lu,"
+                                                            "\"bandwidth_up_mb\":%lu,"
+                                                            "\"bandwidth_used_down\":%lu,"
+                                                            "\"bandwidth_used_up\":%lu,"
+                                                            "\"usage_count\":%lu,"
+                                                            "\"device_count\":%u,"
+                                                            "\"client_macs\":[",
+                                                            (current_index > page_offset) ? "," : "",
+                                                            token_blob.tokens[i].token,
+                                                            token_blob.tokens[i].businessId,
+                                                            status,
+                                                            token_blob.tokens[i].duration_minutes,
+                                                            (long long)token_blob.tokens[i].first_use,
+                                                            (long long)expires_at,
+                                                            remaining_sec > 0 ? remaining_sec : 0,
+                                                            token_blob.tokens[i].bandwidth_down_mb,
+                                                            token_blob.tokens[i].bandwidth_up_mb,
+                                                            token_blob.tokens[i].bandwidth_used_down,
+                                                            token_blob.tokens[i].bandwidth_used_up,
+                                                            token_blob.tokens[i].usage_count,
+                                                            token_blob.tokens[i].device_count);
+
+                                // Add MAC addresses for this token
+                                for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
+                                {
+                                    if (mac_idx > 0)
+                                    {
+                                        response_offset += snprintf(response + response_offset, 8192 - response_offset, ",");
+                                    }
+                                    response_offset += snprintf(response + response_offset, 8192 - response_offset,
+                                                                "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+                                                                token_blob.tokens[i].client_macs[mac_idx][0],
+                                                                token_blob.tokens[i].client_macs[mac_idx][1],
+                                                                token_blob.tokens[i].client_macs[mac_idx][2],
+                                                                token_blob.tokens[i].client_macs[mac_idx][3],
+                                                                token_blob.tokens[i].client_macs[mac_idx][4],
+                                                                token_blob.tokens[i].client_macs[mac_idx][5]);
+                                }
+
+                                response_offset += snprintf(response + response_offset, 8192 - response_offset, "]}");
+
+                                if (response_offset >= 7800)
+                                { // Leave room for closing
+                                    break;
+                                }
+
+                                current_index++;
+                            }
+
+                            // Close the JSON response
+                            snprintf(response + response_offset, 8192 - response_offset, "]}");
                             send(sock, response, strlen(response), 0);
                             free(response);
-                            ESP_LOGI(TAG, "API: Listed %d filtered tokens via API (from %d total)", filtered_count, token_blob.token_count);
+                            ESP_LOGI(TAG, "API: Listed %d tokens via API (offset=%lu, limit=%lu, total_filtered=%d, has_more=%s)",
+                                     returned_count, page_offset, page_limit, total_filtered_count, has_more ? "true" : "false");
                         }
                         else
                         {
@@ -4471,7 +4884,7 @@ static void http_server_task(void *pvParameters)
                         sscanf(dur_start, "%lu", &duration);
 
                         char new_token[TOKEN_LENGTH + 1];
-                        esp_err_t err = create_new_token_with_params(new_token, duration, 0, 0);
+                        esp_err_t err = create_new_token_with_params(new_token, duration, 0, 0, NULL);
 
                         if (err == ESP_OK)
                         {
@@ -5869,12 +6282,32 @@ void app_main(void)
 
     // Register WiFi event handlers
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
+                                                        WIFI_EVENT_STA_START,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        WIFI_EVENT_STA_DISCONNECTED,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        WIFI_EVENT_AP_STACONNECTED,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        WIFI_EVENT_AP_STADISCONNECTED,
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_AP_STAIPASSIGNED,
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
@@ -5944,7 +6377,12 @@ void app_main(void)
 
     // Start WiFi
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "✓ WiFi started - AP: ESP32-Guest-Portal");
+    ESP_LOGI(TAG, "✓ WiFi started - AP: %s", ap_ssid);
+
+    // Log AP IP configuration
+    esp_netif_ip_info_t ap_ip_info;
+    esp_netif_get_ip_info(ap_netif, &ap_ip_info);
+    ESP_LOGI(TAG, "✓ AP IP: " IPSTR " (DHCP server active)", IP2STR(&ap_ip_info.ip));
 
     // Connect to router (non-blocking, will retry via event handler)
     ESP_LOGI(TAG, "WiFi STA starting, attempting connection to: %s", current_wifi_ssid);
@@ -5997,7 +6435,7 @@ void app_main(void)
     xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL);
 
     // Start HTTP server for captive portal with token validation (32KB stack for large HTML pages & admin panel)
-    xTaskCreate(http_server_task, "http_server", 32768, NULL, 5, NULL);
+    xTaskCreate(http_server_task, "http_server", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
 

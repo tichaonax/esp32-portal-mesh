@@ -37,6 +37,7 @@ Create a new guest access token with specified duration and bandwidth limits.
 | `duration` | integer | Yes | Token duration in minutes (min: 30, max: 43200) |
 | `bandwidth_down` | integer | **No** | Download limit in MB (0 or omitted = unlimited, **no negative values**) |
 | `bandwidth_up` | integer | **No** | Upload limit in MB (0 or omitted = unlimited, **no negative values**) |
+| `businessId` | string | **No** | Business identifier (max 36 characters, defaults to "550e8400-e29b-41d4-a716-446655440000") |
 
 **Duration Validation:**
 - Minimum: 30 minutes
@@ -107,9 +108,11 @@ axios.post('http://192.168.0.100/api/token', params)
 {
     "success": true,
     "token": "A3K9M7P2",
+    "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "duration_minutes": 120,
     "bandwidth_down_mb": 500,
-    "bandwidth_up_mb": 100
+    "bandwidth_up_mb": 100,
+    "ap_ssid": "Portal-AP"
 }
 ```
 
@@ -179,6 +182,211 @@ These specific errors occur when:
 {
     "success": false,
     "error": "Missing required parameters"
+}
+```
+
+---
+
+### POST /api/tokens/bulk_create
+Create multiple guest access tokens in a single request with specified duration and bandwidth limits.
+
+#### Request
+
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+| `count` | integer | Yes | Number of tokens to create (min: 1, max: 50) |
+| `duration` | integer | Yes | Token duration in minutes (min: 1, max: 43200) |
+| `bandwidth_down` | integer | **No** | Download limit in MB per token (0 or omitted = unlimited) |
+| `bandwidth_up` | integer | **No** | Upload limit in MB per token (0 or omitted = unlimited) |
+| `businessId` | string | **No** | Business identifier (max 36 characters, defaults to system default) |
+
+**Validation Rules:**
+- `count`: Must be between 1 and 50 inclusive
+- `duration`: Must be positive (≥ 1 minute, ≤ 43200 minutes/30 days)
+- `bandwidth_down`/`bandwidth_up`: Must be non-negative (≥ 0)
+- `businessId`: Maximum 36 characters if provided
+- All parameters must be valid numbers (no negative values)
+
+**Slot Management:**
+- If fewer slots are available than requested, creates as many tokens as possible
+- Returns actual number created vs. requested count
+- Maximum 500 total active tokens system-wide
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X POST http://192.168.0.100/api/tokens/bulk_create \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "count=5" \
+  -d "duration=720" \
+  -d "bandwidth_down=1000" \
+  -d "bandwidth_up=500" \
+  -d "businessId=my-business-001"
+```
+
+**Python:**
+```python
+import requests
+
+url = "http://192.168.0.100/api/tokens/bulk_create"
+data = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456",
+    "count": 5,  # Create 5 tokens
+    "duration": 720,  # 12 hours each
+    "bandwidth_down": 1000,  # 1GB download per token
+    "bandwidth_up": 500,  # 500MB upload per token
+    "businessId": "my-business-001"
+}
+
+response = requests.post(url, data=data)
+print(response.json())
+```
+
+**JavaScript (Node.js):**
+```javascript
+const axios = require('axios');
+
+const params = new URLSearchParams({
+    api_key: 'abcd1234efgh5678ijkl9012mnop3456',
+    count: '5',
+    duration: '720',
+    bandwidth_down: '1000',
+    bandwidth_up: '500',
+    businessId: 'my-business-001'
+});
+
+axios.post('http://192.168.0.100/api/tokens/bulk_create', params)
+    .then(response => console.log(response.data))
+    .catch(error => console.error(error.response.data));
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+**Content:**
+```json
+{
+    "success": true,
+    "tokens_created": 5,
+    "requested": 5,
+    "tokens": [
+        {
+            "token": "A3K9M7P2"
+        },
+        {
+            "token": "B8N4Q6R9"
+        },
+        {
+            "token": "C1P7S5T3"
+        },
+        {
+            "token": "D9U2V8W4"
+        },
+        {
+            "token": "E6X5Y7Z1"
+        }
+    ],
+    "businessId": "my-business-001",
+    "duration_minutes": 720,
+    "bandwidth_down_mb": 1000,
+    "bandwidth_up_mb": 500,
+    "ap_ssid": "Portal-AP"
+}
+```
+
+#### Partial Success Response
+
+When fewer tokens are created than requested (due to slot limitations):
+
+**Code:** `200 OK`
+
+**Content:**
+```json
+{
+    "success": true,
+    "tokens_created": 3,
+    "requested": 10,
+    "tokens": [
+        {
+            "token": "A3K9M7P2"
+        },
+        {
+            "token": "B8N4Q6R9"
+        },
+        {
+            "token": "C1P7S5T3"
+        }
+    ],
+    "businessId": "ddb03736-2f0f-4fad-8ef6-5ffa997a1454",
+    "duration_minutes": 120,
+    "bandwidth_down_mb": 0,
+    "bandwidth_up_mb": 0,
+    "ap_ssid": "Portal-AP"
+}
+```
+
+#### Error Responses
+
+**Invalid API Key**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Invalid API key"
+}
+```
+
+**Request from AP Network**
+
+**Code:** `403 Forbidden`
+```json
+{
+    "error": "API only accessible from uplink network"
+}
+```
+
+**Invalid Parameters**
+
+**Code:** `400 Bad Request`
+
+Possible error messages:
+- `"Count must be between 1 and 50"`
+- `"Count cannot be negative"`
+- `"Duration cannot be negative"`
+- `"Bandwidth cannot be negative"`
+- `"businessId cannot exceed 36 characters"`
+- `"Missing required parameters (api_key, count, duration)"`
+
+**No Token Slots Available**
+
+**Code:** `507 Insufficient Storage`
+```json
+{
+    "success": false,
+    "error": "No token slots available",
+    "error_code": "NO_SLOTS_AVAILABLE",
+    "max_tokens": 500,
+    "current_tokens": 500,
+    "requested": 10
+}
+```
+
+**Token Creation Failed**
+
+**Code:** `500 Internal Server Error`
+```json
+{
+    "success": false,
+    "error": "Failed to create tokens",
+    "error_code": "CREATION_FAILED"
 }
 ```
 
@@ -350,6 +558,7 @@ axios.get('http://192.168.0.100/api/token/info', {
 {
     "success": true,
     "token": "A3K9M7P2",
+    "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "status": "unused",
     "created": 1702123456,
     "first_use": 0,
@@ -372,6 +581,7 @@ axios.get('http://192.168.0.100/api/token/info', {
 {
     "success": true,
     "token": "A3K9M7P2",
+    "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "status": "active",
     "created": 1702123456,
     "first_use": 1702124000,
@@ -394,6 +604,7 @@ axios.get('http://192.168.0.100/api/token/info', {
 {
     "success": true,
     "token": "B7X2K9L4",
+    "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "status": "active",
     "created": 1702123456,
     "first_use": 1702124000,
@@ -415,6 +626,8 @@ axios.get('http://192.168.0.100/api/token/info', {
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `token` | string | The 8-character token string |
+| `businessId` | string | Business identifier for token segregation |
 | `status` | string | Token status: "unused", "active", or "expired" |
 | `created` | integer | Unix timestamp when token was created |
 | `first_use` | integer | Unix timestamp when first used (0 if unused) |
@@ -988,14 +1201,27 @@ Get a complete list of all active tokens in the system with their full metadata.
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
 | `status` | string | No | Filter by token status: "unused", "active", "expired", or "all" (default: "all") |
+| `business_id` | string | No | Filter by business identifier (exact match) |
 | `min_age_minutes` | integer | No | Only include tokens created at least this many minutes ago |
 | `max_age_minutes` | integer | No | Only include tokens created at most this many minutes ago |
 | `used_only` | boolean | No | If "true", only include tokens that have been used at least once |
 | `unused_only` | boolean | No | If "true", only include tokens that have never been used |
+| `offset` | integer | No | Pagination offset: starting index (default: 0) |
+| `limit` | integer | No | Maximum tokens per page (default: 100, max: 200) |
+| `offset` | integer | No | Pagination: starting index for results (default: 0) |
+| `limit` | integer | No | Pagination: maximum tokens to return (default: 100, max: 200) |
+
+**Pagination:**
+- Use `offset` and `limit` to retrieve large token lists in chunks
+- `offset=0, limit=100` returns first 100 tokens
+- `offset=100, limit=100` returns next 100 tokens
+- Response includes `total_count`, `returned_count`, `has_more` for pagination control
+- Maximum `limit` is 200 tokens per request to prevent buffer overflow
 
 **Filtering Logic:**
 - `status=all` (default): Return all active tokens
 - `status=unused/active/expired`: Return only tokens with specified status
+- `business_id=UUID`: Return only tokens with matching business identifier
 - `used_only=true`: Only tokens where `first_use > 0`
 - `unused_only=true`: Only tokens where `first_use = 0`
 - `min_age_minutes=N`: Only tokens created more than N minutes ago
@@ -1020,7 +1246,9 @@ params = {
 response = requests.get('http://192.168.0.100/api/tokens/list', params=params)
 data = response.json()
 
-print(f"Total tokens: {data['count']}")
+print(f"Total tokens: {data['total_count']}")
+print(f"Returned tokens: {data['returned_count']}")
+print(f"Has more: {data['has_more']}")
 for token in data['tokens']:
     print(f"Token: {token['token']}, Status: {token['status']}, "
           f"Duration: {token['duration_minutes']} min")
@@ -1037,7 +1265,9 @@ const params = {
 axios.get('http://192.168.0.100/api/tokens/list', { params })
     .then(response => {
         const data = response.data;
-        console.log(`Total tokens: ${data.count}`);
+        console.log(`Total tokens: ${data.total_count}`);
+        console.log(`Returned tokens: ${data.returned_count}`);
+        console.log(`Has more: ${data.has_more}`);
         data.tokens.forEach(token => {
             console.log(`${token.token}: ${token.status}, ${token.duration_minutes}min`);
         });
@@ -1057,6 +1287,11 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
 curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&unused_only=true&min_age_minutes=1440"
 ```
 
+**Get tokens for a specific business:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&business_id=550e8400-e29b-41d4-a716-446655440000"
+```
+
 **Get active tokens created in the last hour:**
 ```bash
 curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=active&max_age_minutes=60"
@@ -1067,6 +1302,57 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
 curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=expired"
 ```
 
+**Pagination Examples:**
+
+**Get first 50 unused tokens:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=unused&limit=50"
+```
+
+**Get next 50 unused tokens (after first page):**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl9012mnop3456&status=unused&offset=50&limit=50"
+```
+
+**Python script to fetch all unused tokens:**
+```python
+import requests
+
+def get_all_unused_tokens(base_url, api_key):
+    all_tokens = []
+    offset = 0
+    limit = 100
+    
+    while True:
+        params = {
+            "api_key": api_key,
+            "status": "unused",
+            "offset": offset,
+            "limit": limit
+        }
+        
+        response = requests.get(f"{base_url}/api/tokens/list", params=params)
+        data = response.json()
+        
+        if not data["success"]:
+            raise Exception(f"API error: {data}")
+        
+        all_tokens.extend(data["tokens"])
+        
+        if not data["has_more"]:
+            break
+            
+        offset += limit
+    
+    return all_tokens
+
+# Usage
+base_url = "http://192.168.0.100"
+api_key = "abcd1234efgh5678ijkl9012mnop3456"
+unused_tokens = get_all_unused_tokens(base_url, api_key)
+print(f"Found {len(unused_tokens)} unused tokens")
+```
+
 #### Success Response
 
 **Code:** `200 OK`
@@ -1074,10 +1360,15 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
 ```json
 {
     "success": true,
-    "count": 3,
+    "total_count": 250,
+    "returned_count": 100,
+    "offset": 0,
+    "limit": 100,
+    "has_more": true,
     "tokens": [
         {
             "token": "A3K9M7P2",
+            "businessId": "550e8400-e29b-41d4-a716-446655440000",
             "status": "active",
             "duration_minutes": 120,
             "first_use": 1702345678,
@@ -1090,36 +1381,6 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
             "usage_count": 2,
             "device_count": 2,
             "client_macs": ["AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"]
-        },
-        {
-            "token": "TT5N25GG",
-            "status": "unused",
-            "duration_minutes": 30,
-            "first_use": 0,
-            "expires_at": 0,
-            "remaining_seconds": 0,
-            "bandwidth_down_mb": 0,
-            "bandwidth_up_mb": 0,
-            "bandwidth_used_down": 0,
-            "bandwidth_used_up": 0,
-            "usage_count": 0,
-            "device_count": 0,
-            "client_macs": []
-        },
-        {
-            "token": "X8R2D4F1",
-            "status": "expired",
-            "duration_minutes": 60,
-            "first_use": 1702340000,
-            "expires_at": 1702343600,
-            "remaining_seconds": 0,
-            "bandwidth_down_mb": 1000,
-            "bandwidth_up_mb": 250,
-            "bandwidth_used_down": 890,
-            "bandwidth_used_up": 220,
-            "usage_count": 5,
-            "device_count": 1,
-            "client_macs": ["77:88:99:AA:BB:CC"]
         }
     ]
 }
@@ -1130,7 +1391,11 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
 | Field | Type | Description |
 |-------|------|-------------|
 | `success` | boolean | Always true for successful requests |
-| `count` | integer | Number of tokens returned (after applying filters) |
+| `total_count` | integer | Total number of tokens matching filters (across all pages) |
+| `returned_count` | integer | Number of tokens returned in this response |
+| `offset` | integer | Pagination offset used for this request |
+| `limit` | integer | Pagination limit used for this request |
+| `has_more` | boolean | True if more tokens are available beyond current page |
 | `tokens` | array | Array of token objects with detailed metadata |
 
 **Token Object Fields:**
@@ -1138,6 +1403,7 @@ curl -X GET "http://192.168.0.100/api/tokens/list?api_key=abcd1234efgh5678ijkl90
 | Field | Type | Description |
 |-------|------|-------------|
 | `token` | string | 8-character token code |
+| `businessId` | string | Business identifier for token segregation |
 | `status` | string | Token status: "unused" (never used), "active" (in use), "expired" (time/bandwidth exceeded) |
 | `duration_minutes` | integer | Token duration from creation (30-43200 minutes) |
 | `first_use` | integer | Unix timestamp of first use (0 = never used) |
@@ -2082,6 +2348,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 
 **Valid API Endpoints:**
 - `POST /api/token` - Create new token
+- `POST /api/tokens/bulk_create` - Create multiple tokens
 - `POST /api/token/extend` - Reset/extend token
 - `GET /api/token/info` - Query single token information
 - `GET /api/token/batch_info` - Query multiple tokens information
@@ -2883,6 +3150,7 @@ For technical issues or feature requests, contact your system administrator or r
 - **v3.2** (2025-12-12): System Management & Bulk Operations
   - **NEW:** AP SSID Customization - Change captive portal WiFi network name via admin dashboard
   - **NEW:** MAC Address Filtering - Blacklist/whitelist device access control
+  - **NEW:** `POST /api/tokens/bulk_create` - Create multiple tokens in single request (1-50 tokens)
   - **NEW:** `POST /api/mac/blacklist` - Block specific devices from network access
   - **NEW:** `POST /api/mac/whitelist` - Grant VIP bypass access (no token needed)
   - **NEW:** `GET /api/mac/list` - List all MAC filtering entries (enhanced with list filtering)
