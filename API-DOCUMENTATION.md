@@ -2312,15 +2312,19 @@ temporary_block(
 
 All API endpoints may return the following standard error codes:
 
-| Error Code | HTTP Status | Description | Resolution |
-|------------|-------------|-------------|------------|
-| `TOKEN_NOT_FOUND` | 404 | Token doesn't exist or has been disabled | Check token spelling, verify it wasn't disabled, or create a new token |
-| `ENDPOINT_NOT_FOUND` | 404 | Invalid API endpoint | Verify URL path matches documented endpoints exactly |
-| N/A (Invalid API key) | 401 | API key is incorrect | Verify API key from admin dashboard, regenerate if needed |
-| N/A (Forbidden) | 403 | Request from guest network | Make API calls from uplink network only |
-| N/A (Bad Request) | 400 | Missing or invalid parameters | Check required parameters and value formats |
-| N/A (Duration negative) | 400 | Duration parameter is negative | Use positive values: 30 ≤ duration ≤ 43200 |
-| N/A (Bandwidth negative) | 400 | Bandwidth parameter is negative | Use positive values or omit parameter for unlimited |
+| Error Code | HTTP Status | Description | Resolution | Retry? |
+|------------|-------------|-------------|------------|--------|
+| `SERVER_BUSY` | 503 | Server processing another request | Wait and retry after delay in `Retry-After` header | **Yes** (5s) |
+| `TOKEN_NOT_FOUND` | 404 | Token doesn't exist or has been disabled | Check token spelling, verify it wasn't disabled, or create a new token | No |
+| `ENDPOINT_NOT_FOUND` | 404 | Invalid API endpoint | Verify URL path matches documented endpoints exactly | No |
+| `NO_SLOTS_AVAILABLE` | 507 | Maximum token limit reached | Clean up expired tokens or increase capacity | No |
+| `CREATION_FAILED` | 500 | Failed to create token in memory | Check system resources, retry operation | Maybe |
+| `STORAGE_FAILED` | 500 | Failed to persist tokens to NVS | Check storage health, retry operation | Yes |
+| N/A (Invalid API key) | 401 | API key is incorrect | Verify API key from admin dashboard, regenerate if needed | No |
+| N/A (Forbidden) | 403 | Request from guest network | Make API calls from uplink network only | No |
+| N/A (Bad Request) | 400 | Missing or invalid parameters | Check required parameters and value formats | No |
+| N/A (Duration negative) | 400 | Duration parameter is negative | Use positive values: 30 ≤ duration ≤ 43200 | No |
+| N/A (Bandwidth negative) | 400 | Bandwidth parameter is negative | Use positive values or omit parameter for unlimited | No |
 
 ### Handling ENDPOINT_NOT_FOUND
 
@@ -2395,6 +2399,174 @@ def extend_token_with_fallback(api_key, token):
         print(f"Error: {e}")
         return None
 ```
+
+### Handling SERVER_BUSY (503)
+
+The ESP32 processes token operations sequentially to ensure data integrity. When a request arrives while another operation is in progress, the server returns a `503 Service Unavailable` response.
+
+**When This Occurs:**
+- During bulk token creation (creating 50 tokens may take 1-3 seconds)
+- During token disable/extend/purge operations
+- When administrative token reset is in progress
+
+**Response Headers:**
+- `Retry-After: 5` - Number of seconds to wait before retrying
+
+**Response Body:**
+```json
+{
+  "success": false,
+  "error": "Server busy processing tokens",
+  "error_code": "SERVER_BUSY",
+  "retry_after": 5
+}
+```
+
+**Client Implementation - REQUIRED:**
+
+All clients **must** implement retry logic for 503 responses. Here are examples in different languages:
+
+**Python with Retry Logic:**
+```python
+import requests
+import time
+
+def create_token_with_retry(api_key, duration, bandwidth_down, bandwidth_up, max_retries=3):
+    """Create token with automatic retry on 503"""
+    url = "http://192.168.0.100/api/token"
+    data = {
+        "api_key": api_key,
+        "duration": duration,
+        "bandwidth_down": bandwidth_down,
+        "bandwidth_up": bandwidth_up
+    }
+
+    for attempt in range(max_retries):
+        response = requests.post(url, data=data)
+
+        if response.status_code == 503:
+            # Server busy - extract retry delay
+            retry_after = int(response.headers.get('Retry-After', 5))
+            data = response.json()
+            print(f"Server busy (attempt {attempt + 1}/{max_retries}), "
+                  f"retrying in {retry_after} seconds...")
+            time.sleep(retry_after)
+            continue
+
+        # Success or other error - return result
+        return response.json()
+
+    # All retries exhausted
+    raise Exception(f"Server busy after {max_retries} attempts")
+
+# Usage
+try:
+    result = create_token_with_retry(
+        api_key="your_api_key",
+        duration=120,
+        bandwidth_down=500,
+        bandwidth_up=100
+    )
+    print(f"Token created: {result['token']}")
+except Exception as e:
+    print(f"Failed: {e}")
+```
+
+**JavaScript/Node.js with Retry Logic:**
+```javascript
+async function createTokenWithRetry(apiKey, duration, bandwidthDown, bandwidthUp, maxRetries = 3) {
+    const url = "http://192.168.0.100/api/token";
+    const params = new URLSearchParams({
+        api_key: apiKey,
+        duration: duration,
+        bandwidth_down: bandwidthDown,
+        bandwidth_up: bandwidthUp
+    });
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: params
+        });
+
+        if (response.status === 503) {
+            const retryAfter = parseInt(response.headers.get('Retry-After') || '5');
+            const data = await response.json();
+            console.log(`Server busy (attempt ${attempt + 1}/${maxRetries}), ` +
+                       `retrying in ${retryAfter} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+            continue;
+        }
+
+        // Success or other error
+        return await response.json();
+    }
+
+    throw new Error(`Server busy after ${maxRetries} attempts`);
+}
+
+// Usage
+try {
+    const result = await createTokenWithRetry("your_api_key", 120, 500, 100);
+    console.log(`Token created: ${result.token}`);
+} catch (error) {
+    console.error(`Failed: ${error.message}`);
+}
+```
+
+**cURL with Retry (Bash Script):**
+```bash
+#!/bin/bash
+
+API_KEY="your_api_key"
+URL="http://192.168.0.100/api/token"
+MAX_RETRIES=3
+
+for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
+    response=$(curl -s -w "\n%{http_code}" -X POST "$URL" \
+        -d "api_key=$API_KEY" \
+        -d "duration=120" \
+        -d "bandwidth_down=500" \
+        -d "bandwidth_up=100")
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" = "503" ]; then
+        echo "Server busy (attempt $attempt/$MAX_RETRIES), retrying in 5 seconds..."
+        sleep 5
+        continue
+    fi
+
+    echo "$body"
+    exit 0
+done
+
+echo "Error: Server busy after $MAX_RETRIES attempts"
+exit 1
+```
+
+**Best Practices for 503 Handling:**
+
+1. **Always Retry:** 503 is a temporary condition - implement automatic retry
+2. **Respect Retry-After:** Use the header value (typically 5 seconds)
+3. **Limit Retries:** Maximum 3 attempts recommended to avoid infinite loops
+4. **Log Occurrences:** Track 503 frequency to identify peak usage times
+5. **User Feedback:** Show "Processing, please wait..." during retries
+6. **Exponential Backoff (Optional):** For high-traffic scenarios, increase delay on each retry
+
+**When to Investigate:**
+
+- **Frequent 503s:** If you receive 503 responses on >10% of requests, consider:
+  - Implementing client-side request queuing
+  - Spacing out bulk operations
+  - Checking for multiple concurrent clients
+
+- **Always 503:** If all requests return 503, check:
+  - Another process might have deadlocked the system
+  - Device may need restart
+  - Check device logs via serial monitor
 
 ---
 
@@ -2959,8 +3131,32 @@ Before accepting the firmware, the system performs several validation checks:
 - **WiFi Config:** Requires admin password
 - **API Endpoints:** Require admin session login
 
-## Rate Limiting
-Currently no rate limiting is implemented. Consider implementing rate limiting in your application layer if needed.
+## Rate Limiting and Concurrency
+
+### Concurrency Control
+The ESP32 processes token operations **sequentially** using mutex-based concurrency control:
+
+- **Single Operation at a Time:** Only one token modification request (create, bulk create, disable, extend, purge, reset) is processed at any given time
+- **Automatic Rejection:** Concurrent requests return `503 Service Unavailable` with `Retry-After: 5` header
+- **Client Retry Required:** Clients must implement retry logic (see [Handling SERVER_BUSY](#handling-server_busy-503))
+
+### Performance Characteristics
+
+| Operation | Typical Duration | Concurrent Request Handling |
+|-----------|------------------|----------------------------|
+| Single token creation | <100ms | Returns 503 to concurrent requests |
+| Bulk create (10 tokens) | ~500ms | Returns 503 to concurrent requests |
+| Bulk create (50 tokens) | 1-3 seconds | Returns 503 to concurrent requests |
+| Token disable/extend | <100ms | Returns 503 to concurrent requests |
+| Token purge | 100ms-1s | Returns 503 to concurrent requests |
+| Admin reset | <200ms | Returns 503 to concurrent requests |
+
+### Application-Level Rate Limiting
+While the device doesn't enforce rate limiting, consider implementing these strategies in your application:
+
+1. **Client-Side Queueing:** Serialize requests before sending to the ESP32
+2. **Request Batching:** Use bulk_create instead of multiple single token requests
+3. **Backoff Strategy:** Implement exponential backoff on repeated 503 responses
 
 ## Best Practices
 
@@ -2980,21 +3176,29 @@ Currently no rate limiting is implemented. Consider implementing rate limiting i
 7. **Device Health:** Use `/api/health` to monitor token capacity usage and system resources
 
 ### Error Handling
-1. **Retry Logic:** Implement exponential backoff for failures
-2. **Validate Responses:** Always check `success` field
-3. **Log Errors:** Keep track of API failures for debugging
-4. **Handle TOKEN_NOT_FOUND:** Design graceful fallbacks when tokens are unavailable:
+1. **Handle 503 Server Busy (CRITICAL):** Always implement retry logic for 503 responses
+   - Retry after delay specified in `Retry-After` header (typically 5 seconds)
+   - Maximum 3 retry attempts recommended
+   - See detailed examples in [Handling SERVER_BUSY](#handling-server_busy-503) section
+2. **Retry Logic:** Implement exponential backoff for 500-level errors and network failures
+3. **Validate Responses:** Always check `success` field before using response data
+4. **Log Errors:** Keep track of API failures for debugging and monitoring
+5. **Handle TOKEN_NOT_FOUND:** Design graceful fallbacks when tokens are unavailable:
    - For info queries: Notify user token is invalid
    - For disable: Treat as success (already disabled)
    - For extend: Offer to create new token instead
-5. **Network Errors:** Handle connection timeouts and network issues gracefully
+6. **Network Errors:** Handle connection timeouts and network issues gracefully
+7. **Monitor 503 Frequency:** If >10% of requests return 503, implement client-side queuing
 
 ### API Integration
-1. **Check Before Extend:** Use `/api/token/info` to verify token exists before extending
-2. **Batch Operations:** If managing many tokens, implement queuing to avoid overwhelming the device
-3. **Cache API Key:** Load API key once at startup, not on every request
-4. **Status Monitoring:** Poll `/api/token/info` periodically for active subscriptions
-5. **Database Sync:** Store token-to-customer mappings in your database for subscription management
+1. **Implement 503 Retry Logic:** This is **mandatory** - all clients must handle 503 responses (see examples above)
+2. **Check Before Extend:** Use `/api/token/info` to verify token exists before extending
+3. **Use Bulk Create:** For multiple tokens, use `/api/tokens/bulk_create` instead of repeated single requests
+4. **Client-Side Queuing:** Implement request queuing to serialize operations and avoid 503 responses
+5. **Cache API Key:** Load API key once at startup, not on every request
+6. **Status Monitoring:** Poll `/api/token/info` periodically for active subscriptions
+7. **Database Sync:** Store token-to-customer mappings in your database for subscription management
+8. **Space Out Operations:** For high-volume scenarios, add small delays between bulk operations
 
 ## Example Integration
 

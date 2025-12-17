@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_sntp.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
@@ -182,6 +183,9 @@ typedef struct
 
 static token_blob_t token_blob;
 
+// Mutex for protecting token blob modifications
+static SemaphoreHandle_t token_blob_mutex = NULL;
+
 // Remove redundant active_tokens array - work directly with token_blob.tokens
 // static token_info_t active_tokens[MAX_TOKENS]; // REMOVED - saves 36KB RAM
 // static int token_count = 0; // REMOVED - use token_blob.token_count instead
@@ -292,7 +296,6 @@ static void add_authenticated_client(uint32_t client_ip, const uint8_t *mac)
             authenticated_clients[i].auth_time = time(NULL);
             authenticated_clients[i].active = true;
             authenticated_count++;
-            ESP_LOGI(TAG, "✓ Client authenticated: " IPSTR, IP2STR((esp_ip4_addr_t *)&client_ip));
             return;
         }
     }
@@ -472,11 +475,15 @@ static esp_err_t save_tokens_blob_to_nvs(void)
         return err;
     }
 
-    // Copy current token_blob.tokens to token_blob (already in sync)
-    // memcpy(token_blob.tokens, active_tokens, sizeof(active_tokens)); // REMOVED
+    // Calculate actual size needed (only save active tokens, not entire 500-token array)
+    // This prevents NVS space exhaustion: 500 tokens * 200 bytes = 100KB is too much!
+    size_t blob_size = sizeof(int) + (token_blob.token_count * sizeof(token_info_t));
 
-    // Save entire token blob
-    err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, sizeof(token_blob_t));
+    ESP_LOGI(TAG, "DEBUG: Saving %d tokens, blob size: %d bytes (vs full array: %d bytes)",
+             token_blob.token_count, blob_size, sizeof(token_blob_t));
+
+    // Save only the active portion of the token blob
+    err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, blob_size);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Error saving token blob to NVS: %s", esp_err_to_name(err));
@@ -528,7 +535,9 @@ static esp_err_t save_tokens_blob_to_nvs(void)
                          nvs_stats.used_entries, nvs_stats.free_entries, nvs_stats.total_entries);
             }
 
-            err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, sizeof(token_blob_t));
+            // Retry with only active tokens (same calculation as above)
+            size_t retry_blob_size = sizeof(int) + (token_blob.token_count * sizeof(token_info_t));
+            err = nvs_set_blob(nvs_handle, "token_blob", &token_blob, retry_blob_size);
             if (err == ESP_OK)
             {
                 err = nvs_commit(nvs_handle);
@@ -822,10 +831,68 @@ static bool is_valid_ssid(const char *ssid)
     return true;
 }
 
-// Forward declaration for cleanup function (needed by create_new_token_with_params)
+// Forward declarations for cleanup functions (needed by create_new_token_with_params)
+static void cleanup_expired_tokens_internal(void);
 static void cleanup_expired_tokens(void);
 
-// Create new access token with parameters
+// Internal function: Add token to blob in memory (NO NVS save)
+// Caller must hold token_blob_mutex
+static esp_err_t add_token_to_blob(token_info_t *new_token, uint32_t duration_minutes,
+                                    uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb,
+                                    const char *business_id)
+{
+    // Validate duration
+    if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
+    {
+        ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)",
+                 duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Check token limit
+    if (token_blob.token_count >= MAX_TOKENS)
+    {
+        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
+                 token_blob.token_count, MAX_TOKENS);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create token in memory
+    memset(new_token, 0, sizeof(token_info_t));
+    generate_token(new_token->token);
+
+    time_t now = time(NULL);
+    new_token->created = now;
+    new_token->first_use = 0;
+    new_token->last_use = 0;
+    new_token->duration_minutes = duration_minutes;
+    new_token->bandwidth_down_mb = bandwidth_down_mb;
+    new_token->bandwidth_up_mb = bandwidth_up_mb;
+    new_token->bandwidth_used_down = 0;
+    new_token->bandwidth_used_up = 0;
+    new_token->usage_count = 0;
+    memset(new_token->client_macs, 0, sizeof(new_token->client_macs));
+    new_token->device_count = 0;
+    new_token->active = true;
+
+    // Set business ID (default if not provided)
+    if (business_id && strlen(business_id) > 0 && strlen(business_id) <= 36)
+    {
+        strcpy(new_token->businessId, business_id);
+    }
+    else
+    {
+        strcpy(new_token->businessId, "ddb03736-2f0f-4fad-8ef6-5ffa997a1454");
+    }
+
+    // Add to blob
+    memcpy(&token_blob.tokens[token_blob.token_count], new_token, sizeof(token_info_t));
+    token_blob.token_count++;
+
+    return ESP_OK;
+}
+
+// Create new access token with parameters (with mutex protection and NVS save)
 static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration_minutes,
                                               uint32_t bandwidth_down_mb, uint32_t bandwidth_up_mb,
                                               const char *business_id)
@@ -837,12 +904,11 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Validate duration first (before checking token count)
-    if (duration_minutes < TOKEN_MIN_DURATION_MINUTES || duration_minutes > TOKEN_MAX_DURATION_MINUTES)
+    // Try to acquire mutex (wait up to 100ms)
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "Invalid duration: %lu minutes (must be %d-%d)",
-                 duration_minutes, TOKEN_MIN_DURATION_MINUTES, TOKEN_MAX_DURATION_MINUTES);
-        return ESP_ERR_INVALID_ARG;
+        ESP_LOGW(TAG, "Token creation busy, cannot acquire lock");
+        return ESP_ERR_INVALID_STATE;
     }
 
     // If at or near token limit, run cleanup first to free expired slots
@@ -850,61 +916,35 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     {
         ESP_LOGI(TAG, "Token count (%d) near limit (%d), running cleanup first...",
                  token_blob.token_count, MAX_TOKENS);
-        cleanup_expired_tokens();
+        cleanup_expired_tokens_internal();
     }
 
-    // Check token limit after cleanup
-    if (token_blob.token_count >= MAX_TOKENS)
-    {
-        ESP_LOGE(TAG, "Maximum token limit reached: token_count=%d, MAX_TOKENS=%d",
-                 token_blob.token_count, MAX_TOKENS);
-        return ESP_ERR_NO_MEM;
-    }
-
+    // Create token in memory (no NVS save yet)
     token_info_t new_token;
-    memset(&new_token, 0, sizeof(token_info_t)); // Initialize all fields to 0
-    generate_token(new_token.token);
+    esp_err_t err = add_token_to_blob(&new_token, duration_minutes, bandwidth_down_mb,
+                                      bandwidth_up_mb, business_id);
 
-    time_t now = time(NULL);
-    new_token.created = now;
-    new_token.first_use = 0; // Not used yet
-    new_token.last_use = 0;  // Not used yet
-    new_token.duration_minutes = duration_minutes;
-    new_token.bandwidth_down_mb = bandwidth_down_mb;
-    new_token.bandwidth_up_mb = bandwidth_up_mb;
-    new_token.bandwidth_used_down = 0;
-    new_token.bandwidth_used_up = 0;
-    new_token.usage_count = 0;
-    memset(new_token.client_macs, 0, sizeof(new_token.client_macs));
-    new_token.device_count = 0;
-    new_token.active = true;
-
-    // Set business ID (default if not provided)
-    if (business_id && strlen(business_id) > 0 && strlen(business_id) <= 36)
+    if (err != ESP_OK)
     {
-        strcpy(new_token.businessId, business_id);
-    }
-    else
-    {
-        strcpy(new_token.businessId, "ddb03736-2f0f-4fad-8ef6-5ffa997a1454");
+        xSemaphoreGive(token_blob_mutex);
+        return err;
     }
 
-    // Add to token blob
-    memcpy(&token_blob.tokens[token_blob.token_count], &new_token, sizeof(token_info_t));
-    token_blob.token_count++;
-
-    // Save all tokens to NVS blob
-    esp_err_t err = save_tokens_blob_to_nvs();
+    // Save to NVS
+    err = save_tokens_blob_to_nvs();
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to create token - NVS save error: %s (0x%x)",
                  esp_err_to_name(err), err);
         // Rollback the addition
         token_blob.token_count--;
+        xSemaphoreGive(token_blob_mutex);
         return err;
     }
 
     strcpy(token_out, new_token.token);
+    xSemaphoreGive(token_blob_mutex);
+
     ESP_LOGI(TAG, "✓ Created new token: %s (duration: %lu min, down: %lu MB, up: %lu MB)",
              token_out, duration_minutes, bandwidth_down_mb, bandwidth_up_mb);
 
@@ -1279,9 +1319,8 @@ static token_info_t *get_token_info_by_string(const char *token)
     return NULL;
 }
 
-// Periodic cleanup of expired tokens
-// Called every 30s by SNTP sync callback
-static void cleanup_expired_tokens(void)
+// Internal cleanup function - assumes mutex is already held by caller
+static void cleanup_expired_tokens_internal(void)
 {
     if (!is_time_valid())
     {
@@ -1363,6 +1402,22 @@ static void cleanup_expired_tokens(void)
         // Persist the cleaned state to NVS blob
         save_tokens_blob_to_nvs();
     }
+}
+
+// Periodic cleanup of expired tokens with mutex protection
+// Called every 30s by SNTP sync callback
+static void cleanup_expired_tokens(void)
+{
+    // Try to acquire mutex (non-blocking with timeout)
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "Cleanup skipped - token blob busy");
+        return;
+    }
+
+    cleanup_expired_tokens_internal();
+
+    xSemaphoreGive(token_blob_mutex);
 }
 
 // ==================== MAC Filtering Functions ====================
@@ -2323,23 +2378,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
         initialize_sntp();
 
-        // Start SNTP poll task
-        xTaskCreate(sntp_poll_task, "sntp_poll", 4096, NULL, 5, NULL);
+        // Start SNTP poll task (5KB stack to prevent overflow while preserving heap)
+        xTaskCreate(sntp_poll_task, "sntp_poll", 5120, NULL, 5, NULL);
 
         // Note: Slow blink will be set after time sync completes (in callback)
         ESP_LOGI(TAG, "Waiting for time sync before switching to slow blink...");
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED)
     {
-        ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
-        ESP_LOGI(TAG, "✓ Client got IP from AP: " IPSTR " (MAC: " MACSTR ")",
-                 IP2STR(&event->ip), MAC2STR(event->mac));
+        // Client got IP - no log to save memory
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
     {
-        wifi_event_ap_staconnected_t *connected = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "✓ Client connected to AP: " MACSTR ", AID=%d",
-                 MAC2STR(connected->mac), connected->aid);
+        // Client connected - no log to save memory
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
@@ -2541,7 +2592,6 @@ static void http_server_task(void *pvParameters)
         else if (len > 0)
         {
             rx_buffer[len] = 0;
-            ESP_LOGI(TAG, "HTTP Request from %s", inet_ntoa(source_addr.sin_addr));
 
             // Check if client is already authenticated
             uint32_t client_ip = source_addr.sin_addr.s_addr;
@@ -2574,9 +2624,12 @@ static void http_server_task(void *pvParameters)
             bool is_admin_regen_key = (strstr(rx_buffer, "POST /admin/regenerate_key") != NULL);
             bool is_admin_generate_token = (strstr(rx_buffer, "POST /admin/generate_token") != NULL);
             bool is_admin_reset_tokens = (strstr(rx_buffer, "POST /admin/reset_tokens") != NULL);
+            bool is_admin_clear_whitelist = (strstr(rx_buffer, "POST /admin/clear_whitelist") != NULL);
+            bool is_admin_clear_blacklist = (strstr(rx_buffer, "POST /admin/clear_blacklist") != NULL);
             bool is_admin_set_ap_ssid = (strstr(rx_buffer, "POST /admin/set_ap_ssid") != NULL);
             bool is_admin_ota = (strstr(rx_buffer, "POST /admin/ota") != NULL);
-            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_reset_tokens && !is_admin_set_ap_ssid && !is_admin_ota);
+            bool is_admin_system = (strstr(rx_buffer, "GET /admin/system") != NULL);
+            bool is_admin_page = ((strstr(rx_buffer, "GET /admin ") != NULL || strstr(rx_buffer, "GET /admin\r") != NULL || strstr(rx_buffer, "GET /admin\n") != NULL || strstr(rx_buffer, "GET /admin\t") != NULL) && !is_admin_status && !is_admin_config && !is_admin_login && !is_admin_logout && !is_admin_change_pass && !is_admin_regen_key && !is_admin_generate_token && !is_admin_reset_tokens && !is_admin_clear_whitelist && !is_admin_clear_blacklist && !is_admin_set_ap_ssid && !is_admin_ota && !is_admin_system);
 
             // Handle Token API endpoint
             if (is_api_token)
@@ -2802,6 +2855,20 @@ static void http_server_task(void *pvParameters)
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
+                            // Acquire mutex for token blob modification
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            {
+                                const char *busy_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Retry-After: 5\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
+                                send(sock, busy_response, strlen(busy_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
                             // Find and disable token
                             bool found = false;
                             for (int i = 0; i < token_blob.token_count; i++)
@@ -2821,6 +2888,7 @@ static void http_server_task(void *pvParameters)
 
                                     // Save updated blob to NVS
                                     save_tokens_blob_to_nvs();
+                                    xSemaphoreGive(token_blob_mutex);
 
                                     const char *success_response =
                                         "HTTP/1.1 200 OK\r\n"
@@ -2836,6 +2904,7 @@ static void http_server_task(void *pvParameters)
 
                             if (!found)
                             {
+                                xSemaphoreGive(token_blob_mutex);
                                 const char *not_found_response =
                                     "HTTP/1.1 404 Not Found\r\n"
                                     "Content-Type: application/json\r\n"
@@ -2995,12 +3064,28 @@ static void http_server_task(void *pvParameters)
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
+                            // Try to acquire mutex (non-blocking with 100ms timeout)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            {
+                                const char *busy_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Retry-After: 5\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Server busy processing tokens\",\"error_code\":\"SERVER_BUSY\",\"retry_after\":5}";
+                                send(sock, busy_response, strlen(busy_response), 0);
+                                ESP_LOGW(TAG, "API: Bulk token creation denied - server busy");
+                                close(sock);
+                                continue;
+                            }
+
                             // Check how many tokens we can actually create
                             int available_slots = MAX_TOKENS - token_blob.token_count;
                             int tokens_to_create = (count <= available_slots) ? count : available_slots;
 
                             if (tokens_to_create == 0)
                             {
+                                xSemaphoreGive(token_blob_mutex);
                                 // No slots available
                                 char error_response[256];
                                 snprintf(error_response, sizeof(error_response),
@@ -3015,16 +3100,20 @@ static void http_server_task(void *pvParameters)
                                 continue;
                             }
 
-                            // Create tokens
-                            char created_tokens[50][TOKEN_LENGTH + 1]; // Max 50 tokens
+                            // Create all tokens in memory (NO NVS saves)
+                            // Store only token strings to avoid stack overflow (50 * 200 bytes = 10KB is too much!)
                             int created_count = 0;
+                            int start_index = token_blob.token_count; // Remember where we started
                             esp_err_t last_error = ESP_OK;
+
+                            ESP_LOGI(TAG, "API: Creating %d tokens in batch...", tokens_to_create);
 
                             for (int i = 0; i < tokens_to_create; i++)
                             {
-                                esp_err_t err = create_new_token_with_params(created_tokens[created_count], duration,
-                                                                             bandwidth_down, bandwidth_up,
-                                                                             business_id[0] ? business_id : NULL);
+                                token_info_t temp_token;
+                                esp_err_t err = add_token_to_blob(&temp_token, duration,
+                                                                  bandwidth_down, bandwidth_up,
+                                                                  business_id[0] ? business_id : NULL);
                                 if (err == ESP_OK)
                                 {
                                     created_count++;
@@ -3032,53 +3121,77 @@ static void http_server_task(void *pvParameters)
                                 else
                                 {
                                     last_error = err;
-                                    break; // Stop on first error
+                                    // Rollback all added tokens
+                                    token_blob.token_count -= created_count;
+                                    xSemaphoreGive(token_blob_mutex);
+
+                                    const char *error_response =
+                                        "HTTP/1.1 500 Internal Server Error\r\n"
+                                        "Content-Type: application/json\r\n"
+                                        "Connection: close\r\n\r\n"
+                                        "{\"success\":false,\"error\":\"Failed to create tokens in memory\",\"error_code\":\"CREATION_FAILED\"}";
+                                    send(sock, error_response, strlen(error_response), 0);
+                                    ESP_LOGE(TAG, "API: Bulk token creation failed (memory): %s", esp_err_to_name(last_error));
+                                    break;
                                 }
                             }
 
                             if (created_count > 0)
                             {
-                                // Build JSON response with created tokens
-                                char response[4096]; // Large buffer for token list
-                                char *response_ptr = response;
-                                int remaining = sizeof(response);
+                                // Save ONCE after all tokens created
+                                ESP_LOGI(TAG, "API: Saving %d tokens to NVS (single write)...", created_count);
+                                esp_err_t save_err = save_tokens_blob_to_nvs();
 
-                                const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
-
-                                response_ptr += snprintf(response_ptr, remaining,
-                                                         "HTTP/1.1 200 OK\r\n"
-                                                         "Content-Type: application/json\r\n"
-                                                         "Connection: close\r\n\r\n"
-                                                         "{\"success\":true,\"tokens_created\":%d,\"requested\":%lu,\"tokens\":[",
-                                                         created_count, count);
-
-                                for (int i = 0; i < created_count; i++)
+                                if (save_err != ESP_OK)
                                 {
-                                    if (i > 0)
-                                        response_ptr += snprintf(response_ptr, remaining, ",");
-                                    response_ptr += snprintf(response_ptr, remaining,
-                                                             "{\"token\":\"%s\"}",
-                                                             created_tokens[i]);
+                                    // Rollback all tokens on save failure
+                                    token_blob.token_count -= created_count;
+                                    xSemaphoreGive(token_blob_mutex);
+
+                                    const char *error_response =
+                                        "HTTP/1.1 500 Internal Server Error\r\n"
+                                        "Content-Type: application/json\r\n"
+                                        "Connection: close\r\n\r\n"
+                                        "{\"success\":false,\"error\":\"Failed to persist tokens to storage\",\"error_code\":\"STORAGE_FAILED\"}";
+                                    send(sock, error_response, strlen(error_response), 0);
+                                    ESP_LOGE(TAG, "API: Bulk token save failed: %s", esp_err_to_name(save_err));
                                 }
+                                else
+                                {
+                                    // Success! Release mutex and build response
+                                    xSemaphoreGive(token_blob_mutex);
 
-                                response_ptr += snprintf(response_ptr, remaining,
-                                                         "],\"businessId\":\"%s\",\"duration_minutes\":%lu,\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,\"ap_ssid\":\"%s\"}",
-                                                         used_business_id, duration, bandwidth_down, bandwidth_up, ap_ssid);
+                                    // Build JSON response with created tokens
+                                    char response[4096]; // Large buffer for token list
+                                    char *response_ptr = response;
+                                    int remaining = sizeof(response);
 
-                                send(sock, response, strlen(response), 0);
-                                ESP_LOGI(TAG, "API: Created %d bulk tokens via API (total now: %d)",
-                                         created_count, token_blob.token_count);
-                            }
-                            else
-                            {
-                                // All token creation failed
-                                const char *error_response =
-                                    "HTTP/1.1 500 Internal Server Error\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Connection: close\r\n\r\n"
-                                    "{\"success\":false,\"error\":\"Failed to create tokens\",\"error_code\":\"CREATION_FAILED\"}";
-                                send(sock, error_response, strlen(error_response), 0);
-                                ESP_LOGE(TAG, "API: Bulk token creation failed with error: %s", esp_err_to_name(last_error));
+                                    const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
+
+                                    response_ptr += snprintf(response_ptr, remaining,
+                                                             "HTTP/1.1 200 OK\r\n"
+                                                             "Content-Type: application/json\r\n"
+                                                             "Connection: close\r\n\r\n"
+                                                             "{\"success\":true,\"tokens_created\":%d,\"requested\":%lu,\"tokens\":[",
+                                                             created_count, count);
+
+                                    // Build token list from the blob (tokens are at start_index onwards)
+                                    for (int i = 0; i < created_count; i++)
+                                    {
+                                        if (i > 0)
+                                            response_ptr += snprintf(response_ptr, remaining, ",");
+                                        response_ptr += snprintf(response_ptr, remaining,
+                                                                 "{\"token\":\"%s\"}",
+                                                                 token_blob.tokens[start_index + i].token);
+                                    }
+
+                                    response_ptr += snprintf(response_ptr, remaining,
+                                                             "],\"businessId\":\"%s\",\"duration_minutes\":%lu,\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,\"ap_ssid\":\"%s\"}",
+                                                             used_business_id, duration, bandwidth_down, bandwidth_up, ap_ssid);
+
+                                    send(sock, response, strlen(response), 0);
+                                    ESP_LOGI(TAG, "API: ✓ Bulk created %d tokens (total now: %d)", created_count, token_blob.token_count);
+                                }
                             }
                         }
                         else
@@ -3488,6 +3601,20 @@ static void http_server_task(void *pvParameters)
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
+                            // Acquire mutex for token blob modification
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            {
+                                const char *busy_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Retry-After: 5\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
+                                send(sock, busy_response, strlen(busy_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
                             // Find token
                             bool found = false;
                             for (int i = 0; i < token_blob.token_count; i++)
@@ -3508,6 +3635,7 @@ static void http_server_task(void *pvParameters)
                                     token_blob.tokens[i].usage_count = 0;
 
                                     save_tokens_blob_to_nvs(); // Persist to NVS
+                                    xSemaphoreGive(token_blob_mutex);
 
                                     time_t new_expires = token_blob.tokens[i].first_use +
                                                          (token_blob.tokens[i].duration_minutes * 60);
@@ -3539,6 +3667,7 @@ static void http_server_task(void *pvParameters)
 
                             if (!found)
                             {
+                                xSemaphoreGive(token_blob_mutex);
                                 const char *not_found_response =
                                     "HTTP/1.1 404 Not Found\r\n"
                                     "Content-Type: application/json\r\n"
@@ -4016,6 +4145,20 @@ static void http_server_task(void *pvParameters)
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
+                            // Acquire mutex for token blob modification
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            {
+                                const char *busy_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Retry-After: 5\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
+                                send(sock, busy_response, strlen(busy_response), 0);
+                                close(sock);
+                                continue;
+                            }
+
                             time_t now = time(NULL);
                             int purged_count = 0;
                             char purged_tokens[512] = {0}; // Store list of purged tokens
@@ -4096,6 +4239,8 @@ static void http_server_task(void *pvParameters)
                             {
                                 save_tokens_blob_to_nvs();
                             }
+
+                            xSemaphoreGive(token_blob_mutex);
 
                             // Build response
                             char response_buffer[1024];
@@ -4923,6 +5068,51 @@ static void http_server_task(void *pvParameters)
                 continue;
             }
 
+            // Handle admin system management page (minimal separate page)
+            if (is_admin_system)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *redirect =
+                        "HTTP/1.1 302 Found\r\n"
+                        "Location: /admin\r\n"
+                        "Connection: close\r\n\r\n";
+                    send(sock, redirect, strlen(redirect), 0);
+                    close(sock);
+                    continue;
+                }
+
+                update_admin_activity();
+
+                // Minimal system management page
+                const char *system_page =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/html; charset=UTF-8\r\n"
+                    "Connection: close\r\n\r\n"
+                    "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>System Management</title>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<style>body{font-family:Arial;background:#f5f7fa;padding:20px;margin:0}"
+                    ".container{max-width:500px;margin:50px auto;background:white;padding:30px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
+                    "h1{color:#333;margin-bottom:20px}button{width:100%;padding:14px;background:#dc3545;color:white;border:none;"
+                    "border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;margin:10px 0}button:hover{background:#c82333}"
+                    ".back{background:#6c757d}.back:hover{background:#5a6268}.info{background:#e7f3ff;border-left:4px solid #007bff;"
+                    "padding:15px;margin:20px 0;border-radius:5px;font-size:14px}</style></head><body><div class='container'>"
+                    "<h1>⚙️ System Management</h1>"
+                    "<button onclick='resetTokens()'>Reset All Tokens</button>"
+                    "<button class='back' onclick='location.href=\"/admin\"'>← Back to Dashboard</button>"
+                    "<div class='info'><strong>⚠️ Warning:</strong> Token reset is permanent and cannot be undone.</div>"
+                    "</div><script>"
+                    "function resetTokens(){if(confirm('⚠️ Reset ALL tokens?\\n\\nThis will delete all tokens.\\n\\nCannot be undone!')){"
+                    "fetch('/admin/reset_tokens',{method:'POST'}).then(r=>r.json()).then(d=>{"
+                    "if(d.success){alert('Success! '+d.tokens_removed+' tokens removed');location.reload()}"
+                    "else{alert('Error: '+d.error)}}).catch(e=>{alert('Error: '+e)})}}"
+                    "</script></body></html>";
+
+                send(sock, system_page, strlen(system_page), 0);
+                close(sock);
+                continue;
+            }
+
             // Handle admin token reset
             if (is_admin_reset_tokens)
             {
@@ -4938,10 +5128,25 @@ static void http_server_task(void *pvParameters)
                     continue;
                 }
 
+                // Acquire mutex for token blob modification
+                if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                {
+                    const char *busy_response =
+                        "HTTP/1.1 503 Service Unavailable\r\n"
+                        "Retry-After: 5\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
+                    send(sock, busy_response, strlen(busy_response), 0);
+                    close(sock);
+                    continue;
+                }
+
                 // Reset all tokens
                 int tokens_removed = token_blob.token_count;
                 memset(&token_blob, 0, sizeof(token_blob_t));
                 save_tokens_blob_to_nvs();
+                xSemaphoreGive(token_blob_mutex);
 
                 update_admin_activity();
                 char response[256];
@@ -4953,6 +5158,74 @@ static void http_server_task(void *pvParameters)
                          tokens_removed);
                 send(sock, response, strlen(response), 0);
                 ESP_LOGI(TAG, "Admin: Reset all tokens (%d removed)", tokens_removed);
+                close(sock);
+                continue;
+            }
+
+            // Handle clear whitelist
+            if (is_admin_clear_whitelist)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Clear whitelist
+                int entries_removed = whitelist_blob.entry_count;
+                memset(&whitelist_blob, 0, sizeof(whitelist_blob_t));
+                save_whitelist_to_nvs();
+
+                update_admin_activity();
+                char response[256];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Connection: close\r\n\r\n"
+                         "{\"success\":true,\"message\":\"Whitelist cleared\",\"entries_removed\":%d}",
+                         entries_removed);
+                send(sock, response, strlen(response), 0);
+                ESP_LOGI(TAG, "Admin: Cleared whitelist (%d entries removed)", entries_removed);
+                close(sock);
+                continue;
+            }
+
+            // Handle clear blacklist
+            if (is_admin_clear_blacklist)
+            {
+                if (!is_admin_session_valid())
+                {
+                    const char *error =
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"success\":false,\"error\":\"Session expired\"}";
+                    send(sock, error, strlen(error), 0);
+                    close(sock);
+                    continue;
+                }
+
+                // Clear blacklist
+                int entries_removed = blacklist_blob.entry_count;
+                memset(&blacklist_blob, 0, sizeof(blacklist_blob_t));
+                save_blacklist_to_nvs();
+
+                update_admin_activity();
+                char response[256];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Connection: close\r\n\r\n"
+                         "{\"success\":true,\"message\":\"Blacklist cleared\",\"entries_removed\":%d}",
+                         entries_removed);
+                send(sock, response, strlen(response), 0);
+                ESP_LOGI(TAG, "Admin: Cleared blacklist (%d entries removed)", entries_removed);
                 close(sock);
                 continue;
             }
@@ -5530,9 +5803,15 @@ static void http_server_task(void *pvParameters)
                 bool sta_connected = (err == ESP_OK);
 
                 // Get mesh information
+#if MESH_ENABLED
                 bool is_root = esp_mesh_is_root();
                 int routing_size = esp_mesh_get_routing_table_size();
                 const char *mesh_role = is_root ? "ROOT" : "CHILD";
+#else
+                bool is_root = false;
+                int routing_size = 0;
+                const char *mesh_role = "DISABLED";
+#endif
 
                 char status_json[768];
                 snprintf(status_json, sizeof(status_json),
@@ -5747,6 +6026,13 @@ static void http_server_task(void *pvParameters)
                         "</div></div>";
                     send(sock, pass_card, strlen(pass_card), 0);
                     send(sock, ota_card, strlen(ota_card), 0);
+
+                    // Link to System Management (separate page to save memory)
+                    const char *system_link =
+                        "<div class='card'><h2>⚙️ System Management</h2>"
+                        "<a href='/admin/system' style='display:block;padding:12px;background:#667eea;color:white;text-align:center;"
+                        "border-radius:8px;text-decoration:none;font-weight:600'>Open System Management →</a></div></div></div>";
+                    send(sock, system_link, strlen(system_link), 0);
 
                     // JavaScript part 1
                     const char *script1 =
@@ -6148,6 +6434,15 @@ void app_main(void)
     heartbeat_init(HEARTBEAT_LED_GPIO);
     ESP_LOGI(TAG, "✓ Heartbeat LED initialized (fast blink - waiting for WiFi)");
 
+    // Initialize token blob mutex for concurrency control
+    token_blob_mutex = xSemaphoreCreateMutex();
+    if (token_blob_mutex == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create token_blob_mutex");
+        abort();
+    }
+    ESP_LOGI(TAG, "✓ Token blob mutex initialized");
+
     // Time will be synced via SNTP after WiFi connection
     ESP_LOGI(TAG, "Time sync will occur after WiFi connection");
 
@@ -6431,11 +6726,11 @@ void app_main(void)
     ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_blob.token_count);
     ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
 
-    // Start DNS server for captive portal redirect
-    xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL);
+    // Start DNS server for captive portal redirect (4.5KB stack for 512-byte buffers + overhead)
+    xTaskCreate(dns_server_task, "dns_server", 4608, NULL, 5, NULL);
 
-    // Start HTTP server for captive portal with token validation (32KB stack for large HTML pages & admin panel)
-    xTaskCreate(http_server_task, "http_server", 8192, NULL, 5, NULL);
+    // Start HTTP server for captive portal (7KB stack - prevent overflow during admin dashboard)
+    xTaskCreate(http_server_task, "http_server", 7168, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
 
@@ -6448,17 +6743,9 @@ void app_main(void)
         const char *role = esp_mesh_is_root() ? "ROOT" : "CHILD";
         int routing_table_size = esp_mesh_get_routing_table_size();
 
-        ESP_LOGI(TAG, "Status: Role=%s, Layer=%d, Connected=%d, Tokens=%d, Auth=%d, Routing=%d",
-                 role,
-                 mesh_layer,
-                 mesh_connected ? 1 : 0,
-                 token_count,
-                 authenticated_count,
-                 routing_table_size);
+        // Status logging disabled to save memory
 #else
-        ESP_LOGI(TAG, "Status: Role=CHILD, Layer=-1, Connected=0, Tokens=%d, Auth=%d, Routing=0",
-                 token_blob.token_count,
-                 authenticated_count);
+        // Status logging disabled to save memory
 #endif
     }
 }
