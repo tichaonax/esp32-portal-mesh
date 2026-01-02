@@ -107,6 +107,7 @@ axios.post('http://192.168.0.100/api/token', params)
 ```json
 {
     "success": true,
+    "available_slots": 85,
     "token": "A3K9M7P2",
     "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "duration_minutes": 120,
@@ -274,6 +275,7 @@ axios.post('http://192.168.0.100/api/tokens/bulk_create', params)
 ```json
 {
     "success": true,
+    "available_slots": 80,
     "tokens_created": 5,
     "requested": 5,
     "tokens": [
@@ -358,7 +360,7 @@ When fewer tokens are created than requested (due to slot limitations):
 **Code:** `400 Bad Request`
 
 Possible error messages:
-- `"Count must be between 1 and 50"`
+- `"Count must be between 1 and 20"`
 - `"Count cannot be negative"`
 - `"Duration cannot be negative"`
 - `"Bandwidth cannot be negative"`
@@ -393,20 +395,20 @@ Possible error messages:
 ---
 
 ### POST /api/token/disable
-Permanently disable and delete a token from the system. This operation:
-- Immediately revokes token access (active sessions are terminated)
-- Removes token from memory (active_tokens array)
-- Erases token from NVS flash storage
-- Decrements the active token count
-- **Persists across device reboots** - token cannot be recovered
+Permanently disable and delete multiple tokens from the system in a single bulk operation. This operation:
+- Immediately revokes token access for all specified tokens (active sessions are terminated)
+- Removes tokens from memory (active_tokens array)
+- Erases tokens from NVS flash storage in a single save operation
+- Decrements the active token count for each successfully disabled token
+- **Persists across device reboots** - tokens cannot be recovered
 
 **Use Cases:**
-- Revoking access for security reasons
-- Canceling unused/expired tokens to free capacity
-- Bulk cleanup of old tokens
-- Subscription cancellation
+- Bulk cleanup of expired or unused tokens
+- Security incident response (revoking multiple compromised tokens)
+- Subscription cancellation for multiple users
+- Administrative token management operations
 
-**Important:** This is a permanent deletion. The token cannot be restored and will not reappear after device reboot.
+**Important:** This is a permanent bulk deletion. Tokens cannot be restored and will not reappear after device reboot. Maximum 20 tokens per request.
 
 #### Request
 
@@ -417,15 +419,22 @@ Permanently disable and delete a token from the system. This operation:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
-| `token` | string | Yes | The 8-character token to permanently delete |
+| `tokens` | string | Yes | Comma-separated list of 8-character tokens to permanently delete (max 20) |
 
 #### Example Requests
 
-**cURL:**
+**cURL (single token):**
 ```bash
 curl -X POST http://192.168.0.100/api/token/disable \
   -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
-  -d "token=A3K9M7P2"
+  -d "tokens=A3K9M7P2"
+```
+
+**cURL (multiple tokens):**
+```bash
+curl -X POST http://192.168.0.100/api/token/disable \
+  -d "api_key=abcd1234efgh5678ijkl9012mnop3456" \
+  -d "tokens=A3K9M7P2,B8N4Q9R3,C1D5E7F9"
 ```
 
 **Python:**
@@ -435,7 +444,7 @@ import requests
 url = "http://192.168.0.100/api/token/disable"
 data = {
     "api_key": "abcd1234efgh5678ijkl9012mnop3456",
-    "token": "A3K9M7P2"
+    "tokens": "A3K9M7P2,B8N4Q9R3,C1D5E7F9"
 }
 
 response = requests.post(url, data=data)
@@ -448,55 +457,89 @@ print(response.json())
 ```json
 {
     "success": true,
-    "message": "Token disabled successfully"
+    "disabled_count": 3,
+    "disabled_tokens": ["A3K9M7P2", "B8N4Q9R3", "C1D5E7F9"]
 }
 ```
 
 **Verification:**
-After successful deletion, you can verify the token is gone by:
-1. Query `/api/token/info` - will return 404
-2. Check `/api/health` - `active_tokens` count decremented
-3. Reboot device - token remains deleted (persists in NVS)
+After successful bulk deletion, you can verify tokens are gone by:
+1. Query `/api/token/info` for each token - will return 404
+2. Check `/api/health` - `active_tokens` count decremented by the number of successfully disabled tokens
+3. Reboot device - tokens remain deleted (persists in NVS)
 
 **Internal Operations (logged to device console):**
 ```
-I (143100) esp32-mesh-portal: Erased token C25DL85Y from NVS (erase=ESP_OK, commit=ESP_OK)
-I (143100) esp32-mesh-portal: API: Token C25DL85Y disabled via API (count now: 89)
+I (143100) esp32-mesh-portal: API: Token A3K9M7P2 disabled via bulk API
+I (143100) esp32-mesh-portal: API: Token B8N4Q9R3 disabled via bulk API
+I (143100) esp32-mesh-portal: API: Token C1D5E7F9 disabled via bulk API
+I (143100) esp32-mesh-portal: API: Bulk disabled 3 tokens via API (total now: 87)
 ```
 
 #### Error Responses
 
-**Token Not Found**
+**No Tokens Specified**
 
-**Code:** `404 Not Found`
+**Code:** `400 Bad Request`
 ```json
 {
     "success": false,
-    "error": "Token not found or already disabled",
-    "error_code": "TOKEN_NOT_FOUND"
+    "error": "No tokens specified",
+    "error_code": "NO_TOKENS_SPECIFIED"
 }
 ```
 
-This error occurs when:
-- The token doesn't exist in the system
-- The token has already been disabled and deleted
-- The token string was entered incorrectly (case-sensitive)
+**Too Many Tokens**
 
-**Note:** If you receive 404, the token is guaranteed not to exist in the system. This is idempotent - calling disable on an already-disabled token returns 404, not an error.
-
-**NVS Storage Errors (Rare)**
-
-If the device encounters an NVS storage error during deletion, it will still be logged to the console:
-```
-E (xxxxx) esp32-mesh-portal: Failed to erase token XXXXXXXX from NVS: <error_name> (0x<code>)
-E (xxxxx) esp32-mesh-portal: Failed to commit NVS after erasing token XXXXXXXX: <error_name> (0x<code>)
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Too many tokens requested (max 20)",
+    "error_code": "TOO_MANY_TOKENS",
+    "max_tokens": 20,
+    "requested": 51
+}
 ```
 
-Common NVS errors:
-- `ESP_ERR_NVS_NOT_FOUND` (0x1102) - Already deleted
-- `ESP_ERR_NVS_INVALID_HANDLE` (0x1101) - Storage corruption
+**Missing Parameters**
 
-**Other Errors:** Same as `/api/token` endpoint (401, 403, 400)
+**Code:** `400 Bad Request`
+```json
+{
+    "success": false,
+    "error": "Missing required parameters (api_key, tokens)"
+}
+```
+
+**Server Busy**
+
+**Code:** `503 Service Unavailable`
+```json
+{
+    "success": false,
+    "error": "Server busy",
+    "error_code": "SERVER_BUSY"
+}
+```
+
+**Invalid API Key**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Invalid API key",
+    "error_code": "INVALID_API_KEY"
+}
+```
+
+**Notes:**
+- Tokens that are not found or already disabled are silently ignored
+- The response includes only the tokens that were successfully disabled
+- NVS save operation occurs only once after processing all tokens for efficiency
+- All tokens are processed atomically with mutex protection
+- Maximum of 20 tokens can be disabled in a single request
 
 ---
 
@@ -557,6 +600,7 @@ axios.get('http://192.168.0.100/api/token/info', {
 ```json
 {
     "success": true,
+    "available_slots": 85,
     "token": "A3K9M7P2",
     "businessId": "550e8400-e29b-41d4-a716-446655440000",
     "status": "unused",
@@ -677,7 +721,7 @@ Retrieve detailed information for multiple tokens in a single request. This endp
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `api_key` | string | Yes | Your 32-character API key |
-| `tokens` | string | Yes | Comma-separated list of 8-character tokens (max 50 tokens) |
+| `tokens` | string | Yes | Comma-separated list of 8-character tokens (max 20 tokens) |
 
 **Token Limits:**
 - Maximum: 50 tokens per request
@@ -786,9 +830,9 @@ axios.get('http://192.168.0.100/api/token/batch_info', {
 ```json
 {
     "success": false,
-    "error": "Too many tokens requested (max 50)",
+    "error": "Too many tokens requested (max 20)",
     "error_code": "TOO_MANY_TOKENS",
-    "max_tokens": 50,
+    "max_tokens": 20,
     "requested": 75
 }
 ```
@@ -1037,6 +1081,7 @@ print(response.json())
 ```json
 {
     "success": true,
+    "available_slots": 85,
     "uptime_seconds": 12345,
     "uptime_microseconds": 12345678901
 }
@@ -1096,6 +1141,7 @@ print(response.json())
 ```json
 {
     "success": true,
+    "available_slots": 85,
     "status": "healthy",
     "uptime_seconds": 12345,
     "time_synced": true,
@@ -1122,6 +1168,87 @@ print(response.json())
 | `free_heap_bytes` | integer | Available RAM in bytes |
 
 #### Error Responses
+
+**Request from AP Network**
+
+**Code:** `403 Forbidden`
+```json
+{
+    "error": "API only accessible from uplink network"
+}
+```
+
+---
+
+### GET /api/tokens/available_slots
+Get the count of available token slots that can be created. This endpoint helps applications determine how many tokens they can create before hitting the system limit.
+
+#### Request
+
+**Method:** GET
+
+**Authentication:** API key required
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes | Your 32-character API key |
+
+#### Example Requests
+
+**cURL:**
+```bash
+curl -X GET "http://192.168.0.100/api/tokens/available_slots?api_key=abcd1234efgh5678ijkl9012mnop3456"
+```
+
+**Python:**
+```python
+import requests
+
+url = "http://192.168.0.100/api/tokens/available_slots"
+params = {
+    "api_key": "abcd1234efgh5678ijkl9012mnop3456"
+}
+
+response = requests.get(url, params=params)
+print(response.json())
+```
+
+#### Success Response
+
+**Code:** `200 OK`
+
+```json
+{
+    "success": true,
+    "available_slots": 85,
+    "max_tokens": 100,
+    "current_tokens": 15
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Always true for successful requests |
+| `available_slots` | integer | Number of token slots available for creation |
+| `max_tokens` | integer | Maximum token capacity (100) |
+| `current_tokens` | integer | Number of currently active tokens |
+
+#### Error Responses
+
+**Invalid API Key**
+
+**Code:** `401 Unauthorized`
+```json
+{
+    "success": false,
+    "error": "Invalid API key",
+    "error_code": "INVALID_API_KEY"
+}
+```
 
 **Request from AP Network**
 
@@ -1207,16 +1334,16 @@ Get a complete list of all active tokens in the system with their full metadata.
 | `used_only` | boolean | No | If "true", only include tokens that have been used at least once |
 | `unused_only` | boolean | No | If "true", only include tokens that have never been used |
 | `offset` | integer | No | Pagination offset: starting index (default: 0) |
-| `limit` | integer | No | Maximum tokens per page (default: 100, max: 200) |
+| `limit` | integer | No | Maximum tokens per page (default: 20, max: 20) |
 | `offset` | integer | No | Pagination: starting index for results (default: 0) |
-| `limit` | integer | No | Pagination: maximum tokens to return (default: 100, max: 200) |
+| `limit` | integer | No | Pagination: maximum tokens to return (default: 20, max: 20) |
 
 **Pagination:**
 - Use `offset` and `limit` to retrieve large token lists in chunks
-- `offset=0, limit=100` returns first 100 tokens
-- `offset=100, limit=100` returns next 100 tokens
+- `offset=0, limit=20` returns first 20 tokens
+- `offset=20, limit=20` returns next 20 tokens
 - Response includes `total_count`, `returned_count`, `has_more` for pagination control
-- Maximum `limit` is 200 tokens per request to prevent buffer overflow
+- Maximum `limit` is 20 tokens per request to prevent buffer overflow
 
 **Filtering Logic:**
 - `status=all` (default): Return all active tokens
@@ -1360,6 +1487,7 @@ print(f"Found {len(unused_tokens)} unused tokens")
 ```json
 {
     "success": true,
+    "available_slots": 85,
     "total_count": 250,
     "returned_count": 100,
     "offset": 0,
@@ -2356,7 +2484,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `POST /api/token/extend` - Reset/extend token
 - `GET /api/token/info` - Query single token information
 - `GET /api/token/batch_info` - Query multiple tokens information
-- `POST /api/token/disable` - Disable token
+- `POST /api/token/disable` - Disable multiple tokens (bulk)
 - `GET /api/tokens/list` - List all tokens
 - `POST /api/mac/blacklist` - Block devices
 - `POST /api/mac/whitelist` - Grant VIP access
@@ -2365,6 +2493,7 @@ curl -X POST http://192.168.0.100/api/invalid/path \
 - `POST /api/mac/clear` - Clear MAC filters
 - `GET /api/uptime` - Device uptime
 - `GET /api/health` - System health metrics
+- `GET /api/tokens/available_slots` - Check available token slots
 - `GET /api/ap/info` - Access Point information (public)
 - `POST /admin/reset_tokens` - Reset all tokens (admin only)
 - `POST /admin/ota` - Upload firmware for OTA update (admin only)
@@ -3320,6 +3449,13 @@ def check_token_status(token):
 For technical issues or feature requests, contact your system administrator or refer to the project documentation.
 
 ## Version History
+- **v3.6** (2025-12-20): Enhanced Bulk Token Disable Operations & Capacity Monitoring
+  - **ENHANCED:** `POST /api/token/disable` - Now supports bulk operations (up to 50 tokens per request)
+  - **NEW:** `GET /api/tokens/available_slots` - Check available token slots before creation
+  - Single NVS save operation for efficiency in bulk disable operations
+  - Improved error handling with detailed bulk operation responses
+  - Binary size: 915KB (40% free flash space remaining)
+
 - **v3.5** (2025-12-13): Token Purge API & Enhanced Filtering
   - **NEW:** `POST /api/tokens/purge` - Automated token cleanup with age/usage filtering
   - **ENHANCED:** `GET /api/tokens/list` - Added filtering parameters (status, age, usage)
@@ -3389,7 +3525,7 @@ For technical issues or feature requests, contact your system administrator or r
   - Enhanced monitoring and alerting documentation
 
 - **v2.0** (2025-12-09): Enhanced Token Management
-  - **NEW:** `POST /api/token/disable` - Revoke tokens instantly
+- **NEW:** `POST /api/token/disable` - Revoke multiple tokens instantly (bulk operation)
   - **NEW:** `GET /api/token/info` - Query token status and usage statistics
   - **NEW:** `POST /api/token/extend` - Renew/top-up existing tokens
   - **NEW:** Static IP configuration for uplink network

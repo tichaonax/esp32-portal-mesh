@@ -145,7 +145,7 @@ static esp_netif_t *ap_netif = NULL;
 // Token management
 #define TOKEN_LENGTH 8
 #define TOKEN_EXPIRY_HOURS 24
-#define MAX_TOKENS 500 // Increased from 230 to 500 for expanded capacity
+#define MAX_TOKENS 400 // Increased to 400 slots (400 * 232B = ~93KB static RAM)
 #define TOKEN_MIN_DURATION_MINUTES 30
 #define TOKEN_MAX_DURATION_MINUTES (30 * 24 * 60) // 30 days
 #define MAX_DEVICES_PER_TOKEN 2
@@ -175,10 +175,11 @@ typedef struct
 } token_info_t;
 
 // Blob structure for storing all tokens in a single NVS entry
+// IMPORTANT: token_count MUST be first for variable-size NVS save/load to work
 typedef struct
 {
-    token_info_t tokens[MAX_TOKENS];
     int token_count;
+    token_info_t tokens[MAX_TOKENS];
 } token_blob_t;
 
 static token_blob_t token_blob;
@@ -204,8 +205,8 @@ static authenticated_client_t authenticated_clients[MAX_AUTHENTICATED_CLIENTS];
 static int authenticated_count = 0;
 
 // ==================== MAC Filtering (Blacklist/Whitelist) ====================
-#define MAX_BLACKLIST_ENTRIES 200
-#define MAX_WHITELIST_ENTRIES 200
+#define MAX_BLACKLIST_ENTRIES 50
+#define MAX_WHITELIST_ENTRIES 50
 #define MAC_FILTER_REASON_LENGTH 32
 #define MAC_FILTER_NOTE_LENGTH 32
 
@@ -300,26 +301,6 @@ static void add_authenticated_client(uint32_t client_ip, const uint8_t *mac)
         }
     }
     ESP_LOGW(TAG, "Authenticated clients list full!");
-}
-
-// Helper function to count authenticated clients
-static int get_authenticated_count(void)
-{
-    int count = 0;
-    for (int i = 0; i < MAX_AUTHENTICATED_CLIENTS; i++)
-    {
-        if (authenticated_clients[i].active)
-        {
-            count++;
-        }
-    }
-    return count;
-}
-
-// Helper function to count active tokens
-static int get_active_token_count(void)
-{
-    return token_blob.token_count;
 }
 
 #if MESH_ENABLED
@@ -594,44 +575,67 @@ static void load_tokens_blob_from_nvs(void)
         return;
     }
 
-    size_t required_size = sizeof(token_blob_t);
-    err = nvs_get_blob(nvs_handle, "token_blob", &token_blob, &required_size);
-
-    if (err != ESP_OK)
+    // First, get the actual size of the stored blob
+    size_t required_size = 0;
+    err = nvs_get_blob(nvs_handle, "token_blob", NULL, &required_size);
+    if (err != ESP_OK || required_size == 0)
     {
-        ESP_LOGW(TAG, "No token blob found in NVS or corrupted data detected (%s)", esp_err_to_name(err));
-        ESP_LOGW(TAG, "Starting with clean token system (all previous tokens cleared)");
-
-        // Initialize clean token blob
-        memset(&token_blob, 0, sizeof(token_blob_t));
-        token_blob.token_count = 0;
-
+        ESP_LOGW(TAG, "No token blob found in NVS (%s)", esp_err_to_name(err));
         nvs_close(nvs_handle);
         return;
     }
 
-    // Validate tokens directly in token_blob and update count
-    // memcpy(active_tokens, token_blob.tokens, sizeof(active_tokens)); // REMOVED
+    // Clear token blob first
+    memset(&token_blob, 0, sizeof(token_blob_t));
+
+    // Read the actual stored size (may be smaller than full blob if variable-size save)
+    err = nvs_get_blob(nvs_handle, "token_blob", &token_blob, &required_size);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to load token blob from NVS (%s)", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Starting with clean token system");
+        memset(&token_blob, 0, sizeof(token_blob_t));
+        token_blob.token_count = 0;
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Loaded %d bytes from NVS, token_count=%d", required_size, token_blob.token_count);
+
+    // Sanity check: Detect old/corrupted blob format
+    if (token_blob.token_count < 0 || token_blob.token_count > MAX_TOKENS)
+    {
+        ESP_LOGW(TAG, "Invalid token_count %d (max %d) - blob format mismatch or corruption",
+                 token_blob.token_count, MAX_TOKENS);
+        ESP_LOGW(TAG, "This may be an old format blob. Erasing and starting fresh...");
+        memset(&token_blob, 0, sizeof(token_blob_t));
+        token_blob.token_count = 0;
+
+        // Erase the corrupted blob
+        nvs_handle_t erase_handle;
+        if (nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &erase_handle) == ESP_OK)
+        {
+            nvs_erase_key(erase_handle, "token_blob");
+            nvs_commit(erase_handle);
+            nvs_close(erase_handle);
+            ESP_LOGI(TAG, "Old token blob erased. Starting with empty token system.");
+        }
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    // DO NOT validate expiration here - time is not synced yet (1970)!
+    // Expiration cleanup will happen after SNTP sync in cleanup_expired_tokens()
     int valid_count = 0; // Will replace token_count
 
-    time_t now = time(NULL);
     for (int i = 0; i < token_blob.token_count && valid_count < MAX_TOKENS; i++)
     {
         if (token_blob.tokens[i].active)
         {
             bool expired = false;
 
-            // Check time expiration
-            if (token_blob.tokens[i].first_use > 0)
-            {
-                time_t token_expires = token_blob.tokens[i].first_use +
-                                       (token_blob.tokens[i].duration_minutes * 60);
-                if (now > token_expires)
-                {
-                    ESP_LOGI(TAG, "Token %s expired (time), removing", token_blob.tokens[i].token);
-                    expired = true;
-                }
-            }
+            // ONLY check bandwidth expiration (not time-based, safe before SNTP sync)
 
             // Check bandwidth limits
             if (token_blob.tokens[i].bandwidth_down_mb > 0 &&
@@ -951,13 +955,6 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     return ESP_OK;
 }
 
-// Create new access token (simple version for admin UI)
-static esp_err_t create_new_token(char *token_out)
-{
-    // Default: 24 hours, unlimited bandwidth
-    return create_new_token_with_params(token_out, TOKEN_EXPIRY_HOURS * 60, 0, 0, NULL);
-}
-
 // Forward declarations for MAC filtering functions
 static bool is_mac_blacklisted(const uint8_t *mac);
 static bool is_mac_whitelisted(const uint8_t *mac);
@@ -1213,6 +1210,13 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
     time_t now = time(NULL);
     ESP_LOGI(TAG, "DEBUG: validate_token - now=%lld, time_synced=%d", (long long)now, time_synced);
 
+    // Acquire mutex to prevent race conditions during token modification
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "validate_token: Failed to acquire mutex");
+        return false;
+    }
+
     for (int i = 0; i < token_blob.token_count; i++)
     {
         if (!token_blob.tokens[i].active)
@@ -1237,6 +1241,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 ESP_LOGW(TAG, "Token %s has expired (time limit)", token);
                 token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
+                xSemaphoreGive(token_blob_mutex);
                 return false;
             }
 
@@ -1247,6 +1252,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 ESP_LOGW(TAG, "Token %s exceeded download limit", token);
                 token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
+                xSemaphoreGive(token_blob_mutex);
                 return false;
             }
             if (token_blob.tokens[i].bandwidth_up_mb > 0 &&
@@ -1255,6 +1261,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 ESP_LOGW(TAG, "Token %s exceeded upload limit", token);
                 token_blob.tokens[i].active = false;
                 save_tokens_blob_to_nvs();
+                xSemaphoreGive(token_blob_mutex);
                 return false;
             }
 
@@ -1276,6 +1283,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
                 {
                     ESP_LOGW(TAG, "Token %s already has %d devices (max allowed)",
                              token, MAX_DEVICES_PER_TOKEN);
+                    xSemaphoreGive(token_blob_mutex);
                     return false;
                 }
 
@@ -1298,11 +1306,13 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
             save_tokens_blob_to_nvs();
 
             ESP_LOGI(TAG, "✓ Token %s validated (usage: %lu)", token, token_blob.tokens[i].usage_count);
+            xSemaphoreGive(token_blob_mutex);
             return true;
         }
     }
 
     ESP_LOGW(TAG, "✗ Invalid token: %s", token);
+    xSemaphoreGive(token_blob_mutex);
     return false;
 }
 
@@ -1580,17 +1590,19 @@ static void time_sync_notification_cb(struct timeval *tv)
     time_synced = true;
     time_sync_timestamp = tv->tv_sec;
 
-    char time_str[64];
-    struct tm *timeinfo = localtime(&tv->tv_sec);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
-    ESP_LOGI(TAG, "✓ Time synchronized via SNTP: %s", time_str);
+    //char time_str[64];
+    //struct tm *timeinfo = localtime(&tv->tv_sec);
+    //strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
+    //ESP_LOGI(TAG, "✓ Time synchronized via SNTP: %s", time_str);
 
     // Switch LED to slow heartbeat (connected mode) now that time is synced
     heartbeat_set_connected(true);
-    ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected, time synced)");
+    //ESP_LOGI(TAG, "✓ Heartbeat: Slow blink (internet connected, time synced)");
 
     // Cleanup expired tokens every 30s (on each SNTP sync)
     cleanup_expired_tokens();
+    
+    ESP_LOGI(TAG, "Free heap after NTP sync: %lu bytes", esp_get_free_heap_size());
 }
 
 // Initialize SNTP time synchronization
@@ -1608,7 +1620,7 @@ static void initialize_sntp(void)
     setenv("TZ", "UTC", 1);
     tzset();
 
-    ESP_LOGI(TAG, "Waiting for time sync from NTP servers...");
+    //ESP_LOGI(TAG, "Waiting for time sync from NTP servers...");
 }
 
 // Task to poll SNTP every 30 seconds
@@ -2200,92 +2212,6 @@ static void reconnect_wifi(void)
     }
 }
 
-// Reconfigure AP SSID dynamically (without restarting device)
-static esp_err_t reconfigure_ap_ssid(const char *new_ssid)
-{
-    if (!is_valid_ssid(new_ssid))
-    {
-        ESP_LOGE(TAG, "Cannot reconfigure with invalid SSID");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ESP_LOGI(TAG, "Reconfiguring AP SSID from \"%s\" to \"%s\"...", ap_ssid, new_ssid);
-
-    // Step 1: Save new SSID to NVS first (so it persists across reboot)
-    esp_err_t err = save_ap_ssid(new_ssid);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to save new SSID to NVS: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    // Step 2: Stop WiFi
-    ESP_LOGI(TAG, "Stopping WiFi...");
-    err = esp_wifi_stop();
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to stop WiFi: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    // Give brief delay for WiFi to stop cleanly
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Step 3: Reconfigure AP with new SSID
-    wifi_config_t ap_config = {0};
-    strncpy((char *)ap_config.ap.ssid, new_ssid, sizeof(ap_config.ap.ssid));
-    ap_config.ap.ssid_len = strlen(new_ssid);
-    ap_config.ap.channel = MESH_CHANNEL;
-    ap_config.ap.max_connection = 4;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    ap_config.ap.pmf_cfg.required = false;
-
-    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to set AP config: %s", esp_err_to_name(err));
-        return err;
-    }
-    ESP_LOGI(TAG, "✓ AP config updated with new SSID");
-
-    // Step 4: Reconfigure STA (preserve existing router connection)
-    wifi_config_t sta_config = {0};
-    strncpy((char *)sta_config.sta.ssid, current_wifi_ssid, sizeof(sta_config.sta.ssid));
-    strncpy((char *)sta_config.sta.password, current_wifi_pass, sizeof(sta_config.sta.password));
-    sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    sta_config.sta.pmf_cfg.capable = true;
-    sta_config.sta.pmf_cfg.required = false;
-
-    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to set STA config: %s", esp_err_to_name(err));
-        return err;
-    }
-    ESP_LOGI(TAG, "✓ STA config preserved");
-
-    // Step 5: Restart WiFi
-    ESP_LOGI(TAG, "Restarting WiFi...");
-    err = esp_wifi_start();
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to restart WiFi: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    // Step 6: Reconnect STA to router
-    err = esp_wifi_connect();
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "WiFi reconnection may take a moment: %s", esp_err_to_name(err));
-    }
-
-    ESP_LOGI(TAG, "✓ AP SSID reconfigured successfully to \"%s\"", new_ssid);
-    ESP_LOGI(TAG, "✓ Guests can now connect to: \"%s\"", new_ssid);
-
-    return ESP_OK;
-}
-
 // Enable NAT for internet routing
 static void enable_nat_routing(void)
 {
@@ -2531,7 +2457,6 @@ static void dns_server_task(void *pvParameters)
 // Basic HTTP server for captive portal
 static void http_server_task(void *pvParameters)
 {
-    char rx_buffer[1024];
     int addr_family = AF_INET;
     int ip_protocol = IPPROTO_IP;
 
@@ -2571,6 +2496,7 @@ static void http_server_task(void *pvParameters)
     }
 
     ESP_LOGI(TAG, "HTTP Server started on port 80");
+    ESP_LOGI(TAG, "Free heap after HTTP server start: %lu bytes", esp_get_free_heap_size());
 
     while (1)
     {
@@ -2583,15 +2509,41 @@ static void http_server_task(void *pvParameters)
             break;
         }
 
-        // Receive HTTP request
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        if (len < 0)
+        // Log connection accepted
+        char addr_str[16];
+        inet_ntoa_r(source_addr.sin_addr, addr_str, sizeof(addr_str));
+        ESP_LOGI(TAG, "HTTP: Connection accepted from %s", addr_str);
+
+        // Allocate rx_buffer on heap to save stack space
+        char *rx_buffer = malloc(1024);
+        if (rx_buffer == NULL)
         {
-            ESP_LOGE(TAG, "recv failed: errno %d", errno);
+            ESP_LOGE(TAG, "Failed to allocate rx_buffer, closing connection");
+            goto cleanup;
         }
-        else if (len > 0)
+
+        // Receive HTTP request
+        int len = recv(sock, rx_buffer, 1024 - 1, 0);
+        if (len <= 0)
+        {
+            // Connection closed or error occurred
+            if (len < 0)
+            {
+                ESP_LOGE(TAG, "recv failed: errno %d", errno);
+            }
+            free(rx_buffer);
+            goto cleanup;
+        }
+
+        // Process request (len > 0)
         {
             rx_buffer[len] = 0;
+
+            // Log first line of request
+            char *eol = strchr(rx_buffer, '\r');
+            if (eol) *eol = '\0';
+            ESP_LOGI(TAG, "HTTP: %s", rx_buffer);
+            if (eol) *eol = '\r';
 
             // Check if client is already authenticated
             uint32_t client_ip = source_addr.sin_addr.s_addr;
@@ -2618,6 +2570,7 @@ static void http_server_task(void *pvParameters)
             bool is_api_mac_remove = (strstr(rx_buffer, "POST /api/mac/remove") != NULL);
             bool is_api_mac_list = (strstr(rx_buffer, "GET /api/mac/list") != NULL);
             bool is_api_mac_clear = (strstr(rx_buffer, "POST /api/mac/clear") != NULL);
+            bool is_api_tokens_available_slots = (strstr(rx_buffer, "GET /api/tokens/available_slots") != NULL);
             bool is_admin_login = (strstr(rx_buffer, "POST /admin/login") != NULL);
             bool is_admin_logout = (strstr(rx_buffer, "POST /admin/logout") != NULL);
             bool is_admin_change_pass = (strstr(rx_buffer, "POST /admin/change_password") != NULL);
@@ -2674,8 +2627,7 @@ static void http_server_task(void *pvParameters)
                                 "Connection: close\r\n\r\n"
                                 "{\"success\":false,\"error\":\"Duration cannot be negative\"}";
                             send(sock, error_response, strlen(error_response), 0);
-                            close(sock);
-                            continue;
+                            goto cleanup;
                         }
                         sscanf(dur_start, "%lu", &duration);
 
@@ -2692,8 +2644,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                             sscanf(down_start, "%lu", &bandwidth_down);
                         }
@@ -2709,8 +2660,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                             sscanf(up_start, "%lu", &bandwidth_up);
                         }
@@ -2729,8 +2679,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"businessId cannot exceed 36 characters\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                         }
 
@@ -2747,13 +2696,15 @@ static void http_server_task(void *pvParameters)
                             {
                                 char response[512];
                                 const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
+                                int available_slots = MAX_TOKENS - token_blob.token_count;
+                                if (available_slots < 0) available_slots = 0;
                                 snprintf(response, sizeof(response),
                                          "HTTP/1.1 200 OK\r\n"
                                          "Content-Type: application/json\r\n"
                                          "Connection: close\r\n\r\n"
-                                         "{\"success\":true,\"token\":\"%s\",\"duration_minutes\":%lu,"
+                                         "{\"success\":true,\"available_slots\":%d,\"token\":\"%s\",\"duration_minutes\":%lu,"
                                          "\"bandwidth_down_mb\":%lu,\"bandwidth_up_mb\":%lu,\"businessId\":\"%s\",\"ap_ssid\":\"%s\"}",
-                                         new_token, duration, bandwidth_down, bandwidth_up, used_business_id, ap_ssid);
+                                         available_slots, new_token, duration, bandwidth_down, bandwidth_up, used_business_id, ap_ssid);
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGI(TAG, "API: Created token %s via API", new_token);
                             }
@@ -2824,11 +2775,10 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
-            // Handle Token Disable API endpoint
+            // Handle Token Disable API endpoint (now supports bulk)
             if (is_api_token_disable)
             {
                 REJECT_LOCAL_AP_REQUEST(sock, source_addr);
@@ -2838,23 +2788,68 @@ static void http_server_task(void *pvParameters)
                 {
                     body += 4;
                     char received_key[API_KEY_LENGTH + 1] = {0};
-                    char token_to_disable[TOKEN_LENGTH + 1] = {0};
+                    char tokens_param[4096] = {0}; // Large buffer for multiple tokens
 
-                    // Parse: api_key=XXX&token=XXX
+                    // Parse: api_key=XXX&tokens=token1,token2,token3
                     char *key_start = strstr(body, "api_key=");
-                    char *token_start = strstr(body, "token=");
+                    char *tokens_start = strstr(body, "tokens=");
 
-                    if (key_start && token_start)
+                    if (key_start && tokens_start)
                     {
                         key_start += 8;
                         sscanf(key_start, "%32[^&\r\n]", received_key);
 
-                        token_start += 6;
-                        sscanf(token_start, "%8[^&\r\n]", token_to_disable);
+                        tokens_start += 7;
+                        sscanf(tokens_start, "%4095[^&\r\n]", tokens_param);
 
                         // Validate API key
                         if (strcmp(received_key, api_key) == 0)
                         {
+                            // Parse tokens from comma-separated list
+#define MAX_DISABLE_TOKENS 20
+                            char *token_list[MAX_DISABLE_TOKENS];
+                            int token_count = 0;
+
+                            char *token_ptr = tokens_param;
+                            char *comma_pos;
+
+                            while ((comma_pos = strchr(token_ptr, ',')) != NULL && token_count < MAX_DISABLE_TOKENS)
+                            {
+                                *comma_pos = '\0';
+                                token_list[token_count++] = token_ptr;
+                                token_ptr = comma_pos + 1;
+                            }
+
+                            // Add the last token (or only token if no commas)
+                            if (token_count < MAX_DISABLE_TOKENS && *token_ptr != '\0')
+                            {
+                                token_list[token_count++] = token_ptr;
+                            }
+
+                            if (token_count == 0)
+                            {
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"No tokens specified\",\"error_code\":\"NO_TOKENS_SPECIFIED\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                goto cleanup;
+                            }
+
+                            if (token_count > MAX_DISABLE_TOKENS)
+                            {
+                                char error_response[256];
+                                snprintf(error_response, sizeof(error_response),
+                                         "HTTP/1.1 400 Bad Request\r\n"
+                                         "Content-Type: application/json\r\n"
+                                         "Connection: close\r\n\r\n"
+                                         "{\"success\":false,\"error\":\"Too many tokens requested (max %d)\",\"error_code\":\"TOO_MANY_TOKENS\",\"max_tokens\":%d,\"requested\":%d}",
+                                         MAX_DISABLE_TOKENS, MAX_DISABLE_TOKENS, token_count);
+                                send(sock, error_response, strlen(error_response), 0);
+                                goto cleanup;
+                            }
+
                             // Acquire mutex for token blob modification
                             if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
                             {
@@ -2865,53 +2860,64 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
                                 send(sock, busy_response, strlen(busy_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
-                            // Find and disable token
-                            bool found = false;
-                            for (int i = 0; i < token_blob.token_count; i++)
+                            // Process all tokens: disable in memory, collect results
+                            int disabled_count = 0;
+                            char disabled_tokens[512] = {0}; // Store list of disabled tokens
+
+                            for (int req_idx = 0; req_idx < token_count; req_idx++)
                             {
-                                if (token_blob.tokens[i].active &&
-                                    strcmp(token_blob.tokens[i].token, token_to_disable) == 0)
+                                char *requested_token = token_list[req_idx];
+
+                                // Find and disable token
+                                for (int i = 0; i < token_blob.token_count; i++)
                                 {
-                                    token_blob.tokens[i].active = false;
-
-                                    // Compact array immediately by shifting remaining tokens
-                                    for (int j = i; j < token_blob.token_count - 1; j++)
+                                    if (token_blob.tokens[i].active &&
+                                        strcmp(token_blob.tokens[i].token, requested_token) == 0)
                                     {
-                                        token_blob.tokens[j] = token_blob.tokens[j + 1];
+                                        token_blob.tokens[i].active = false;
+
+                                        // Compact array immediately by shifting remaining tokens
+                                        for (int j = i; j < token_blob.token_count - 1; j++)
+                                        {
+                                            token_blob.tokens[j] = token_blob.tokens[j + 1];
+                                        }
+                                        token_blob.token_count--;
+
+                                        // Add to disabled list for response
+                                        if (disabled_count > 0)
+                                            strncat(disabled_tokens, ",", sizeof(disabled_tokens) - strlen(disabled_tokens) - 1);
+                                        strncat(disabled_tokens, requested_token, sizeof(disabled_tokens) - strlen(disabled_tokens) - 1);
+
+                                        disabled_count++;
+                                        ESP_LOGI(TAG, "API: Token %s disabled via bulk API", requested_token);
+                                        break;
                                     }
-                                    token_blob.token_count--;
-                                    found = true;
-
-                                    // Save updated blob to NVS
-                                    save_tokens_blob_to_nvs();
-                                    xSemaphoreGive(token_blob_mutex);
-
-                                    const char *success_response =
-                                        "HTTP/1.1 200 OK\r\n"
-                                        "Content-Type: application/json\r\n"
-                                        "Connection: close\r\n\r\n"
-                                        "{\"success\":true,\"message\":\"Token disabled successfully\"}";
-                                    send(sock, success_response, strlen(success_response), 0);
-                                    ESP_LOGI(TAG, "API: Token %s disabled via API (count now: %d)",
-                                             token_to_disable, token_blob.token_count);
-                                    break;
                                 }
                             }
 
-                            if (!found)
+                            // Save to NVS once after processing all tokens
+                            if (disabled_count > 0)
                             {
-                                xSemaphoreGive(token_blob_mutex);
-                                const char *not_found_response =
-                                    "HTTP/1.1 404 Not Found\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Connection: close\r\n\r\n"
-                                    "{\"success\":false,\"error\":\"Token not found or already disabled\",\"error_code\":\"TOKEN_NOT_FOUND\"}";
-                                send(sock, not_found_response, strlen(not_found_response), 0);
+                                save_tokens_blob_to_nvs();
                             }
+
+                            xSemaphoreGive(token_blob_mutex);
+
+                            // Build response
+                            char response_buffer[1024];
+                            snprintf(response_buffer, sizeof(response_buffer),
+                                     "HTTP/1.1 200 OK\r\n"
+                                     "Content-Type: application/json\r\n"
+                                     "Connection: close\r\n\r\n"
+                                     "{\"success\":true,\"disabled_count\":%d,\"disabled_tokens\":[%s]}",
+                                     disabled_count,
+                                     disabled_count > 0 ? disabled_tokens : "");
+
+                            send(sock, response_buffer, strlen(response_buffer), 0);
+                            ESP_LOGI(TAG, "API: Bulk disabled %d tokens via API (total now: %d)", disabled_count, token_blob.token_count);
                         }
                         else
                         {
@@ -2924,12 +2930,11 @@ static void http_server_task(void *pvParameters)
                             "HTTP/1.1 400 Bad Request\r\n"
                             "Content-Type: application/json\r\n"
                             "Connection: close\r\n\r\n"
-                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, token)\"}";
+                            "{\"success\":false,\"error\":\"Missing required parameters (api_key, tokens)\"}";
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Bulk Token Create API endpoint
@@ -2976,22 +2981,20 @@ static void http_server_task(void *pvParameters)
                                 "Connection: close\r\n\r\n"
                                 "{\"success\":false,\"error\":\"Count cannot be negative\"}";
                             send(sock, error_response, strlen(error_response), 0);
-                            close(sock);
-                            continue;
+                            goto cleanup;
                         }
                         sscanf(count_start, "%lu", &count);
 
                         // Validate count limits
-                        if (count == 0 || count > 50)
+                        if (count == 0 || count > 20)
                         {
                             const char *error_response =
                                 "HTTP/1.1 400 Bad Request\r\n"
                                 "Content-Type: application/json\r\n"
                                 "Connection: close\r\n\r\n"
-                                "{\"success\":false,\"error\":\"Count must be between 1 and 50\"}";
+                                "{\"success\":false,\"error\":\"Count must be between 1 and 20\"}";
                             send(sock, error_response, strlen(error_response), 0);
-                            close(sock);
-                            continue;
+                            goto cleanup;
                         }
 
                         // Extract duration (in minutes)
@@ -3004,8 +3007,7 @@ static void http_server_task(void *pvParameters)
                                 "Connection: close\r\n\r\n"
                                 "{\"success\":false,\"error\":\"Duration cannot be negative\"}";
                             send(sock, error_response, strlen(error_response), 0);
-                            close(sock);
-                            continue;
+                            goto cleanup;
                         }
                         sscanf(dur_start, "%lu", &duration);
 
@@ -3021,8 +3023,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                             sscanf(down_start, "%lu", &bandwidth_down);
                         }
@@ -3037,8 +3038,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Bandwidth cannot be negative\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                             sscanf(up_start, "%lu", &bandwidth_up);
                         }
@@ -3056,8 +3056,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"businessId cannot exceed 36 characters\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
                         }
 
@@ -3075,8 +3074,7 @@ static void http_server_task(void *pvParameters)
                                     "{\"success\":false,\"error\":\"Server busy processing tokens\",\"error_code\":\"SERVER_BUSY\",\"retry_after\":5}";
                                 send(sock, busy_response, strlen(busy_response), 0);
                                 ESP_LOGW(TAG, "API: Bulk token creation denied - server busy");
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Check how many tokens we can actually create
@@ -3096,8 +3094,7 @@ static void http_server_task(void *pvParameters)
                                          MAX_TOKENS, token_blob.token_count, count);
                                 send(sock, error_response, strlen(error_response), 0);
                                 ESP_LOGW(TAG, "API: Bulk token creation denied - no slots available (%d/%d)", token_blob.token_count, MAX_TOKENS);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Create all tokens in memory (NO NVS saves)
@@ -3168,12 +3165,15 @@ static void http_server_task(void *pvParameters)
 
                                     const char *used_business_id = business_id[0] ? business_id : "ddb03736-2f0f-4fad-8ef6-5ffa997a1454";
 
+                                    int available_slots = MAX_TOKENS - token_blob.token_count;
+                                    if (available_slots < 0) available_slots = 0;
+
                                     response_ptr += snprintf(response_ptr, remaining,
                                                              "HTTP/1.1 200 OK\r\n"
                                                              "Content-Type: application/json\r\n"
                                                              "Connection: close\r\n\r\n"
-                                                             "{\"success\":true,\"tokens_created\":%d,\"requested\":%lu,\"tokens\":[",
-                                                             created_count, count);
+                                                             "{\"success\":true,\"available_slots\":%d,\"tokens_created\":%d,\"requested\":%lu,\"tokens\":[",
+                                                             available_slots, created_count, count);
 
                                     // Build token list from the blob (tokens are at start_index onwards)
                                     for (int i = 0; i < created_count; i++)
@@ -3212,8 +3212,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Token Info API endpoint
@@ -3283,12 +3282,15 @@ static void http_server_task(void *pvParameters)
                                     sanitize_string(token_blob.tokens[i].hostname, safe_hostname, sizeof(safe_hostname));
                                     sanitize_string(token_blob.tokens[i].device_type, safe_device_type, sizeof(safe_device_type));
 
+                                    int available_slots = MAX_TOKENS - token_blob.token_count;
+                                    if (available_slots < 0) available_slots = 0;
+
                                     char response[2048]; // Increased buffer for device info
                                     int offset = snprintf(response, sizeof(response),
                                                           "HTTP/1.1 200 OK\r\n"
                                                           "Content-Type: application/json\r\n"
                                                           "Connection: close\r\n\r\n"
-                                                          "{\"success\":true,\"token\":\"%s\","
+                                                          "{\"success\":true,\"available_slots\":%d,\"token\":\"%s\","
                                                           "\"status\":\"%s\","
                                                           "\"created\":%lld,"
                                                           "\"first_use\":%lld,"
@@ -3308,6 +3310,7 @@ static void http_server_task(void *pvParameters)
                                                           "\"first_seen\":%lld,"
                                                           "\"last_seen\":%lld,"
                                                           "\"devices\":[",
+                                                          available_slots,
                                                           token_blob.tokens[i].token,
                                                           is_expired ? "expired" : (is_used ? "active" : "unused"),
                                                           (long long)token_blob.tokens[i].created,
@@ -3392,8 +3395,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Token Batch Info API endpoint
@@ -3424,7 +3426,7 @@ static void http_server_task(void *pvParameters)
                         if (strcmp(received_key, api_key) == 0)
                         {
 // Parse tokens from comma-separated list
-#define MAX_BATCH_TOKENS 50
+#define MAX_BATCH_TOKENS 20
                             char *token_list[MAX_BATCH_TOKENS];
                             int token_count = 0;
 
@@ -3452,8 +3454,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"No tokens specified\",\"error_code\":\"NO_TOKENS_SPECIFIED\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             if (token_count > MAX_BATCH_TOKENS)
@@ -3466,8 +3467,7 @@ static void http_server_task(void *pvParameters)
                                          "{\"success\":false,\"error\":\"Too many tokens requested (max %d)\",\"error_code\":\"TOO_MANY_TOKENS\",\"max_tokens\":%d,\"requested\":%d}",
                                          MAX_BATCH_TOKENS, MAX_BATCH_TOKENS, token_count);
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Build response with token info array
@@ -3570,8 +3570,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Token Extend API endpoint
@@ -3611,8 +3610,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
                                 send(sock, busy_response, strlen(busy_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Find token
@@ -3691,8 +3689,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Uptime API endpoint
@@ -3705,14 +3702,15 @@ static void http_server_task(void *pvParameters)
                 int64_t uptime_sec = uptime_us / 1000000;
 
                 char response[512];
+                int available_slots = MAX_TOKENS - token_blob.token_count;
+                if (available_slots < 0) available_slots = 0;
                 snprintf(response, sizeof(response),
                          "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
-                         "{\"success\":true,\"uptime_seconds\":%lld,"
+                         "{\"success\":true,\"available_slots\":%d,\"uptime_seconds\":%lld,"
                          "\"uptime_microseconds\":%lld}",
-                         uptime_sec, uptime_us);
+                         available_slots, uptime_sec, uptime_us);
                 send(sock, response, strlen(response), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Health Check API endpoint
@@ -3730,9 +3728,11 @@ static void http_server_task(void *pvParameters)
                 int active_count = token_blob.token_count;
 
                 char response[1024];
+                int available_slots = MAX_TOKENS - token_blob.token_count;
+                if (available_slots < 0) available_slots = 0;
                 snprintf(response, sizeof(response),
                          "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
-                         "{\"success\":true,\"status\":\"healthy\","
+                         "{\"success\":true,\"available_slots\":%d,\"status\":\"healthy\","
                          "\"uptime_seconds\":%lld,"
                          "\"time_synced\":%s,"
                          "\"last_time_sync\":%lld,"
@@ -3740,6 +3740,7 @@ static void http_server_task(void *pvParameters)
                          "\"active_tokens\":%d,"
                          "\"max_tokens\":%d,"
                          "\"free_heap_bytes\":%lu}",
+                         available_slots,
                          uptime_sec,
                          time_synced ? "true" : "false",
                          (long long)time_sync_timestamp,
@@ -3748,8 +3749,26 @@ static void http_server_task(void *pvParameters)
                          MAX_TOKENS,
                          free_heap);
                 send(sock, response, strlen(response), 0);
-                close(sock);
-                continue;
+                goto cleanup;
+            }
+
+            // Handle Available Token Slots API endpoint
+            if (is_api_tokens_available_slots)
+            {
+                REJECT_LOCAL_AP_REQUEST(sock, source_addr);
+
+                // Calculate available slots
+                int available_slots = MAX_TOKENS - token_blob.token_count;
+                if (available_slots < 0) available_slots = 0; // Safety check
+
+                char response[512];
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
+                         "{\"success\":true,\"available_slots\":%d,\"max_tokens\":%d,\"current_tokens\":%d}",
+                         available_slots, MAX_TOKENS, token_blob.token_count);
+                send(sock, response, strlen(response), 0);
+                ESP_LOGI(TAG, "API: Available token slots queried: %d/%d", available_slots, MAX_TOKENS);
+                goto cleanup;
             }
 
             // Handle AP Info API endpoint (public - no auth required for receipts)
@@ -3761,8 +3780,7 @@ static void http_server_task(void *pvParameters)
                          "{\"success\":true,\"ap_ssid\":\"%s\"}",
                          ap_ssid);
                 send(sock, response, strlen(response), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Tokens List API endpoint
@@ -3831,15 +3849,28 @@ static void http_server_task(void *pvParameters)
                         {
                             offset_start += 7;
                             sscanf(offset_start, "%lu", &page_offset);
+                            // CRITICAL: Bound offset to prevent infinite loops
+                            if (page_offset > 1000)
+                            {
+                                ESP_LOGW(TAG, "offset=%lu exceeds max 1000, rejecting", page_offset);
+                                const char *error_response =
+                                    "HTTP/1.1 400 Bad Request\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"offset must be <= 1000\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                goto cleanup;
+                            }
                         }
                         if (limit_start)
                         {
                             limit_start += 6;
                             sscanf(limit_start, "%lu", &page_limit);
-                            if (page_limit > 200)
-                                page_limit = 200; // Cap at 200 to prevent buffer overflow
+                            // CRITICAL: Bound limit to prevent buffer overflow and excessive processing
+                            if (page_limit > 20)
+                                page_limit = 20; // Cap at 20 to prevent buffer overflow
                             if (page_limit == 0)
-                                page_limit = 100; // Default to 100 if 0
+                                page_limit = 20; // Default to 20 if 0
                         }
                         if (business_id_start)
                         {
@@ -3860,8 +3891,21 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Memory allocation failed\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
+                            }
+
+                            // CRITICAL: Acquire mutex to prevent race conditions during token_blob reads
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            {
+                                ESP_LOGW(TAG, "tokens/list: Failed to acquire mutex, server busy");
+                                const char *error_response =
+                                    "HTTP/1.1 503 Service Unavailable\r\n"
+                                    "Content-Type: application/json\r\n"
+                                    "Connection: close\r\n\r\n"
+                                    "{\"success\":false,\"error\":\"Server busy, try again\"}";
+                                send(sock, error_response, strlen(error_response), 0);
+                                free(response);
+                                goto cleanup;
                             }
 
                             time_t now = time(NULL);
@@ -3939,12 +3983,14 @@ static void http_server_task(void *pvParameters)
                             }
 
                             // Build response header with pagination info
+                            int available_slots = MAX_TOKENS - token_blob.token_count;
+                            if (available_slots < 0) available_slots = 0;
                             int response_offset = snprintf(response, 8192,
                                                            "HTTP/1.1 200 OK\r\n" HTTP_HEADER_JSON
                                                            "{\"success\":true,\"total_count\":%d,\"returned_count\":%d,"
-                                                           "\"offset\":%lu,\"limit\":%lu,\"has_more\":%s,\"tokens\":[",
+                                                           "\"offset\":%lu,\"limit\":%lu,\"has_more\":%s,\"available_slots\":%d,\"tokens\":[",
                                                            total_filtered_count, returned_count, page_offset, page_limit,
-                                                           has_more ? "true" : "false");
+                                                           has_more ? "true" : "false", available_slots);
 
                             // Second pass: build tokens array with pagination
                             int current_index = 0; // Index in filtered results
@@ -4016,8 +4062,15 @@ static void http_server_task(void *pvParameters)
 
                                 returned_count--;
 
-                                // Build token JSON
-                                response_offset += snprintf(response + response_offset, 8192 - response_offset,
+                                // Build token JSON with bounds checking
+                                size_t remaining = 8192 - response_offset;
+                                if (remaining < 500) // Need at least 500 bytes for token entry
+                                {
+                                    ESP_LOGW(TAG, "Response buffer nearly full, truncating at %d tokens", (int)(current_index - page_offset));
+                                    break; // Stop adding tokens to prevent overflow
+                                }
+
+                                response_offset += snprintf(response + response_offset, remaining,
                                                             "%s{\"token\":\"%s\","
                                                             "\"businessId\":\"%s\","
                                                             "\"status\":\"%s\","
@@ -4047,14 +4100,25 @@ static void http_server_task(void *pvParameters)
                                                             token_blob.tokens[i].usage_count,
                                                             token_blob.tokens[i].device_count);
 
+                                // Check if buffer is getting full
+                                if (response_offset >= 8000)
+                                {
+                                    ESP_LOGW(TAG, "Response buffer at %d bytes, stopping", response_offset);
+                                    break;
+                                }
+
                                 // Add MAC addresses for this token
                                 for (int mac_idx = 0; mac_idx < token_blob.tokens[i].device_count && mac_idx < MAX_DEVICES_PER_TOKEN; mac_idx++)
                                 {
+                                    remaining = 8192 - response_offset;
+                                    if (remaining < 30) // Need at least 30 bytes for MAC address
+                                        break;
+
                                     if (mac_idx > 0)
                                     {
-                                        response_offset += snprintf(response + response_offset, 8192 - response_offset, ",");
+                                        response_offset += snprintf(response + response_offset, remaining, ",");
                                     }
-                                    response_offset += snprintf(response + response_offset, 8192 - response_offset,
+                                    response_offset += snprintf(response + response_offset, remaining,
                                                                 "\"%02X:%02X:%02X:%02X:%02X:%02X\"",
                                                                 token_blob.tokens[i].client_macs[mac_idx][0],
                                                                 token_blob.tokens[i].client_macs[mac_idx][1],
@@ -4077,6 +4141,10 @@ static void http_server_task(void *pvParameters)
                             // Close the JSON response
                             snprintf(response + response_offset, 8192 - response_offset, "]}");
                             send(sock, response, strlen(response), 0);
+
+                            // Release mutex after completing read operations
+                            xSemaphoreGive(token_blob_mutex);
+
                             free(response);
                             ESP_LOGI(TAG, "API: Listed %d tokens via API (offset=%lu, limit=%lu, total_filtered=%d, has_more=%s)",
                                      returned_count, page_offset, page_limit, total_filtered_count, has_more ? "true" : "false");
@@ -4096,8 +4164,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle Tokens Purge API endpoint
@@ -4155,8 +4222,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
                                 send(sock, busy_response, strlen(busy_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             time_t now = time(NULL);
@@ -4270,8 +4336,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle POST /api/mac/blacklist - Add MAC(s) from token to blacklist
@@ -4379,8 +4444,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle POST /api/mac/whitelist - Add MAC(s) from token to whitelist (VIP bypass)
@@ -4488,8 +4552,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle GET /api/mac/list - List blacklist and/or whitelist entries
@@ -4533,8 +4596,7 @@ static void http_server_task(void *pvParameters)
                                     "Connection: close\r\n\r\n"
                                     "{\"success\":false,\"error\":\"Invalid list parameter. Use 'blacklist', 'whitelist', or 'both'\"}";
                                 send(sock, error_response, strlen(error_response), 0);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Build JSON response
@@ -4628,8 +4690,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle POST /api/mac/remove - Remove MAC from blacklist/whitelist
@@ -4742,8 +4803,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle POST /api/mac/clear - Clear blacklist/whitelist
@@ -4818,8 +4878,7 @@ static void http_server_task(void *pvParameters)
                         send(sock, error_response, strlen(error_response), 0);
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle invalid API endpoints - return 404 for unmatched /api/* routes
@@ -4828,7 +4887,7 @@ static void http_server_task(void *pvParameters)
                 // Check if it's not one of our known endpoints
                 bool is_known_api = is_api_token || is_api_token_disable || is_api_token_info ||
                                     is_api_token_extend || is_api_tokens_list || is_api_uptime || is_api_health ||
-                                    is_api_mac_blacklist || is_api_mac_whitelist || is_api_mac_remove ||
+                                    is_api_tokens_available_slots || is_api_mac_blacklist || is_api_mac_whitelist || is_api_mac_remove ||
                                     is_api_mac_list || is_api_mac_clear;
 
                 if (!is_known_api)
@@ -4839,8 +4898,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"API endpoint not found\",\"error_code\":\"NOT_FOUND\"}";
                     send(sock, not_found_response, strlen(not_found_response), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
             }
 
@@ -4883,8 +4941,7 @@ static void http_server_task(void *pvParameters)
                         }
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin logout
@@ -4897,8 +4954,7 @@ static void http_server_task(void *pvParameters)
                     "Connection: close\r\n\r\n"
                     "{\"success\":true}";
                 send(sock, response, strlen(response), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin password change
@@ -4912,8 +4968,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 char *body = strstr(rx_buffer, "\r\n\r\n");
@@ -4956,8 +5011,7 @@ static void http_server_task(void *pvParameters)
                         }
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle API key regeneration
@@ -4971,8 +5025,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 esp_err_t err = regenerate_api_key();
@@ -4997,8 +5050,7 @@ static void http_server_task(void *pvParameters)
                         "{\"success\":false,\"error\":\"Failed to regenerate key\"}";
                     send(sock, error, strlen(error), 0);
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin token generation
@@ -5012,8 +5064,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 char *body = strstr(rx_buffer, "\r\n\r\n");
@@ -5064,8 +5115,7 @@ static void http_server_task(void *pvParameters)
                         }
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin system management page (minimal separate page)
@@ -5078,8 +5128,7 @@ static void http_server_task(void *pvParameters)
                         "Location: /admin\r\n"
                         "Connection: close\r\n\r\n";
                     send(sock, redirect, strlen(redirect), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 update_admin_activity();
@@ -5109,8 +5158,7 @@ static void http_server_task(void *pvParameters)
                     "</script></body></html>";
 
                 send(sock, system_page, strlen(system_page), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin token reset
@@ -5124,8 +5172,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Acquire mutex for token blob modification
@@ -5138,8 +5185,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Server busy\",\"error_code\":\"SERVER_BUSY\"}";
                     send(sock, busy_response, strlen(busy_response), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Reset all tokens
@@ -5158,8 +5204,7 @@ static void http_server_task(void *pvParameters)
                          tokens_removed);
                 send(sock, response, strlen(response), 0);
                 ESP_LOGI(TAG, "Admin: Reset all tokens (%d removed)", tokens_removed);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle clear whitelist
@@ -5173,8 +5218,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Clear whitelist
@@ -5192,8 +5236,7 @@ static void http_server_task(void *pvParameters)
                          entries_removed);
                 send(sock, response, strlen(response), 0);
                 ESP_LOGI(TAG, "Admin: Cleared whitelist (%d entries removed)", entries_removed);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle clear blacklist
@@ -5207,8 +5250,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Clear blacklist
@@ -5226,8 +5268,7 @@ static void http_server_task(void *pvParameters)
                          entries_removed);
                 send(sock, response, strlen(response), 0);
                 ESP_LOGI(TAG, "Admin: Cleared blacklist (%d entries removed)", entries_removed);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle OTA firmware update
@@ -5241,8 +5282,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 if (ota_in_progress)
@@ -5253,8 +5293,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"OTA update already in progress\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Parse multipart form data to extract firmware file
@@ -5267,8 +5306,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Invalid request format\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
                 body += 4; // Skip \r\n\r\n
 
@@ -5282,8 +5320,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"No firmware file found\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
                 firmware_start += 4; // Skip \r\n\r\n
 
@@ -5297,8 +5334,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"No boundary found\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
                 boundary += 9; // Skip "boundary="
                 char boundary_marker[128] = {0};
@@ -5320,8 +5356,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Could not determine firmware size\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 size_t firmware_size = firmware_end - firmware_start;
@@ -5333,8 +5368,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Invalid firmware size\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Validate firmware before proceeding with OTA
@@ -5346,8 +5380,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Firmware validation failed. Invalid or incompatible binary.\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Start OTA update
@@ -5365,8 +5398,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"No OTA partition available\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Begin OTA
@@ -5382,8 +5414,7 @@ static void http_server_task(void *pvParameters)
                              "{\"success\":false,\"error\":\"Failed to begin OTA: %s\"}",
                              esp_err_to_name(err));
                     send(sock, error_msg, strlen(error_msg), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Write firmware data
@@ -5400,8 +5431,7 @@ static void http_server_task(void *pvParameters)
                              "{\"success\":false,\"error\":\"Failed to write firmware: %s\"}",
                              esp_err_to_name(err));
                     send(sock, error_msg, strlen(error_msg), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // End OTA
@@ -5417,8 +5447,7 @@ static void http_server_task(void *pvParameters)
                              "{\"success\":false,\"error\":\"Failed to end OTA: %s\"}",
                              esp_err_to_name(err));
                     send(sock, error_msg, strlen(error_msg), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 // Set boot partition
@@ -5434,8 +5463,7 @@ static void http_server_task(void *pvParameters)
                              "{\"success\":false,\"error\":\"Failed to set boot partition: %s\"}",
                              esp_err_to_name(err));
                     send(sock, error_msg, strlen(error_msg), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 ota_in_progress = false;
@@ -5456,8 +5484,7 @@ static void http_server_task(void *pvParameters)
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 esp_restart();
 
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle AP SSID configuration
@@ -5471,8 +5498,7 @@ static void http_server_task(void *pvParameters)
                         "Connection: close\r\n\r\n"
                         "{\"success\":false,\"error\":\"Session expired\"}";
                     send(sock, error, strlen(error), 0);
-                    close(sock);
-                    continue;
+                    goto cleanup;
                 }
 
                 char *body = strstr(rx_buffer, "\r\n\r\n");
@@ -5524,8 +5550,7 @@ static void http_server_task(void *pvParameters)
                                 "{\"success\":false,\"error\":\"Incorrect admin password\"}";
                             send(sock, error, strlen(error), 0);
                             ESP_LOGW(TAG, "Admin: Failed AP SSID change attempt - incorrect password");
-                            close(sock);
-                            continue;
+                            goto cleanup;
                         }
 
                         // Parse SSID
@@ -5568,8 +5593,7 @@ static void http_server_task(void *pvParameters)
                                     "{\"success\":false,\"error\":\"Invalid SSID (must be 1-32 printable ASCII characters)\"}";
                                 send(sock, error, strlen(error), 0);
                                 ESP_LOGW(TAG, "Admin: Invalid SSID rejected: \"%s\"", new_ssid);
-                                close(sock);
-                                continue;
+                                goto cleanup;
                             }
 
                             // Save new SSID to NVS
@@ -5623,8 +5647,7 @@ static void http_server_task(void *pvParameters)
                         ESP_LOGW(TAG, "Admin: Missing parameters for AP SSID change");
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin configuration
@@ -5791,8 +5814,7 @@ static void http_server_task(void *pvParameters)
                         }
                     }
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin status API
@@ -5804,11 +5826,9 @@ static void http_server_task(void *pvParameters)
 
                 // Get mesh information
 #if MESH_ENABLED
-                bool is_root = esp_mesh_is_root();
                 int routing_size = esp_mesh_get_routing_table_size();
-                const char *mesh_role = is_root ? "ROOT" : "CHILD";
+                const char *mesh_role = esp_mesh_is_root() ? "ROOT" : "CHILD";
 #else
-                bool is_root = false;
                 int routing_size = 0;
                 const char *mesh_role = "DISABLED";
 #endif
@@ -5829,8 +5849,7 @@ static void http_server_task(void *pvParameters)
                          mesh_layer,
                          routing_size);
                 send(sock, status_json, strlen(status_json), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle admin page
@@ -6121,8 +6140,7 @@ static void http_server_task(void *pvParameters)
                              ADMIN_SESSION_TIMEOUT);
                     send(sock, script3, strlen(script3), 0);
                 }
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // Handle captive portal detection requests
@@ -6141,8 +6159,7 @@ static void http_server_task(void *pvParameters)
                     "Location: http://192.168.4.1/\r\n"
                     "Connection: close\r\n\r\n";
                 send(sock, redirect, strlen(redirect), 0);
-                close(sock);
-                continue;
+                goto cleanup;
             }
 
             // If authenticated and NOT accessing portal pages, close connection to let traffic through to internet
@@ -6158,9 +6175,11 @@ static void http_server_task(void *pvParameters)
             if (is_authenticated && !is_portal_page)
             {
                 ESP_LOGI(TAG, "Authenticated client accessing internet - closing connection to allow direct access");
-                close(sock);
-                continue;
+                goto cleanup;
             }
+
+            ESP_LOGI(TAG, "HTTP: Processing request (is_post_login=%d, is_portal_page=%d, is_authenticated=%d)",
+                     is_post_login, is_portal_page, is_authenticated);
 
             if (is_post_login)
             {
@@ -6261,6 +6280,7 @@ static void http_server_task(void *pvParameters)
                 else
                 {
                 show_login:
+                    ESP_LOGI(TAG, "HTTP: Serving login/portal page (auth=%d, time_valid=%d)", is_authenticated, is_time_valid());
                     // Check if time is synced before showing login page
                     if (!is_time_valid())
                     {
@@ -6287,8 +6307,7 @@ static void http_server_task(void *pvParameters)
                             "<p class='info'>This usually takes 5-10 seconds.<br>The page will refresh automatically.</p>"
                             "</div></body></html>";
                         send(sock, waiting_response, strlen(waiting_response), 0);
-                        close(sock);
-                        continue;
+                        goto cleanup;
                     }
 
                     // Check if MAC is blacklisted before showing login page
@@ -6345,8 +6364,7 @@ static void http_server_task(void *pvParameters)
 
                         send(sock, blocked_response, strlen(blocked_response), 0);
                         ESP_LOGW(TAG, "Blocked blacklisted MAC %s from accessing portal", mac_display);
-                        close(sock);
-                        continue;
+                        goto cleanup;
                     }
 
                     // Show login page for unauthenticated users
@@ -6380,6 +6398,8 @@ static void http_server_task(void *pvParameters)
                 }
             }
 
+        cleanup:
+            free(rx_buffer);
             close(sock);
         }
     }
@@ -6723,14 +6743,49 @@ void app_main(void)
     enable_nat_routing();
 #endif
 
-    ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded", token_blob.token_count);
+    // Count used vs unused tokens
+    int used_tokens = 0;
+    int unused_tokens = 0;
+    for (int i = 0; i < token_blob.token_count; i++)
+    {
+        if (token_blob.tokens[i].first_use > 0)
+        {
+            used_tokens++;
+        }
+        else
+        {
+            unused_tokens++;
+        }
+    }
+
+    ESP_LOGI(TAG, "✓ TOKEN SYSTEM ACTIVE: %d tokens loaded (Used: %d, Unused: %d)",
+             token_blob.token_count, used_tokens, unused_tokens);
+    ESP_LOGI(TAG, "✓ API KEY: %s", api_key);
+    // Log free heap before starting servers
+    ESP_LOGI(TAG, "Free heap before servers: %lu bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "Starting DNS and HTTP servers...");
 
     // Start DNS server for captive portal redirect (4.5KB stack for 512-byte buffers + overhead)
-    xTaskCreate(dns_server_task, "dns_server", 4608, NULL, 5, NULL);
+    BaseType_t dns_result = xTaskCreate(dns_server_task, "dns_server", 4608, NULL, 5, NULL);
+    if (dns_result != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create DNS server task! Free heap: %lu bytes", esp_get_free_heap_size());
+    }
+    else
+    {
+        ESP_LOGI(TAG, "✓ DNS server started");
+    }
 
-    // Start HTTP server for captive portal (7KB stack - prevent overflow during admin dashboard)
-    xTaskCreate(http_server_task, "http_server", 7168, NULL, 5, NULL);
+    // Start HTTP server for captive portal (32KB stack - needed for batch_info with large buffers)
+    BaseType_t http_result = xTaskCreate(http_server_task, "http_server", 32768, NULL, 5, NULL);
+    if (http_result != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create HTTP server task! Free heap: %lu bytes", esp_get_free_heap_size());
+    }
+    else
+    {
+        ESP_LOGI(TAG, "✓ HTTP server started");
+    }
 
     ESP_LOGI(TAG, "✓ CAPTIVE PORTAL ACTIVE (with token validation)");
 
