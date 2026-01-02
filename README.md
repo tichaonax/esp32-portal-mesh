@@ -42,17 +42,20 @@ If you already have a local repository on your machine and want to link it to th
 
 5. **Push your local changes to GitHub:**
    ```bash
-   # Push your main/master branch
-   git push -u origin main
+   # Push your current branch (works with any branch name)
+   git push -u origin HEAD
    
-   # Or if you're using master branch:
-   git push -u origin master
+   # Alternatively, specify the branch name explicitly:
+   # git push -u origin main
+   # git push -u origin master
    ```
    
-   If you have a different commit history, you may need to force push (use with caution):
+   If you have a different commit history, you may need to force push:
    ```bash
-   git push -u origin main --force
+   git push -u origin HEAD --force
    ```
+   
+   ⚠️ **Warning:** Force push will overwrite the remote repository's history and can cause data loss for collaborators. Use this only if you're certain you want to replace the remote content completely.
 
 #### Option 2: Using SSH (For users with SSH keys configured)
 
@@ -74,12 +77,16 @@ If the GitHub repository already has commits that you want to integrate with you
 
 1. **Pull and merge the existing content:**
    ```bash
+   # Pull from the main branch
    git pull origin main --allow-unrelated-histories
+   
+   # Or use your current branch name dynamically:
+   # git pull origin $(git branch --show-current) --allow-unrelated-histories
    ```
 
 2. **Resolve any conflicts if they occur, then push:**
    ```bash
-   git push -u origin main
+   git push -u origin HEAD
    ```
 
 #### Starting Fresh
@@ -89,10 +96,10 @@ If you want to completely replace the GitHub repository content with your local 
 1. **Add the remote as described above**
 2. **Force push your local repository:**
    ```bash
-   git push -u origin main --force
+   git push -u origin HEAD --force
    ```
    
-   ⚠️ **Warning:** This will overwrite all content in the GitHub repository!
+   ⚠️ **Warning:** This will overwrite all content in the GitHub repository and permanently delete its commit history! This action cannot be undone and will affect all collaborators.
 
 ### Verifying the Connection
 
