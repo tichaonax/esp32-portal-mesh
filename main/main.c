@@ -28,7 +28,6 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "esp_sntp.h"
-#include "esp_task_wdt.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
@@ -465,9 +464,6 @@ static void ssid_reboot_task(void *param)
 // Save all tokens as a single blob to NVS
 static esp_err_t save_tokens_blob_to_nvs(void)
 {
-    // Reset watchdog before potentially long NVS operations
-    esp_task_wdt_reset();
-
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
@@ -504,7 +500,6 @@ static esp_err_t save_tokens_blob_to_nvs(void)
 
             // Try to erase all keys in the tokens namespace to free space
             ESP_LOGI(TAG, "DEBUG: Calling nvs_erase_all on tokens namespace...");
-            esp_task_wdt_reset(); // Reset watchdog before erase operation
             err = nvs_erase_all(nvs_handle);
             ESP_LOGI(TAG, "DEBUG: nvs_erase_all returned: %s", esp_err_to_name(err));
 
