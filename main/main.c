@@ -28,6 +28,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "esp_sntp.h"
+#include "esp_task_wdt.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
@@ -445,9 +446,28 @@ static void sanitize_string(const char *input, char *output, size_t max_len)
     output[i] = '\0';
 }
 
+// Task function for OTA reboot
+static void ota_reboot_task(void *param)
+{
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    esp_restart();
+}
+
+// Task function for SSID change reboot
+static void ssid_reboot_task(void *param)
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGE(TAG, "⚠️⚠️⚠️  REBOOTING ESP32 NOW TO APPLY NEW AP SSID...");
+    fflush(stdout);
+    esp_restart();
+}
+
 // Save all tokens as a single blob to NVS
 static esp_err_t save_tokens_blob_to_nvs(void)
 {
+    // Reset watchdog before potentially long NVS operations
+    esp_task_wdt_reset();
+
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open_from_partition("nvs_tokens", "tokens", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
@@ -484,6 +504,7 @@ static esp_err_t save_tokens_blob_to_nvs(void)
 
             // Try to erase all keys in the tokens namespace to free space
             ESP_LOGI(TAG, "DEBUG: Calling nvs_erase_all on tokens namespace...");
+            esp_task_wdt_reset(); // Reset watchdog before erase operation
             err = nvs_erase_all(nvs_handle);
             ESP_LOGI(TAG, "DEBUG: nvs_erase_all returned: %s", esp_err_to_name(err));
 
@@ -909,7 +930,7 @@ static esp_err_t create_new_token_with_params(char *token_out, uint32_t duration
     }
 
     // Try to acquire mutex (wait up to 100ms)
-    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
     {
         ESP_LOGW(TAG, "Token creation busy, cannot acquire lock");
         return ESP_ERR_INVALID_STATE;
@@ -1211,7 +1232,7 @@ static bool validate_token(const char *token, const uint8_t *client_mac)
     ESP_LOGI(TAG, "DEBUG: validate_token - now=%lld, time_synced=%d", (long long)now, time_synced);
 
     // Acquire mutex to prevent race conditions during token modification
-    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
     {
         ESP_LOGW(TAG, "validate_token: Failed to acquire mutex");
         return false;
@@ -1419,7 +1440,7 @@ static void cleanup_expired_tokens_internal(void)
 static void cleanup_expired_tokens(void)
 {
     // Try to acquire mutex (non-blocking with timeout)
-    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
     {
         ESP_LOGW(TAG, "Cleanup skipped - token blob busy");
         return;
@@ -2388,9 +2409,9 @@ static void dns_server_task(void *pvParameters)
                 int forward_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (forward_sock >= 0)
                 {
-                    // Set timeout for receiving response
+                    // Set timeout for receiving response (reduced to 1s for better concurrency)
                     struct timeval timeout;
-                    timeout.tv_sec = 2;
+                    timeout.tv_sec = 1;
                     timeout.tv_usec = 0;
                     setsockopt(forward_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
@@ -2486,7 +2507,7 @@ static void http_server_task(void *pvParameters)
         return;
     }
 
-    err = listen(listen_sock, 1);
+    err = listen(listen_sock, 5);
     if (err != 0)
     {
         ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
@@ -2513,6 +2534,15 @@ static void http_server_task(void *pvParameters)
         char addr_str[16];
         inet_ntoa_r(source_addr.sin_addr, addr_str, sizeof(addr_str));
         ESP_LOGI(TAG, "HTTP: Connection accepted from %s", addr_str);
+
+        // Set socket receive timeout to 5 seconds
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+        {
+            ESP_LOGE(TAG, "Failed to set socket timeout: errno %d", errno);
+        }
 
         // Allocate rx_buffer on heap to save stack space
         char *rx_buffer = malloc(1024);
@@ -2851,7 +2881,7 @@ static void http_server_task(void *pvParameters)
                             }
 
                             // Acquire mutex for token blob modification
-                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                             {
                                 const char *busy_response =
                                     "HTTP/1.1 503 Service Unavailable\r\n"
@@ -3064,7 +3094,7 @@ static void http_server_task(void *pvParameters)
                         if (strcmp(received_key, api_key) == 0)
                         {
                             // Try to acquire mutex (non-blocking with 100ms timeout)
-                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                             {
                                 const char *busy_response =
                                     "HTTP/1.1 503 Service Unavailable\r\n"
@@ -3601,7 +3631,7 @@ static void http_server_task(void *pvParameters)
                         if (strcmp(received_key, api_key) == 0)
                         {
                             // Acquire mutex for token blob modification
-                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                             {
                                 const char *busy_response =
                                     "HTTP/1.1 503 Service Unavailable\r\n"
@@ -3895,7 +3925,7 @@ static void http_server_task(void *pvParameters)
                             }
 
                             // CRITICAL: Acquire mutex to prevent race conditions during token_blob reads
-                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                             {
                                 ESP_LOGW(TAG, "tokens/list: Failed to acquire mutex, server busy");
                                 const char *error_response =
@@ -4213,7 +4243,7 @@ static void http_server_task(void *pvParameters)
                         if (strcmp(received_key, api_key) == 0)
                         {
                             // Acquire mutex for token blob modification
-                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                            if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                             {
                                 const char *busy_response =
                                     "HTTP/1.1 503 Service Unavailable\r\n"
@@ -5176,7 +5206,7 @@ static void http_server_task(void *pvParameters)
                 }
 
                 // Acquire mutex for token blob modification
-                if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+                if (xSemaphoreTake(token_blob_mutex, pdMS_TO_TICKS(10000)) != pdTRUE)
                 {
                     const char *busy_response =
                         "HTTP/1.1 503 Service Unavailable\r\n"
@@ -5480,9 +5510,9 @@ static void http_server_task(void *pvParameters)
 
                 ESP_LOGI(TAG, "Admin: OTA update completed, rebooting in 5 seconds");
 
-                // Reboot after 5 seconds
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                esp_restart();
+                // Create a separate task to reboot after 5 seconds
+                // This prevents blocking the HTTP server
+                xTaskCreate(ota_reboot_task, "ota_reboot_task", 2048, NULL, 5, NULL);
 
                 goto cleanup;
             }
@@ -5612,17 +5642,17 @@ static void http_server_task(void *pvParameters)
                                 send(sock, response, strlen(response), 0);
                                 ESP_LOGW(TAG, "▶▶▶ Admin: Response sent - AP SSID will change to \"%s\" after reboot", new_ssid);
 
-                                // Close socket and delay before reboot
+                                // Close socket and create separate task for reboot
+                                // This prevents blocking the HTTP server
                                 close(sock);
-                                ESP_LOGW(TAG, "▶▶▶ Socket closed, waiting 1 second before reboot...");
-                                vTaskDelay(pdMS_TO_TICKS(1000)); // Give time for response to send
+                                ESP_LOGW(TAG, "▶▶▶ Socket closed, scheduling reboot in 1 second...");
 
-                                ESP_LOGE(TAG, "⚠️⚠️⚠️  REBOOTING ESP32 NOW TO APPLY NEW AP SSID...");
-                                fflush(stdout); // Ensure log is written
-                                esp_restart();  // THIS SHOULD REBOOT THE DEVICE
+                                xTaskCreate(ssid_reboot_task, "ssid_reboot_task", 2048, NULL, 5, NULL);
 
-                                // Should never reach here
-                                ESP_LOGE(TAG, "❌ ERROR: esp_restart() did not reboot! This should never happen!");
+                                // Free buffer and continue to next request (device will reboot soon)
+                                free(rx_buffer);
+                                sock = -1; // Mark socket as already closed
+                                goto cleanup;
                             }
                             else
                             {
@@ -6400,7 +6430,9 @@ static void http_server_task(void *pvParameters)
 
         cleanup:
             free(rx_buffer);
-            close(sock);
+            if (sock >= 0) {
+                close(sock);
+            }
         }
     }
 
