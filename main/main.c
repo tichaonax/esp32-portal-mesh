@@ -1617,8 +1617,10 @@ static void time_sync_notification_cb(struct timeval *tv)
 
     // Cleanup expired tokens every 30s (on each SNTP sync)
     cleanup_expired_tokens();
-    
-    ESP_LOGI(TAG, "Free heap after NTP sync: %lu bytes", esp_get_free_heap_size());
+
+    uint64_t uptime_sec = esp_timer_get_time() / 1000000;
+    ESP_LOGI(TAG, "Free heap after NTP sync: %lu bytes (uptime: %llu seconds)",
+             esp_get_free_heap_size(), uptime_sec);
 }
 
 // Initialize SNTP time synchronization
@@ -2556,7 +2558,7 @@ static void http_server_task(void *pvParameters)
             {
                 ESP_LOGE(TAG, "recv failed: errno %d", errno);
             }
-            free(rx_buffer);
+            // Don't free here - cleanup will handle it to avoid double-free
             goto cleanup;
         }
 
@@ -5644,9 +5646,9 @@ static void http_server_task(void *pvParameters)
 
                                 xTaskCreate(ssid_reboot_task, "ssid_reboot_task", 2048, NULL, 5, NULL);
 
-                                // Free buffer and continue to next request (device will reboot soon)
-                                free(rx_buffer);
-                                sock = -1; // Mark socket as already closed
+                                // Socket already closed, mark it to prevent double-close
+                                sock = -1;
+                                // Let cleanup free rx_buffer to avoid double-free
                                 goto cleanup;
                             }
                             else
@@ -5956,6 +5958,7 @@ static void http_server_task(void *pvParameters)
                         ".header{position:relative}"
                         "</style></head><body><div class='container'>"
                         "<div class='header'><h1>🎛️ Admin Dashboard</h1><p>Manage your ESP32 Portal</p>"
+                        "<p style='color:#fff;opacity:0.8;font-size:14px;margin-top:8px' id='uptime'>Uptime: Loading...</p>"
                         "<button class='logout-btn secondary' onclick='logout()'>Logout</button></div>"
                         "<div class='grid'>";
 
@@ -6152,7 +6155,11 @@ static void http_server_task(void *pvParameters)
                         "var meshStatus=d.mesh_connected?'<span class=\"status-badge status-ok\">✓ Connected</span>':'<span class=\"status-badge status-error\">✗ Disconnected</span>';"
                         "var roleColor=d.mesh_role==='ROOT'?'#28a745':'#007bff';"
                         "document.getElementById('meshStatus').innerHTML='<strong>Status:</strong> '+meshStatus+'<br><strong>Role:</strong> <span style=\"color:'+roleColor+';font-weight:bold\">'+d.mesh_role+'</span><br><strong>Layer:</strong> '+d.mesh_layer+'<br><strong>Nodes:</strong> '+d.mesh_routing_size})};"
-                        "updateStatus();setInterval(updateStatus,10000);";
+                        "function updateUptime(){fetch('/api/uptime').then(r=>r.json()).then(d=>{"
+                        "var s=d.uptime_seconds;var days=Math.floor(s/86400);var h=Math.floor((s%86400)/3600);var m=Math.floor((s%3600)/60);var sec=s%60;"
+                        "var up='Uptime: ';if(days>0)up+=days+'d ';if(h>0||days>0)up+=h+'h ';if(m>0||h>0||days>0)up+=m+'m ';up+=sec+'s';"
+                        "document.getElementById('uptime').textContent=up}).catch(()=>document.getElementById('uptime').textContent='Uptime: N/A')}"
+                        "updateStatus();updateUptime();setInterval(updateStatus,10000);setInterval(updateUptime,10000);";
                     send(sock, script2, strlen(script2), 0);
 
                     // Session timeout with dynamic value
